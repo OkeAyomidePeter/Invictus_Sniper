@@ -1,9 +1,14 @@
 mod config;
 mod helius_listener;
+mod enrichment;
 
 use anyhow::Result;
+use enrichment::{EnrichedToken, TokenEnricher};
+use helius_listener::ClassifiedEvent;
 use log::{error, info, warn};
 use tokio::signal;
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -12,20 +17,20 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    info!("🚀 Starting Solana Token Launch Monitor");
+    info!("🚀 Starting Solana Token Launch Monitor with Enrichment");
     info!("================================================");
 
     // Load configuration
     let config = config::Config::load();
     info!("✅ Configuration loaded successfully");
 
-    // Validate Helius API key
-    if config.helius_api_key.is_empty() {
-        error!("❌ Helius API key is not set in configuration");
-        return Err(anyhow::anyhow!("Missing Helius API key"));
-    }
+    // Validate configuration
+    validate_config(&config)?;
 
     info!("🔑 Helius API key configured: {}***", &config.helius_api_key[..8]);
+    info!("🔑 Private key configured: {}***", &config.private_key[..8]); 
+    info!("🔑 Telegram Bot Token configured: {}***", &config.telegram_token[..8]);
+    info!("🔑 Telegram Chat Id configured: {}***", &config.telegram_chat_id[..5]);
     info!("================================================");
 
     // Start Helius listener
@@ -41,8 +46,77 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Create token enricher with caching
+    info!("🔍 Initializing token enricher with 5-minute cache...");
+    let enricher = TokenEnricher::new(config.helius_api_key.clone());
+    info!("✅ Token enricher initialized");
+
+    // Create channel for enriched tokens
+    let (enriched_tx, mut enriched_rx) = mpsc::channel::<EnrichedToken>(100);
+
+    // Spawn enrichment worker
+    let enricher_clone = enricher.clone();
+    tokio::spawn(async move {
+        info!("🔄 Enrichment worker started");
+        while let Some(event) = event_receiver.recv().await {
+            let event_sig = event.signature().to_string();
+            info!("📥 Received event: {}", event_sig);
+            
+            match enricher_clone.enrich_event(&event).await {
+                Ok(enriched) => {
+                    info!("✅ Successfully enriched: {} ({})", 
+                        enriched.mint, 
+                        enriched.symbol.as_deref().unwrap_or("NO_SYMBOL")
+                    );
+                    
+                    if let Err(e) = enriched_tx.send(enriched).await {
+                        error!("❌ Failed to send enriched token: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to enrich event {}: {}", event_sig, e);
+                }
+            }
+        }
+        warn!("⚠️ Enrichment worker stopped");
+    });
+
+    // Spawn cache cleanup task (every 5 minutes)
+    let enricher_clone = enricher.clone();
+    tokio::spawn(async move {
+        let mut cleanup_interval = interval(Duration::from_secs(300));
+        loop {
+            cleanup_interval.tick().await;
+            enricher_clone.clean_expired_cache().await;
+            
+            let stats = enricher_clone.get_cache_stats().await;
+            info!("🧹 Cache cleanup: {} total entries cached", stats.total_entries);
+        }
+    });
+
+    // Spawn cache stats reporter (every 30 seconds)
+    let enricher_clone = enricher.clone();
+    tokio::spawn(async move {
+        let mut stats_interval = interval(Duration::from_secs(30));
+        loop {
+            stats_interval.tick().await;
+            let stats = enricher_clone.get_cache_stats().await;
+            if stats.total_entries > 0 {
+                info!("📊 Cache Stats: Metadata={}, Accounts={}, Social={}, Holders={}, Total={}", 
+                    stats.metadata_entries,
+                    stats.account_info_entries,
+                    stats.social_links_entries,
+                    stats.holder_count_entries,
+                    stats.total_entries
+                );
+            }
+        }
+    });
+
     info!("================================================");
     info!("👂 Listening for MINT and POOL CREATION events...");
+    info!("🔍 All events will be enriched with full metadata");
     info!("================================================");
 
     // Set up graceful shutdown handler
@@ -52,16 +126,9 @@ async fn main() -> Result<()> {
     // Main event processing loop
     loop {
         tokio::select! {
-            // Handle incoming classified events
-            Some(classified_event) = event_receiver.recv() => {
-                match classified_event {
-                    helius_listener::ClassifiedEvent::Mint(mint_event) => {
-                        handle_mint_event(mint_event);
-                    }
-                    helius_listener::ClassifiedEvent::PoolCreation(pool_event) => {
-                        handle_pool_creation_event(pool_event);
-                    }
-                }
+            // Handle enriched tokens
+            Some(enriched_token) = enriched_rx.recv() => {
+                handle_enriched_token(enriched_token).await;
             }
 
             // Handle Ctrl+C shutdown
@@ -80,219 +147,141 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Handle mint events (new token created)
-fn handle_mint_event(event: helius_listener::MintEvent) {
+/// Validate configuration
+fn validate_config(config: &config::Config) -> Result<()> {
+    if config.helius_api_key.is_empty() {
+        error!("❌ Helius API key is not set in configuration");
+        return Err(anyhow::anyhow!("Missing Helius API key"));
+    }
+    if config.private_key.is_empty() {
+        error!("❌ No private key is setup");
+        return Err(anyhow::anyhow!("Missing private key"));
+    }
+    if config.telegram_token.is_empty() {
+        error!("❌ No telegram bot token is setup");
+        return Err(anyhow::anyhow!("Missing telegram bot token"));
+    }
+    if config.telegram_chat_id.is_empty() {
+        error!("❌ No telegram_chat_id is setup");
+        return Err(anyhow::anyhow!("Missing telegram_chat_id"));
+    }
+    Ok(())
+}
+
+/// Handle enriched token - main decision logic
+async fn handle_enriched_token(token: EnrichedToken) {
     info!("");
     info!("╔════════════════════════════════════════════════════════════════");
-    info!("║ 🪙 NEW TOKEN MINT DETECTED");
+    info!("║ 🎯 ENRICHED TOKEN ANALYSIS");
     info!("╠════════════════════════════════════════════════════════════════");
-    info!("║ Mint Address:  {}", event.mint);
-    info!("║ Platform:      {}", event.platform);
-    info!("║ Signature:     {}", event.signature);
-    info!("║ Slot:          {}", event.slot);
+    info!("║ Mint:          {}", token.mint);
+    info!("║ Symbol:        {}", token.symbol.as_deref().unwrap_or("N/A"));
+    info!("║ Name:          {}", token.name.as_deref().unwrap_or("N/A"));
+    info!("║ Platform:      {}", token.platform);
+    info!("║ Signature:     {}", token.signature);
+    info!("╠════════════════════════════════════════════════════════════════");
     
-    if let Some(decimals) = event.decimals {
+    // Token details
+    if let Some(decimals) = token.decimals {
         info!("║ Decimals:      {}", decimals);
     }
-    
-    if let Some(supply) = event.supply {
-        info!("║ Supply:        {}", supply);
+    if let Some(supply) = token.supply {
+        info!("║ Supply:        {}", format_number(supply as f64));
+    }
+    if let Some(holders) = token.holders {
+        info!("║ Holders:       {}", holders);
     }
     
-    if let Some(timestamp) = event.timestamp {
-        info!("║ Timestamp:     {}", timestamp);
-    }
-    
-    info!("╚════════════════════════════════════════════════════════════════");
-    info!("");
-
-    // TODO: Add your token analysis logic here
-    // - Fetch token metadata
-    // - Check for rug pull indicators
-    // - Analyze holder distribution
-    // - Make buy decision
-    
-    analyze_and_decide_mint(event);
-}
-
-/// Handle pool creation events (token listed on DEX)
-fn handle_pool_creation_event(event: helius_listener::PoolCreationEvent) {
-    info!("");
-    info!("╔════════════════════════════════════════════════════════════════");
-    info!("║ 🏊 NEW POOL CREATION DETECTED");
     info!("╠════════════════════════════════════════════════════════════════");
-    info!("║ DEX:           {}", event.dex);
-    info!("║ Pool Address:  {}", event.pool_address);
-    info!("║ Token Mint:    {}", event.token_mint);
-    info!("║ Pair Token:    {}", event.pair_token);
-    info!("║ Signature:     {}", event.signature);
-    info!("║ Slot:          {}", event.slot);
     
-    if let Some(timestamp) = event.timestamp {
-        info!("║ Timestamp:     {}", timestamp);
+    // Authority info (CRITICAL for safety)
+    info!("║ 🔐 AUTHORITY CHECK:");
+    info!("║   Freeze Auth: {}", if token.has_freeze_authority { "❌ YES (RISKY)" } else { "✅ NONE" });
+    info!("║   Mint Auth:   {}", if token.has_mint_authority { "❌ YES (RISKY)" } else { "✅ NONE" });
+    info!("║   Mutable:     {}", if token.is_mutable { "⚠️ YES" } else { "✅ NO" });
+    
+    info!("╠════════════════════════════════════════════════════════════════");
+    
+    // Liquidity info
+    if token.has_liquidity {
+        info!("║ 💧 LIQUIDITY:");
+        if let Some(pool) = &token.pool_info {
+            info!("║   DEX:          {}", pool.dex);
+            info!("║   Pool:         {}", pool.pool_address);
+            info!("║   Base Reserve: {}", format_number(pool.base_reserve));
+            info!("║   Quote Reserve: {}", format_number(pool.quote_reserve));
+            if let Some(liq_usd) = pool.liquidity_usd {
+                info!("║   Liquidity:    ${}", format_number(liq_usd));
+            }
+        }
+    } else {
+        info!("║ 💧 Liquidity:   ❌ NO POOL YET");
+    }
+    
+    info!("╠════════════════════════════════════════════════════════════════");
+    
+    // Market data
+    if let Some(price) = token.price_usd {
+        info!("║ 💰 MARKET DATA:");
+        info!("║   Price:       ${:.10}", price);
+        if let Some(fdv) = token.fdv {
+            info!("║   FDV:         ${}", format_number(fdv));
+        }
+        if let Some(mc) = token.market_cap {
+            info!("║   Market Cap:  ${}", format_number(mc));
+        }
+    }
+    
+    info!("╠════════════════════════════════════════════════════════════════");
+    
+    // Tax info (CRITICAL for trading)
+    info!("║ 📊 TAX ANALYSIS:");
+    if let Some(buy_tax) = token.buy_tax {
+        let buy_status = if buy_tax > 10.0 { "❌ HIGH" } else if buy_tax > 5.0 { "⚠️ MEDIUM" } else { "✅ LOW" };
+        info!("║   Buy Tax:     {:.2}% {}", buy_tax, buy_status);
+    } else {
+        info!("║   Buy Tax:     ⏳ Calculating...");
+    }
+    
+    if let Some(sell_tax) = token.sell_tax {
+        let sell_status = if sell_tax > 10.0 { "❌ HIGH" } else if sell_tax > 5.0 { "⚠️ MEDIUM" } else { "✅ LOW" };
+        info!("║   Sell Tax:    {:.2}% {}", sell_tax, sell_status);
+    } else {
+        info!("║   Sell Tax:    ⏳ Calculating...");
+    }
+    
+    info!("╠════════════════════════════════════════════════════════════════");
+    
+    // Social links
+    if token.social_links.website.is_some() 
+        || token.social_links.twitter.is_some() 
+        || token.social_links.telegram.is_some() {
+        info!("║ 🌐 SOCIAL LINKS:");
+        if let Some(website) = &token.social_links.website {
+            info!("║   Website:     {}", website);
+        }
+        if let Some(twitter) = &token.social_links.twitter {
+            info!("║   Twitter:     {}", twitter);
+        }
+        if let Some(telegram) = &token.social_links.telegram {
+            info!("║   Telegram:    {}", telegram);
+        }
     }
     
     info!("╚════════════════════════════════════════════════════════════════");
+    
+    
     info!("");
-
-    // TODO: Add your pool analysis logic here
-    // - Check liquidity amount
-    // - Verify lock period
-    // - Analyze initial price
-    // - Make buy decision
-    
-    analyze_and_decide_pool(event);
 }
 
-/// Analyze mint event and decide whether to buy
-fn analyze_and_decide_mint(event: helius_listener::MintEvent) {
-    info!("🔍 Analyzing mint event for potential trade...");
-    
-    // Example decision logic
-    match event.platform.as_str() {
-        "Pump.fun" => {
-            info!("📊 Pump.fun token detected - applying Pump.fun strategy");
-            // TODO: Implement Pump.fun specific strategy
-            // - Check bonding curve progress
-            // - Analyze social signals
-            // - Fast buy if criteria met
-        }
-        "Raydium Launchlab" => {
-            info!("📊 Raydium Launchlab token detected - applying Raydium strategy");
-            // TODO: Implement Raydium Launchlab strategy
-            // - Wait for pool creation
-            // - Check initial liquidity
-            // - Buy on pool creation
-        }
-        "SPL Token" | "Token 2022" => {
-            info!("📊 Standard SPL token detected - waiting for pool creation");
-            // TODO: Wait for corresponding pool creation event
-            // - Track this mint
-            // - Buy when pool is created
-        }
-        _ => {
-            warn!("⚠️  Unknown platform: {}", event.platform);
-        }
-    }
-    
-    // Example: Check if token meets criteria
-    if let Some(decimals) = event.decimals {
-        if decimals != 9 && decimals != 6 {
-            warn!("⚠️  Unusual decimals ({}), skipping", decimals);
-            return;
-        }
-    }
-    
-    // TODO: Implement actual buy logic
-    // execute_buy_order(&event.mint, buy_amount, slippage);
-}
-
-/// Analyze pool creation event and decide whether to buy
-fn analyze_and_decide_pool(event: helius_listener::PoolCreationEvent) {
-    info!("🔍 Analyzing pool creation event for potential trade...");
-    
-    // Example decision logic
-    match event.dex.as_str() {
-        "Raydium AMM v4" | "Raydium CPMM" => {
-            info!("📊 Raydium pool detected - FAST BUY opportunity");
-            // TODO: Implement immediate buy logic
-            // - This is often the best entry point
-            // - Execute buy within same slot if possible
-            // - Use high priority fee
-        }
-        "Orca Whirlpool" => {
-            info!("📊 Orca Whirlpool pool detected");
-            // TODO: Implement Orca strategy
-        }
-        "Pump.fun" => {
-            info!("📊 Pump.fun graduation to Raydium detected");
-            // TODO: Handle Pump.fun graduation
-            // - Token graduated from bonding curve
-            // - Usually good signal
-        }
-        _ => {
-            info!("📊 Pool created on {}", event.dex);
-        }
-    }
-    
-    // Check if paired with SOL (most common)
-    if event.pair_token == "So11111111111111111111111111111111111111112" {
-        info!("✅ SOL pair confirmed - proceeding with analysis");
-        // TODO: Fetch pool liquidity
-        // TODO: Check if liquidity is locked
-        // TODO: Execute buy if criteria met
+fn format_number(num: f64) -> String {
+    if num >= 1_000_000_000.0 {
+        format!("{:.2}B", num / 1_000_000_000.0)
+    } else if num >= 1_000_000.0 {
+        format!("{:.2}M", num / 1_000_000.0)
+    } else if num >= 1_000.0 {
+        format!("{:.2}K", num / 1_000.0)
     } else {
-        warn!("⚠️  Non-SOL pair detected: {}", event.pair_token);
+        format!("{:.2}", num)
     }
-    
-    // TODO: Implement actual buy logic
-    // execute_buy_order(&event.token_mint, buy_amount, slippage);
-}
-
-// ========== UTILITY FUNCTIONS ==========
-
-/// Execute a buy order (placeholder)
-#[allow(dead_code)]
-fn execute_buy_order(mint: &str, amount_sol: f64, slippage_bps: u16) {
-    info!("💰 Executing buy order:");
-    info!("   Token: {}", mint);
-    info!("   Amount: {} SOL", amount_sol);
-    info!("   Slippage: {}%", slippage_bps as f64 / 100.0);
-    
-    // TODO: Implement actual buy execution
-    // 1. Build swap transaction (Jupiter/Raydium)
-    // 2. Set high priority fee for fast execution
-    // 3. Sign and send transaction
-    // 4. Monitor for confirmation
-    // 5. Log trade results
-}
-
-/// Fetch token metadata from chain (placeholder)
-#[allow(dead_code)]
-async fn fetch_token_metadata(mint: &str) -> Result<TokenMetadata> {
-    // TODO: Implement metadata fetching
-    // - Use Metaplex metadata account
-    // - Or use Helius API for parsed metadata
-    
-    Ok(TokenMetadata {
-        name: "Unknown".to_string(),
-        symbol: "???".to_string(),
-        uri: None,
-    })
-}
-
-/// Check for rug pull indicators (placeholder)
-#[allow(dead_code)]
-fn check_rug_pull_indicators(mint: &str) -> RugPullScore {
-    // TODO: Implement rug pull detection
-    // - Check if mint authority is revoked
-    // - Check if freeze authority is revoked
-    // - Analyze top holder concentration
-    // - Check for suspicious patterns
-    
-    RugPullScore {
-        score: 0.0,
-        mint_authority_revoked: false,
-        freeze_authority_revoked: false,
-        top_10_holder_percentage: 0.0,
-        liquidity_locked: false,
-    }
-}
-
-// ========== DATA STRUCTURES ==========
-
-#[allow(dead_code)]
-struct TokenMetadata {
-    name: String,
-    symbol: String,
-    uri: Option<String>,
-}
-
-#[allow(dead_code)]
-struct RugPullScore {
-    score: f64,
-    mint_authority_revoked: bool,
-    freeze_authority_revoked: bool,
-    top_10_holder_percentage: f64,
-    liquidity_locked: bool,
 }

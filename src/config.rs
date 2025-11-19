@@ -8,10 +8,9 @@ pub struct Config {
     pub helius_api_key: String,
     pub private_key: String,
     pub telegram_token: String,
-    pub trading_mode: String,
+    // pub trading_mode: String,
     pub telegram_chat_id: String,
     pub database_url: String,
-    // Risk engine configuration
     pub min_liquidity_sol: f64,
     pub min_holders: u32,
     pub max_trade_size_sol: f64,
@@ -30,7 +29,7 @@ impl Config {
                 .or_else(|_| env::var("SOLANA_PRIVATE_KEY_PATH"))
                 .expect("SOLANA_PRIVATE_KEY or SOLANA_PRIVATE_KEY_PATH required"),
             telegram_token: env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
-            trading_mode: env::var("TRADING_MODE").unwrap_or("devnet".to_string()),
+            // trading_mode: env::var("TRADING_MODE").unwrap_or("devnet".to_string()),
             telegram_chat_id: env::var("TELEGRAM_CHAT_ID").unwrap_or("".to_string()),
             database_url: env::var("DATABASE_URL").unwrap_or("sqlite:./sniper_bot.db".to_string()),
             // Risk engine configuration from environment
@@ -134,8 +133,8 @@ impl Config {
             };
 
         format!(
-            "Config loaded: mode={}, helius_key={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}",
-            self.trading_mode,
+            "Config loaded:  helius_key={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}",
+            // self.trading_mode,
             Self::mask_secret(&self.helius_api_key),
             private_key_display,
             if self.telegram_token.is_empty() { "not_set".to_string() } else { Self::mask_secret(&self.telegram_token) },
