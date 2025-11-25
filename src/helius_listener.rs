@@ -1,8 +1,8 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, error, info, warn};
-use serde::Deserialize;
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -19,44 +19,58 @@ pub struct RawTxEvent {
     pub data: serde_json::Value,
 }
 
-/// Classified event types from the pipeline (SIMPLIFIED - Only Mint and Pool Creation)
+/// Classified event types from the pipeline (POOL CREATION ONLY)
 #[derive(Debug, Clone)]
 pub enum ClassifiedEvent {
-    Mint(MintEvent),
     PoolCreation(PoolCreationEvent),
 }
 
 impl ClassifiedEvent {
     pub fn signature(&self) -> &str {
         match self {
-            ClassifiedEvent::Mint(e) => &e.signature,
             ClassifiedEvent::PoolCreation(e) => &e.signature,
         }
     }
 }
 
-/// Mint event - covers ALL platforms (Raydium Launchlab, Pump.fun, SPL Token, etc.)
-#[derive(Debug, Clone)]
-pub struct MintEvent {
-    pub mint: String,
-    pub signature: String,
-    pub slot: u64,
-    pub timestamp: Option<i64>,
-    pub platform: String, // "SPL Token", "Raydium Launchlab", "Pump.fun", etc.
-    pub decimals: Option<u8>,
-    pub supply: Option<u64>,
-}
-
-/// Pool creation event - covers ALL DEXes (Jupiter, Orca, Raydium AMM, CPMM, etc.)
+/// Pool creation event - covers ALL DEXes with platform detection
 #[derive(Debug, Clone)]
 pub struct PoolCreationEvent {
     pub pool_address: String,
-    pub token_mint: String, // The new token being listed
-    pub pair_token: String, // Usually SOL or USDC
+    pub token_mint: String,     // The new token being listed
+    pub pair_token: String,      // Usually SOL or USDC
     pub signature: String,
     pub slot: u64,
     pub timestamp: Option<i64>,
-    pub dex: String, // "Raydium AMM v4", "Raydium CPMM", "Orca Whirlpool", "Pump.fun", etc.
+    pub dex: String,             // "Raydium AMM v4", "Raydium CPMM", "Orca Whirlpool", etc.
+    pub token_platform: TokenPlatform, // NEW: Track token origin
+    pub is_graduated: bool,      // NEW: True if migrated from bonding curve
+}
+
+/// Token platform detection
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum TokenPlatform {
+    PumpFun,           // Graduated from Pump.fun bonding curve
+    BonkFun,           // Graduated from Bonk.fun bonding curve
+    RaydiumLaunchlab,  // Raydium native launch
+    Standard,          // Standard SPL token
+    Unknown,
+}
+
+impl TokenPlatform {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "Pump.fun" => Self::PumpFun,
+            "Bonk.fun" => Self::BonkFun,
+            "Raydium Launchlab" => Self::RaydiumLaunchlab,
+            "Standard" => Self::Standard,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn is_graduated(&self) -> bool {
+        matches!(self, Self::PumpFun | Self::BonkFun)
+    }
 }
 
 /// Helius WebSocket message types
@@ -99,16 +113,10 @@ struct LogsValue {
     err: Option<serde_json::Value>,
 }
 
-// ========== REAL PROGRAM IDs (Verified on Solana Mainnet) ==========
+// ========== PROGRAM IDs ==========
 
 /// SPL Token program ID
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-
-/// Token-2022 program ID
-const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-
-/// Metaplex Token Metadata program ID
-const METAPLEX_TOKEN_METADATA_PROGRAM_ID: &str = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 
 /// Raydium AMM v4 program ID (Most popular Raydium pools)
 const RAYDIUM_AMM_V4_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -116,37 +124,97 @@ const RAYDIUM_AMM_V4_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSU
 /// Raydium CPMM program ID (Concentrated liquidity)
 const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
-/// Raydium Liquidity Pool V4 (Another variant)
+/// Raydium Liquidity Pool V4
 const RAYDIUM_LIQUIDITY_POOL_V4: &str = "RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZqXgEr";
 
-/// Pump.fun program ID (Bonding curve token launch platform)
+/// Pump.fun program ID (Bonding curve platform)
 const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwi3bTW1w4Q5PgdHzCfyqXYUVh";
 
-/// Orca Whirlpool program ID (Concentrated liquidity AMM)
+/// **CRITICAL: Pump.fun Migration Account** - Monitors token graduations
+const PUMPFUN_MIGRATION_ACCOUNT: &str = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg";
+
+/// Bonk.fun program ID
+const BONK_FUN_PROGRAM_ID: &str = "FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1";
+
+/// Raydium Launchlab program ID
+const RAYDIUM_LAUNCHLAB_PROGRAM_ID: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+
+/// Orca Whirlpool program ID
 const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 /// Jupiter Aggregator v6 program ID
 const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 
-/// Meteora DLMM (Dynamic Liquidity Market Maker)
+/// Meteora DLMM
 const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// Phoenix DEX program ID
 const PHOENIX_PROGRAM_ID: &str = "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY";
 
-/// Start the Helius listener with event pipeline (MAINNET ONLY, WebSocket ONLY)
+// ========== WELL-KNOWN TOKENS (TO EXCLUDE) ==========
+
+/// Wrapped SOL (WSOL)
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// USDC
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+/// USDT
+const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+/// Bonk
+const BONK_MINT: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+
+/// Jito SOL
+const JITOSOL_MINT: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
+
+/// mSOL (Marinade)
+const MSOL_MINT: &str = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So";
+
+/// Pyth
+const PYTH_MINT: &str = "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3";
+
+/// RAY (Raydium)
+const RAY_MINT: &str = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+
+/// ORCA
+const ORCA_MINT: &str = "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE";
+
+/// Jupiter
+const JUP_MINT: &str = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
+
+/// WIF (dogwifhat)
+const WIF_MINT: &str = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm";
+
+/// POPCAT
+const POPCAT_MINT: &str = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr";
+
+// ========== CONNECTION POOL CONFIGURATION ==========
+const WS_POOL_SIZE: usize = 3; // Number of concurrent WebSocket connections
+const PING_INTERVAL_SECS: u64 = 30; // Send ping every 30 seconds to keep connection alive
+
+/// Start the Helius listener with connection pool and optimized sniper architecture
 pub async fn start(config: &Config) -> Result<mpsc::Receiver<ClassifiedEvent>> {
-    let (raw_tx, raw_rx) = mpsc::channel::<RawTxEvent>(1000);
-    let (classified_tx, classified_rx) = mpsc::channel::<ClassifiedEvent>(1000);
+    let (raw_tx, raw_rx) = mpsc::channel::<RawTxEvent>(2000); // Increased buffer for multiple connections
+    let (classified_tx, classified_rx) = mpsc::channel::<ClassifiedEvent>(2000);
 
     let api_key = config.helius_api_key.clone();
 
-    info!("🚀 Starting Helius listener (MAINNET ONLY, WebSocket ONLY)");
+    info!("🚀 Starting Helius Sniper Listener (OPTIMIZED FOR SPEED)");
+    info!("🎯 Strategy: Monitor pool creation + platform detection");
+    info!("⚡ Focus: Pump.fun/Bonk.fun graduated tokens ONLY");
+    info!("🔗 Connection Pool: {} WebSocket connections", WS_POOL_SIZE);
+    info!("💓 Heartbeat: Ping every {}s to prevent disconnection", PING_INTERVAL_SECS);
 
-    // Start the websocket listener
-    tokio::spawn(async move {
-        listener_loop(api_key, raw_tx).await;
-    });
+    // Start multiple websocket listeners (connection pool)
+    for connection_id in 0..WS_POOL_SIZE {
+        let api_key_clone = api_key.clone();
+        let raw_tx_clone = raw_tx.clone();
+        
+        tokio::spawn(async move {
+            listener_loop(connection_id, api_key_clone, raw_tx_clone).await;
+        });
+    }
 
     // Start the event classification pipeline
     tokio::spawn(async move {
@@ -158,24 +226,24 @@ pub async fn start(config: &Config) -> Result<mpsc::Receiver<ClassifiedEvent>> {
     Ok(classified_rx)
 }
 
-async fn listener_loop(api_key: String, tx: mpsc::Sender<RawTxEvent>) {
+async fn listener_loop(connection_id: usize, api_key: String, tx: mpsc::Sender<RawTxEvent>) {
     let mut backoff_seconds = 1;
     let max_backoff = 60;
 
-    info!("Listener starting (MAINNET WebSocket only)");
+    info!("[Connection #{}] Listener starting (MAINNET WebSocket)", connection_id);
 
     loop {
-        info!("Connecting to Helius WebSocket (mainnet)");
+        info!("[Connection #{}] Connecting to Helius WebSocket (mainnet)", connection_id);
 
-        match connect_and_listen(&api_key, &tx).await {
+        match connect_and_listen(connection_id, &api_key, &tx).await {
             Ok(()) => {
-                info!("WebSocket connection closed normally");
+                info!("[Connection #{}] WebSocket connection closed normally", connection_id);
                 backoff_seconds = 1;
             }
             Err(e) => {
                 error!(
-                    "WebSocket error: {}. Reconnecting in {}s...",
-                    e, backoff_seconds
+                    "[Connection #{}] WebSocket error: {}. Reconnecting in {}s...",
+                    connection_id, e, backoff_seconds
                 );
                 sleep(Duration::from_secs(backoff_seconds)).await;
                 backoff_seconds = std::cmp::min(backoff_seconds * 2, max_backoff);
@@ -185,14 +253,15 @@ async fn listener_loop(api_key: String, tx: mpsc::Sender<RawTxEvent>) {
 }
 
 async fn connect_and_listen(
+    connection_id: usize,
     api_key: &str,
     tx: &mpsc::Sender<RawTxEvent>,
 ) -> Result<()> {
-    // MAINNET ONLY - Helius WebSocket endpoint
     let ws_url = format!("wss://mainnet.helius-rpc.com/?api-key={}", api_key);
 
     info!(
-        "Connecting to Helius WebSocket: {}",
+        "[Connection #{}] Connecting to Helius WebSocket: {}",
+        connection_id,
         ws_url.replace(api_key, "***")
     );
 
@@ -200,44 +269,32 @@ async fn connect_and_listen(
         .await
         .context("Failed to connect to Helius WebSocket")?;
 
-    info!("✅ Connected to Helius WebSocket (mainnet)");
+    info!("[Connection #{}] ✅ Connected to Helius WebSocket (mainnet)", connection_id);
 
     let (mut write, mut read) = ws_stream.split();
 
-    // ========== SUBSCRIBE TO MINT EVENTS (All Platforms) ==========
-    // We use logsSubscribe because it catches mint events from ALL platforms
-    // including Pump.fun bonding curves, Raydium Launchlab, and standard SPL mints
+    // ========== CRITICAL: PUMP.FUN MIGRATION MONITORING ==========
+    // This catches tokens graduating from bonding curve to Raydium
+    let pumpfun_migration_sub = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "logsSubscribe",
+        "params": [
+            {
+                "mentions": [PUMPFUN_MIGRATION_ACCOUNT]
+            },
+            {
+                "commitment": "confirmed"
+            }
+        ]
+    });
 
-    let mint_programs = vec![
-        (1, SPL_TOKEN_PROGRAM_ID, "SPL Token"),
-        (2, TOKEN_2022_PROGRAM_ID, "Token 2022"),
-        (3, METAPLEX_TOKEN_METADATA_PROGRAM_ID, "Metaplex Metadata"),
-        (4, PUMP_FUN_PROGRAM_ID, "Pump.fun"),
-    ];
+    write
+        .send(Message::Text(pumpfun_migration_sub.to_string()))
+        .await?;
+    info!("[Connection #{}] 🎯 PRIORITY: Subscribed to Pump.fun Migration Account", connection_id);
 
-    for (id, program_id, name) in mint_programs {
-        let subscribe_msg = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "logsSubscribe",
-            "params": [
-                {
-                    "mentions": [program_id]
-                },
-                {
-                    "commitment": "confirmed"
-                }
-            ]
-        });
-
-        write
-            .send(Message::Text(subscribe_msg.to_string()))
-            .await?;
-        info!("📡 Subscribed to mint events for {}", name);
-    }
-
-    // ========== SUBSCRIBE TO POOL CREATION EVENTS (All DEXes) ==========
-
+    // ========== POOL CREATION MONITORING (ALL DEXes) ==========
     let dex_programs = vec![
         (10, RAYDIUM_AMM_V4_PROGRAM_ID, "Raydium AMM v4"),
         (11, RAYDIUM_CPMM_PROGRAM_ID, "Raydium CPMM"),
@@ -246,6 +303,7 @@ async fn connect_and_listen(
         (14, JUPITER_V6_PROGRAM_ID, "Jupiter v6"),
         (15, METEORA_DLMM_PROGRAM_ID, "Meteora DLMM"),
         (16, PHOENIX_PROGRAM_ID, "Phoenix DEX"),
+        (17, PUMP_FUN_PROGRAM_ID, "Pump.fun"), // Direct pool creation
     ];
 
     for (id, program_id, name) in dex_programs {
@@ -266,30 +324,63 @@ async fn connect_and_listen(
         write
             .send(Message::Text(subscribe_msg.to_string()))
             .await?;
-        info!("📡 Subscribed to pool creation events for {}", name);
+        info!("[Connection #{}] 📡 Subscribed to pool creation: {}", connection_id, name);
     }
 
-    // Listen for messages
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if let Err(e) = handle_message(&text, api_key, tx).await {
-                    warn!("Error handling message: {}", e);
+    // ========== HEARTBEAT/PING TASK ==========
+    // Spawn a task to send periodic pings to keep connection alive
+    let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+        loop {
+            interval.tick().await;
+            if ping_tx.send(()).await.is_err() {
+                break; // Connection closed
+            }
+        }
+    });
+
+    // Listen for messages and handle pings
+    loop {
+        tokio::select! {
+            // Handle incoming messages
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Err(e) = handle_message(&text, api_key, tx).await {
+                            warn!("[Connection #{}] Error handling message: {}", connection_id, e);
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        info!("[Connection #{}] WebSocket closed by server", connection_id);
+                        break;
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        if let Err(e) = write.send(Message::Pong(data)).await {
+                            error!("[Connection #{}] Failed to send pong: {}", connection_id, e);
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        // Received pong response - connection is alive
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        return Err(anyhow::anyhow!("[Connection #{}] WebSocket error: {}", connection_id, e));
+                    }
+                    None => {
+                        info!("[Connection #{}] WebSocket stream ended", connection_id);
+                        break;
+                    }
                 }
             }
-            Ok(Message::Close(_)) => {
-                info!("WebSocket closed by server");
-                break;
-            }
-            Ok(Message::Ping(data)) => {
-                // Respond to ping to keep connection alive
-                let _ = write.send(Message::Pong(data)).await;
-            }
-            Ok(_) => {
-                // Ignore other message types
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("WebSocket error: {}", e));
+            // Send periodic pings
+            Some(_) = ping_rx.recv() => {
+                if let Err(e) = write.send(Message::Ping(vec![])).await {
+                    error!("[Connection #{}] Failed to send ping: {}", connection_id, e);
+                    break;
+                }
+                info!("[Connection #{}] 💓 Sent heartbeat ping", connection_id);
             }
         }
     }
@@ -324,24 +415,23 @@ async fn handle_message(
             let logs = params.result.value.logs;
             let slot = params.result.context.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
 
-            // Quick filter: Check if logs contain keywords for mint or pool creation
-            let is_relevant = logs.iter().any(|log| {
-                log.contains("InitializeMint") ||
+            // CRITICAL: Quick filter for pool creation keywords
+            let is_pool_creation = logs.iter().any(|log| {
                 log.contains("initialize") ||
+                log.contains("Initialize2") ||
+                log.contains("InitializePool") ||
                 log.contains("create") ||
                 log.contains("CreatePool") ||
-                log.contains("Initialize2") ||
-                log.contains("InitializePool")
+                log.contains(PUMPFUN_MIGRATION_ACCOUNT) // Graduation event!
             });
 
-            if !is_relevant {
-                // Skip transactions that don't contain relevant keywords
+            if !is_pool_creation {
                 return Ok(());
             }
 
-            info!("🔍 Relevant transaction detected: {}", signature);
+            info!("⚡ Pool creation detected: {}", signature);
 
-            // Fetch the full transaction
+            // Fetch full transaction details
             let client = reqwest::Client::new();
             let rpc_url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
             
@@ -365,10 +455,10 @@ async fn handle_message(
                     };
 
                     if tx.send(raw_event).await.is_err() {
-                        warn!("Failed to send event to channel (receiver dropped)");
+                        warn!("Failed to send event to channel");
                         return Err(anyhow::anyhow!("Channel receiver dropped"));
                     }
-                    info!("✅ Processed transaction: {}", signature);
+                    info!("✅ Forwarded transaction: {}", signature);
                 }
                 Err(e) => {
                     warn!("Failed to fetch transaction {}: {}", signature, e);
@@ -380,16 +470,16 @@ async fn handle_message(
     Ok(())
 }
 
-/// Event classification pipeline with debouncing
+/// Event classification pipeline - POOL CREATION ONLY
 async fn event_pipeline(
     mut raw_rx: mpsc::Receiver<RawTxEvent>,
     classified_tx: mpsc::Sender<ClassifiedEvent>,
 ) -> Result<()> {
     let mut event_buffer: HashMap<String, RawTxEvent> = HashMap::new();
     let mut last_process_time = Instant::now();
-    let debounce_duration = Duration::from_millis(300);
+    let debounce_duration = Duration::from_millis(100); // Reduced for speed
 
-    info!("🎯 Event classification pipeline started (MINT + POOL CREATION ONLY)");
+    info!("🎯 Event pipeline started (POOL CREATION ONLY - OPTIMIZED FOR SPEED)");
 
     loop {
         tokio::select! {
@@ -406,7 +496,7 @@ async fn event_pipeline(
     }
 }
 
-/// Process a batch of buffered events and classify them
+/// Process event batch
 async fn process_event_batch(
     event_buffer: &mut HashMap<String, RawTxEvent>,
     classified_tx: &mpsc::Sender<ClassifiedEvent>,
@@ -416,287 +506,271 @@ async fn process_event_batch(
     info!("📦 Processing batch of {} events", events.len());
 
     for (_key, event) in events {
-        if let Some(classified_event) = classify_event(&event) {
-            let event_type = match &classified_event {
-                ClassifiedEvent::Mint(_) => "🪙 MINT",
-                ClassifiedEvent::PoolCreation(_) => "🏊 POOL CREATION",
-            };
-            info!("{} event detected: {}", event_type, event.signature);
+        if let Some(pool_event) = detect_pool_creation_event(&event) {
+            // Log graduated tokens prominently
+            if pool_event.is_graduated {
+                info!(
+                    "🎓 GRADUATED TOKEN DETECTED: {} (platform: {:?}, dex: {})",
+                    pool_event.token_mint,
+                    pool_event.token_platform,
+                    pool_event.dex
+                );
+            }
+
+            info!("🏊 POOL CREATION: {:#?}", pool_event);
             
-            // ========== LOG FULL EVENT DATA BEFORE SENDING ==========
-            info!("📤 SENDING CLASSIFIED EVENT: {:#?}", classified_event);
-            // ========================================================
-            
-            if classified_tx.send(classified_event).await.is_err() {
-                warn!("Failed to send classified event (receiver dropped)");
+            if classified_tx.send(ClassifiedEvent::PoolCreation(pool_event)).await.is_err() {
+                warn!("Failed to send pool event (receiver dropped)");
                 break;
             }
         }
     }
 }
 
-/// Classify a single event (MINT or POOL CREATION only)
-fn classify_event(event: &RawTxEvent) -> Option<ClassifiedEvent> {
+/// Detect pool creation events with platform detection
+fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     let transaction = event.data.get("transaction")?;
     let logs = event.data.get("logs")?;
     let meta = event.data.get("meta");
+    let logs_array = logs.as_array()?;
 
-    // Check logs for mint events
-    if let Some(mint_event) = detect_mint_event(event, transaction, logs, meta) {
-        return Some(ClassifiedEvent::Mint(mint_event));
+    // Extract token mints first
+    let (token_mint, pair_token) = extract_pool_tokens(transaction, meta)?;
+
+    // CRITICAL: Filter out established tokens and invalid pairs
+    if !is_valid_new_token_pair(&token_mint, &pair_token) {
+        return None;
     }
 
-    // Check logs for pool creation events
-    if let Some(pool_event) = detect_pool_creation_event(event, transaction, logs, meta) {
-        return Some(ClassifiedEvent::PoolCreation(pool_event));
+    // Detect platform from transaction account keys (SECURE)
+    let token_platform = detect_token_platform(transaction, logs_array);
+    let is_graduated = token_platform.is_graduated();
+
+    // ========== SNIPER BOT: GRADUATED TOKENS ONLY ==========
+    // CRITICAL: Reject ALL non-graduated tokens
+    // Only process Pump.fun and Bonk.fun graduated tokens
+    if !is_graduated {
+        warn!("🚫 REJECTED: Non-graduated token {} - GRADUATED ONLY MODE", token_mint);
+        warn!("   Platform: {:?} | Graduated: {} | DEX: N/A", token_platform, is_graduated);
+        return None;
     }
 
-    None
+    info!("🎓 GRADUATED TOKEN DETECTED: {} (platform: {:?})", token_mint, token_platform);
+
+    // Detect DEX
+    let dex = detect_dex_from_logs(logs_array)?;
+
+    // Extract pool address
+    let pool_address = extract_pool_address(transaction, meta, logs_array)?;
+
+    Some(PoolCreationEvent {
+        pool_address,
+        token_mint,
+        pair_token,
+        signature: event.signature.clone(),
+        slot: event.slot,
+        timestamp: event.timestamp,
+        dex,
+        token_platform,
+        is_graduated,
+    })
 }
 
-/// Detect mint events from transaction logs (ALL PLATFORMS)
-fn detect_mint_event(
-    event: &RawTxEvent,
+/// Detect token platform from transaction account keys and logs
+/// SECURITY: Uses cryptographic proof via account keys, NOT mint suffix
+fn detect_token_platform(
     transaction: &serde_json::Value,
-    logs: &serde_json::Value,
-    meta: Option<&serde_json::Value>,
-) -> Option<MintEvent> {
-    let logs_array = logs.as_array()?;
-    
-    // First, check if this involves Pump.fun by looking at mint address suffix
-    let mint_address = extract_mint_address(transaction, meta)?;
-    
-    // Pump.fun tokens end with "pump" - this is the most reliable detection
-    let platform = if mint_address.ends_with("pump") {
-        "Pump.fun".to_string()
-    } else {
-        // Check logs for platform-specific program IDs
-        determine_mint_platform(logs_array).unwrap_or("SPL Token".to_string())
-    };
-    
-    // Check for SPL Token InitializeMint
-    for log in logs_array {
-        let log_str = log.as_str()?;
-        
-        if log_str.contains("InitializeMint") || log_str.contains("Initialize2") {
-            let decimals = extract_decimals(transaction, meta);
-            
-            return Some(MintEvent {
-                mint: mint_address,
-                signature: event.signature.clone(),
-                slot: event.slot,
-                timestamp: event.timestamp,
-                platform,
-                decimals,
-                supply: extract_supply(meta),
-            });
-        }
-    }
-    
-    None
-}
-
-/// Detect pool creation events from transaction logs (ALL DEXes)
-fn detect_pool_creation_event(
-    event: &RawTxEvent,
-    transaction: &serde_json::Value,
-    logs: &serde_json::Value,
-    meta: Option<&serde_json::Value>,
-) -> Option<PoolCreationEvent> {
-    let logs_array = logs.as_array()?;
-    
-    // Pool creation keywords by DEX
-    let pool_keywords = [
-        ("initialize", "Raydium"),
-        ("InitializePool", "Raydium"),
-        ("create", "Orca"),
-        ("CreatePool", "Orca"),
-        ("initialize_pool", "Meteora"),
-        ("create_pool", "Phoenix"),
-    ];
-    
-    for log in logs_array {
-        let log_str = log.as_str()?;
-        
-        for (keyword, dex) in &pool_keywords {
-            if log_str.contains(keyword) {
-                // Extract pool details
-                let pool_address = extract_pool_address(transaction, meta, log_str)?;
-                let (token_mint, pair_token) = extract_pool_tokens(transaction, meta)?;
+    logs: &[serde_json::Value]
+) -> TokenPlatform {
+    // LAYER 1: Check account keys (MOST SECURE - cryptographic proof)
+    // This cannot be faked by scammers creating tokens ending in "pump" or "bonk"
+    if let Some(message) = transaction.get("message") {
+        if let Some(account_keys) = message.get("accountKeys").and_then(|k| k.as_array()) {
+            for key in account_keys {
+                // Extract pubkey (handles both string and object formats)
+                let pubkey = if let Some(obj) = key.as_object() {
+                    obj.get("pubkey").and_then(|p| p.as_str()).unwrap_or("")
+                } else {
+                    key.as_str().unwrap_or("")
+                };
                 
-                return Some(PoolCreationEvent {
-                    pool_address,
-                    token_mint,
-                    pair_token,
-                    signature: event.signature.clone(),
-                    slot: event.slot,
-                    timestamp: event.timestamp,
-                    dex: dex.to_string(),
-                });
-            }
-        }
-    }
-    
-    None
-}
-
-/// Extract mint address from transaction
-fn extract_mint_address(
-    transaction: &serde_json::Value,
-    meta: Option<&serde_json::Value>,
-) -> Option<String> {
-    // Try to get from postTokenBalances (most reliable)
-    if let Some(meta) = meta {
-        if let Some(post_balances) = meta.get("postTokenBalances").and_then(|b| b.as_array()) {
-            if let Some(first) = post_balances.first() {
-                if let Some(mint) = first.get("mint").and_then(|m| m.as_str()) {
-                    return Some(mint.to_string());
+                // Check for Pump.fun migration account (graduated tokens)
+                if pubkey == PUMPFUN_MIGRATION_ACCOUNT {
+                    return TokenPlatform::PumpFun;
+                }
+                
+                // Check for Bonk.fun program
+                if pubkey == BONK_FUN_PROGRAM_ID {
+                    return TokenPlatform::BonkFun;
+                }
+                
+                // Check for Raydium Launchlab
+                if pubkey == RAYDIUM_LAUNCHLAB_PROGRAM_ID {
+                    return TokenPlatform::RaydiumLaunchlab;
                 }
             }
         }
     }
-    
-    // Fallback: parse from account keys
+
+    // LAYER 2: Check logs for program IDs (FALLBACK)
+    // Less secure than account keys but still validates program interaction
+    for log in logs {
+        if let Some(log_str) = log.as_str() {
+            // Check for Pump.fun migration account (CRITICAL for graduated tokens)
+            if log_str.contains(PUMPFUN_MIGRATION_ACCOUNT) {
+                return TokenPlatform::PumpFun;
+            }
+            
+            // Check for other program IDs
+            if log_str.contains(PUMP_FUN_PROGRAM_ID) {
+                return TokenPlatform::PumpFun;
+            }
+            if log_str.contains(BONK_FUN_PROGRAM_ID) {
+                return TokenPlatform::BonkFun;
+            }
+            if log_str.contains(RAYDIUM_LAUNCHLAB_PROGRAM_ID) {
+                return TokenPlatform::RaydiumLaunchlab;
+            }
+        }
+    }
+
+    // DEFAULT: Treat as Standard (SAFE)
+    // If we can't cryptographically prove it's from a platform, assume it's not
+    TokenPlatform::Standard
+}
+
+/// Detect DEX from logs
+fn detect_dex_from_logs(logs: &[serde_json::Value]) -> Option<String> {
+    for log in logs {
+        if let Some(log_str) = log.as_str() {
+            if log_str.contains(RAYDIUM_AMM_V4_PROGRAM_ID) {
+                return Some("Raydium AMM v4".to_string());
+            }
+            if log_str.contains(RAYDIUM_CPMM_PROGRAM_ID) {
+                return Some("Raydium CPMM".to_string());
+            }
+            if log_str.contains(ORCA_WHIRLPOOL_PROGRAM_ID) {
+                return Some("Orca Whirlpool".to_string());
+            }
+            if log_str.contains(METEORA_DLMM_PROGRAM_ID) {
+                return Some("Meteora DLMM".to_string());
+            }
+            if log_str.contains(JUPITER_V6_PROGRAM_ID) {
+                return Some("Jupiter v6".to_string());
+            }
+            if log_str.contains(PHOENIX_PROGRAM_ID) {
+                return Some("Phoenix".to_string());
+            }
+            if log_str.contains(PUMP_FUN_PROGRAM_ID) {
+                return Some("Pump.fun".to_string()); 
+            }
+        }
+    }
+    Some("Unknown DEX".to_string())
+}
+
+/// Extract pool address
+fn extract_pool_address(
+    transaction: &serde_json::Value,
+    _meta: Option<&serde_json::Value>,
+    logs: &[serde_json::Value],
+) -> Option<String> {
+    // Try to parse from logs
+    for log in logs {
+        if let Some(log_str) = log.as_str() {
+            if let Some(addr_start) = log_str.find("pool: ") {
+                let addr = &log_str[addr_start + 6..]; 
+                if let Some(space_idx) = addr.find(' ') {
+                    return Some(addr[..space_idx].to_string());
+                }
+            }
+        }
+    }
+
+    // Fallback: get from account keys
     let message = transaction.get("message")?;
     let account_keys = message.get("accountKeys")?.as_array()?;
-    
-    // Usually mint is the first account after program IDs
+
+    // Return first writable non-program account
     for key in account_keys {
         if let Some(pubkey) = key.get("pubkey").and_then(|p| p.as_str()) {
-            // Skip known program IDs
-            if !is_program_id(pubkey) {
+            if !is_program_id(pubkey) && !is_token_mint(pubkey) {
                 return Some(pubkey.to_string());
             }
         } else if let Some(pubkey_str) = key.as_str() {
-            if !is_program_id(pubkey_str) {
+            if !is_program_id(pubkey_str) && !is_token_mint(pubkey_str) {
                 return Some(pubkey_str.to_string());
             }
         }
     }
-    
+
     None
 }
 
-/// Extract decimals from transaction
-fn extract_decimals(
-    transaction: &serde_json::Value,
-    meta: Option<&serde_json::Value>,
-) -> Option<u8> {
-    if let Some(meta) = meta {
-        if let Some(post_balances) = meta.get("postTokenBalances").and_then(|b| b.as_array()) {
-            if let Some(first) = post_balances.first() {
-                if let Some(decimals) = first.get("uiTokenAmount")
-                    .and_then(|u| u.get("decimals"))
-                    .and_then(|d| d.as_u64()) {
-                    return Some(decimals as u8);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract supply from metadata
-fn extract_supply(meta: Option<&serde_json::Value>) -> Option<u64> {
-    if let Some(meta) = meta {
-        if let Some(post_balances) = meta.get("postTokenBalances").and_then(|b| b.as_array()) {
-            if let Some(first) = post_balances.first() {
-                if let Some(amount) = first.get("uiTokenAmount")
-                    .and_then(|u| u.get("amount"))
-                    .and_then(|a| a.as_str())
-                    .and_then(|s| s.parse::<u64>().ok()) {
-                    return Some(amount);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Determine mint platform from logs and mint address
-fn determine_mint_platform(logs: &[serde_json::Value]) -> Option<String> {
-    for log in logs {
-        if let Some(log_str) = log.as_str() {
-            // Check for Pump.fun program ID in logs
-            if log_str.contains("6EF8rrecthR5Dkzon8Nwi3bTW1w4Q5PgdHzCfyqXYUVh") 
-                || log_str.contains(PUMP_FUN_PROGRAM_ID) {
-                return Some("Pump.fun".to_string());
-            }
-            // Check for Raydium program IDs
-            if log_str.contains("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8") 
-                || log_str.contains(RAYDIUM_AMM_V4_PROGRAM_ID)
-                || log_str.contains(RAYDIUM_CPMM_PROGRAM_ID) {
-                return Some("Raydium Launchlab".to_string());
-            }
-        }
-    }
-    Some("SPL Token".to_string())
-}
-
-/// Extract pool address from transaction
-fn extract_pool_address(
-    transaction: &serde_json::Value,
-    meta: Option<&serde_json::Value>,
-    log: &str,
-) -> Option<String> {
-    // Try to parse from logs first
-    if let Some(addr_start) = log.find("pool: ") {
-        let addr = &log[addr_start + 6..];
-        if let Some(space_idx) = addr.find(' ') {
-            return Some(addr[..space_idx].to_string());
-        }
-    }
-    
-    // Fallback: get from account keys
-    let message = transaction.get("message")?;
-    let account_keys = message.get("accountKeys")?.as_array()?;
-    
-    // Pool address is usually one of the writable accounts
-    if let Some(meta) = meta {
-        // Check for newly created accounts (pool accounts)
-        // This is a heuristic - adjust based on actual transaction structure
-    }
-    
-    // Return first non-program account as pool address
-    for key in account_keys {
-        if let Some(pubkey) = key.get("pubkey").and_then(|p| p.as_str()) {
-            if !is_program_id(pubkey) {
-                return Some(pubkey.to_string());
-            }
-        }
-    }
-    
-    None
-}
-
-/// Extract token pair from pool creation
+/// Extract token pair from pool
+/// CRITICAL: Always returns (new_token, well_known_token) to prevent well-known tokens from being enriched
 fn extract_pool_tokens(
     transaction: &serde_json::Value,
     meta: Option<&serde_json::Value>,
 ) -> Option<(String, String)> {
-    if let Some(meta) = meta {
+    // Extract raw tokens first
+    let (token_a, token_b) = if let Some(meta) = meta {
         if let Some(post_balances) = meta.get("postTokenBalances").and_then(|b| b.as_array()) {
             if post_balances.len() >= 2 {
                 let token_a = post_balances[0].get("mint")?.as_str()?;
                 let token_b = post_balances[1].get("mint")?.as_str()?;
-                return Some((token_a.to_string(), token_b.to_string()));
+                (token_a.to_string(), token_b.to_string())
+            } else if post_balances.len() == 1 {
+                let token = post_balances[0].get("mint")?.as_str()?;
+                (token.to_string(), "So11111111111111111111111111111111111111112".to_string())
+            } else {
+                // Fallback to account keys parsing
+                extract_from_account_keys(transaction)?
             }
+        } else {
+            // Fallback to account keys parsing
+            extract_from_account_keys(transaction)?
         }
-    }
-    
-    // Fallback: assume SOL pair
+    } else {
+        // Fallback to account keys parsing
+        extract_from_account_keys(transaction)?
+    };
+
+    // CRITICAL FIX: Ensure new token is always first, well-known token second
+    // This prevents SOL/USDC/USDT from being enriched as new tokens
+    let (new_token, pair_token) = if is_well_known_token(&token_a) && !is_well_known_token(&token_b) {
+        // token_a is well-known, token_b is new -> swap to put new token first
+        (token_b, token_a)
+    } else if is_well_known_token(&token_b) && !is_well_known_token(&token_a) {
+        // token_b is well-known, token_a is new -> already in correct order
+        (token_a, token_b)
+    } else {
+        // Neither or both are well-known - will be filtered by is_valid_new_token_pair
+        // Keep original order
+        (token_a, token_b)
+    };
+
+    Some((new_token, pair_token))
+}
+
+/// Helper function to extract tokens from account keys (fallback method)
+fn extract_from_account_keys(transaction: &serde_json::Value) -> Option<(String, String)> {
     let message = transaction.get("message")?;
     let account_keys = message.get("accountKeys")?.as_array()?;
-    
+
     let mut tokens = Vec::new();
     for key in account_keys {
         if let Some(pubkey) = key.get("pubkey").and_then(|p| p.as_str()) {
-            if !is_program_id(pubkey) {
+            if !is_program_id(pubkey) && is_token_mint(pubkey) {
                 tokens.push(pubkey.to_string());
+            }
+        } else if let Some(pubkey_str) = key.as_str() {
+            if !is_program_id(pubkey_str) && is_token_mint(pubkey_str) {
+                tokens.push(pubkey_str.to_string());
             }
         }
     }
-    
+
     if tokens.len() >= 2 {
         Some((tokens[0].clone(), tokens[1].clone()))
     } else if tokens.len() == 1 {
@@ -711,22 +785,94 @@ fn is_program_id(address: &str) -> bool {
     matches!(
         address,
         SPL_TOKEN_PROGRAM_ID
-            | TOKEN_2022_PROGRAM_ID
-            | METAPLEX_TOKEN_METADATA_PROGRAM_ID
             | RAYDIUM_AMM_V4_PROGRAM_ID
             | RAYDIUM_CPMM_PROGRAM_ID
             | RAYDIUM_LIQUIDITY_POOL_V4
             | PUMP_FUN_PROGRAM_ID
+            | BONK_FUN_PROGRAM_ID
+            | RAYDIUM_LAUNCHLAB_PROGRAM_ID
             | ORCA_WHIRLPOOL_PROGRAM_ID
             | JUPITER_V6_PROGRAM_ID
             | METEORA_DLMM_PROGRAM_ID
             | PHOENIX_PROGRAM_ID
-            | "11111111111111111111111111111111" // System program
-            | "ComputeBudget111111111111111111111111111111" // Compute budget
+            | "11111111111111111111111111111111"
+            | "ComputeBudget111111111111111111111111111111"
     )
 }
 
-/// Fetch full transaction details for a signature
+/// Heuristic to check if address looks like a token mint
+fn is_token_mint(address: &str) -> bool {
+    address.len() == 44 && !is_program_id(address)
+}
+
+/// Check if a token is a well-known/established token that should be excluded
+fn is_well_known_token(mint: &str) -> bool {
+    matches!(
+        mint,
+        WSOL_MINT
+            | USDC_MINT
+            | USDT_MINT
+            | BONK_MINT
+            | JITOSOL_MINT
+            | MSOL_MINT
+            | PYTH_MINT
+            | RAY_MINT
+            | ORCA_MINT
+            | JUP_MINT
+            | WIF_MINT
+            | POPCAT_MINT
+    )
+}
+
+/// Validate that this is a new token pairing (not two established tokens)
+fn is_valid_new_token_pair(token_a: &str, token_b: &str) -> bool {
+    // Both tokens cannot be the same
+    if token_a == token_b {
+        warn!("⚠️ Rejected: Both tokens are identical ({})", token_a);
+        return false;
+    }
+
+    // At least one token must be SOL/USDC/USDT (the pair token)
+    let has_valid_pair = token_a == WSOL_MINT
+        || token_b == WSOL_MINT
+        || token_a == USDC_MINT
+        || token_b == USDC_MINT
+        || token_a == USDT_MINT
+        || token_b == USDT_MINT;
+
+    if !has_valid_pair {
+        warn!(
+            "⚠️ Rejected: No valid pair token (SOL/USDC/USDT) found. Tokens: {} / {}",
+            token_a, token_b
+        );
+        return false;
+    }
+
+    // Determine which is the new token and which is the pair
+    let (new_token, pair_token) = if token_a == WSOL_MINT || token_a == USDC_MINT || token_a == USDT_MINT {
+        (token_b, token_a)
+    } else {
+        (token_a, token_b)
+    };
+
+    // The new token cannot be a well-known token
+    if is_well_known_token(new_token) {
+        warn!(
+            "⚠️ Rejected: Token {} is a well-known established token",
+            new_token
+        );
+        return false;
+    }
+
+    // Valid new token pair
+    info!(
+        "✅ Valid new token pair detected: {} paired with {}",
+        new_token, pair_token
+    );
+    true
+}
+
+/// Fetch transaction details
 async fn fetch_transaction(
     client: &reqwest::Client,
     rpc_url: &str,

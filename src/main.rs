@@ -1,14 +1,28 @@
 mod config;
 mod helius_listener;
 mod enrichment;
+mod scoring;
+mod risk_engine;
+mod presigner;
+mod tx;
+mod db;
+mod tele;
+mod position_tracker;
+mod rate_limiter;
+mod retry;
+mod wallet_monitor;
 
 use anyhow::Result;
-use enrichment::{EnrichedToken, TokenEnricher};
-use helius_listener::ClassifiedEvent;
 use log::{error, info, warn};
 use tokio::signal;
-use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use scoring::TokenScorer;
+use risk_engine::RiskEngine;
+use presigner::Presigner;
+use tx::TransactionManager;
+use db::Database;
+use tele::TelegramInterface;
+use config::Config;
+use position_tracker::{PositionTracker, Position};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -17,27 +31,22 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    info!("🚀 Starting Solana Token Launch Monitor with Enrichment");
+    info!("🚀 Starting Invictus Sniper Bot");
     info!("================================================");
 
-    // Load configuration
+    // 1. Load Configuration
     let config = config::Config::load();
     info!("✅ Configuration loaded successfully");
+    
+    // Display config (masked)
+    info!("{}", config.display());
 
-    // Validate configuration
-    validate_config(&config)?;
-
-    info!("🔑 Helius API key configured: {}***", &config.helius_api_key[..8]);
-    info!("🔑 Private key configured: {}***", &config.private_key[..8]); 
-    info!("🔑 Telegram Bot Token configured: {}***", &config.telegram_token[..8]);
-    info!("🔑 Telegram Chat Id configured: {}***", &config.telegram_chat_id[..5]);
-    info!("================================================");
-
-    // Start Helius listener
-    info!("🎯 Starting Helius WebSocket listener...");
-    let mut event_receiver = match helius_listener::start(&config).await {
+    // 2. Start Helius Listener (Producer)
+    // Returns a receiver for ClassifiedEvent
+    info!("🎯 Starting Helius Listener...");
+    let classified_rx = match helius_listener::start(&config).await {
         Ok(rx) => {
-            info!("✅ Helius listener started successfully");
+            info!("✅ Helius listener started");
             rx
         }
         Err(e) => {
@@ -46,242 +55,245 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Create token enricher with caching
-    info!("🔍 Initializing token enricher with 5-minute cache...");
-    let enricher = TokenEnricher::new(config.helius_api_key.clone());
-    info!("✅ Token enricher initialized");
-
-    // Create channel for enriched tokens
-    let (enriched_tx, mut enriched_rx) = mpsc::channel::<EnrichedToken>(100);
-
-    // Spawn enrichment worker
-    let enricher_clone = enricher.clone();
-    tokio::spawn(async move {
-        info!("🔄 Enrichment worker started");
-        while let Some(event) = event_receiver.recv().await {
-            let event_sig = event.signature().to_string();
-            info!("📥 Received event: {}", event_sig);
-            
-            match enricher_clone.enrich_event(&event).await {
-                Ok(enriched) => {
-                    info!("✅ Successfully enriched: {} ({})", 
-                        enriched.mint, 
-                        enriched.symbol.as_deref().unwrap_or("NO_SYMBOL")
-                    );
-                    
-                    if let Err(e) = enriched_tx.send(enriched).await {
-                        error!("❌ Failed to send enriched token: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Failed to enrich event {}: {}", event_sig, e);
-                }
-            }
+    // 3. Start Enrichment Pipeline (Processor)
+    // Takes ClassifiedEvent receiver, returns EnrichedToken receiver
+    info!("🔍 Starting Enrichment Pipeline...");
+    let mut enriched_rx = match enrichment::start(&config, classified_rx).await {
+        Ok(rx) => {
+            info!("✅ Enrichment pipeline started");
+            rx
         }
-        warn!("⚠️ Enrichment worker stopped");
-    });
-
-    // Spawn cache cleanup task (every 5 minutes)
-    let enricher_clone = enricher.clone();
-    tokio::spawn(async move {
-        let mut cleanup_interval = interval(Duration::from_secs(300));
-        loop {
-            cleanup_interval.tick().await;
-            enricher_clone.clean_expired_cache().await;
-            
-            let stats = enricher_clone.get_cache_stats().await;
-            info!("🧹 Cache cleanup: {} total entries cached", stats.total_entries);
+        Err(e) => {
+            error!("❌ Failed to start enrichment pipeline: {}", e);
+            return Err(e);
         }
-    });
+    };
 
-    // Spawn cache stats reporter (every 30 seconds)
-    let enricher_clone = enricher.clone();
-    tokio::spawn(async move {
-        let mut stats_interval = interval(Duration::from_secs(30));
-        loop {
-            stats_interval.tick().await;
-            let stats = enricher_clone.get_cache_stats().await;
-            if stats.total_entries > 0 {
-                info!("📊 Cache Stats: Metadata={}, Accounts={}, Social={}, Holders={}, Total={}", 
-                    stats.metadata_entries,
-                    stats.account_info_entries,
-                    stats.social_links_entries,
-                    stats.holder_count_entries,
-                    stats.total_entries
-                );
-            }
-        }
-    });
+    // 4. Initialize Scorer
+    let scorer = scoring::TokenScorer::new();
+    info!("⚖️  Token Scorer initialized");
 
-    info!("================================================");
-    info!("👂 Listening for MINT and POOL CREATION events...");
-    info!("🔍 All events will be enriched with full metadata");
-    info!("================================================");
-
-    // Set up graceful shutdown handler
+    // 4. Initialize Scorer (Moved to before main loop)
+    // 5. Main Event Loop (Consumer)
+    // Process enriched tokens (Logging only for now)
     let shutdown_signal = signal::ctrl_c();
     tokio::pin!(shutdown_signal);
 
-    // Main event processing loop
+    info!("================================================");
+    info!("⚡ System Operational - Waiting for opportunities");
+    info!("================================================");
+
+    // Initialize Scorer
+    let scorer = TokenScorer::new();
+    
+    // Initialize Risk Engine
+    let risk_engine = RiskEngine::new(&config);
+
+    // Initialize Presigner (Fast Tx Builder)
+    let presigner = std::sync::Arc::new(Presigner::new(&config));
+    
+    // Initialize Transaction Manager (Jito)
+    let tx_manager = TransactionManager::new(presigner.clone(), &config);
+
+    // Initialize Database
+    let database = std::sync::Arc::new(Database::new("sqlite://invictus.db").await?);
+
+    // Shutdown Channel
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+    // Initialize Telegram Interface
+    let tele_interface = std::sync::Arc::new(TelegramInterface::new(&config, database.clone(), shutdown_tx));
+    let tele_for_spawn = tele_interface.as_ref().clone();
+    tokio::spawn(async move { tele_for_spawn.run().await });
+
+    // Initialize Position Tracker
+    let position_tracker = PositionTracker::new(&config);
+
+    info!("🚀 Sniper Bot Initialized & Running...");
+
+    // Main Event Loop
     loop {
         tokio::select! {
-            // Handle enriched tokens
-            Some(enriched_token) = enriched_rx.recv() => {
-                handle_enriched_token(enriched_token).await;
+            // Handle Shutdown Signal (Ctrl+C or Telegram Kill)
+            _ = signal::ctrl_c() => {
+                info!("🛑 Shutdown signal received (Ctrl+C). Exiting...");
+                break;
             }
+            _ = shutdown_rx.recv() => {
+                info!("💀 Kill signal received from Telegram. Exiting...");
+                break;
+            }
+            Some(enriched_token) = enriched_rx.recv() => {
+                // Low latency scoring
+                let score = scorer.score(&enriched_token);
 
-            // Handle Ctrl+C shutdown
+                info!(
+                    "✨ ENRICHED: {} | Liq: ${} | Score: {:.1}/70",
+                    enriched_token.mint,
+                    enriched_token.initial_liquidity_sol.unwrap_or(0.0),
+                    score
+                );
+                
+                // Threshold: >50/70 (71%) for buy consideration (graduated tokens only)
+                if score > 50.0 {
+                    info!("🚀 HIGH SCORE DETECTED: {} (Score: {:.1}/70) - STARTING RISK VERIFICATION", enriched_token.mint, score);
+                    
+                    // Store in DB
+                    if let Err(e) = database.store_token(&enriched_token, score).await {
+                        error!("Failed to store token {}: {}", enriched_token.mint, e);
+                    }
+
+                    // Perform Risk Verification (Real Tiny Buy)
+                    match risk_engine.verify_token(enriched_token.clone()).await {
+                        Ok(verified) => {
+                            if verified.is_honeypot {
+                                warn!("🛑 HONEYPOT DETECTED: {} - Failed risk verification", verified.token.mint);
+                                for log in verified.verification_log {
+                                    warn!("   - {}", log);
+                                }
+                            } else {
+                                info!("✅ RISK VERIFICATION PASSED: {} - Safe to buy!", verified.token.mint);
+                                
+                                // Execute BUY with Jito
+                                let buy_amount_sol_lamports = (config.max_trade_size_sol * 1_000_000_000.0) as u64;
+                                let tip_lamports = 1_000_000; // 0.001 SOL tip
+                                let slippage_bps = 300; // 3% slippage
+                                
+                                info!("💰 Executing BUY for {} ({} SOL)", verified.token.mint, config.max_trade_size_sol);
+                                
+                                match tx_manager.buy_with_jito(
+                                    &verified.token.mint,
+                                    buy_amount_sol_lamports,
+                                    tip_lamports,
+                                    slippage_bps,
+                                ).await {
+                                    Ok(bundle_id) => {
+                                        info!("🚀 BUY executed successfully! Bundle: {}", bundle_id);
+                                        
+                                        // Calculate entry price (estimated based on liquidity)
+                                        let entry_price_estimate = if let Some(liq) = verified.token.initial_liquidity_sol {
+                                            liq / (verified.token.supply.unwrap_or(1_000_000_000) as f64)
+                                        } else {
+                                            0.0
+                                        };
+                                        
+                                        // Record trade in database
+                                        if let Err(e) = database.record_trade(
+                                            &verified.token.mint,
+                                            "BUY",
+                                            0, // Token amount unknown until we query balance
+                                            buy_amount_sol_lamports,
+                                            &bundle_id,
+                                            Some(&bundle_id),
+                                            Some(entry_price_estimate),
+                                        ).await {
+                                            error!("Failed to record BUY trade: {}", e);
+                                        }
+                                        
+                                        // Start auto-sell monitoring if enabled
+                                        if config.auto_sell_enabled {
+                                            info!("📊 Starting auto-sell monitoring for {}", verified.token.mint);
+                                            
+                                            // Sleep briefly to allow transaction to settle
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                                            
+                                            // Query token balance to get exact amount
+                                            // For now, estimate based on buy amount
+                                            let estimated_token_amount = (buy_amount_sol_lamports as f64 / entry_price_estimate) as u64;
+                                            
+                                            let position = Position {
+                                                mint: verified.token.mint.clone(),
+                                                entry_price_sol_per_token: entry_price_estimate,
+                                                entry_time: std::time::Instant::now(),
+                                                amount_token_raw: estimated_token_amount,
+                                                amount_sol_invested: buy_amount_sol_lamports,
+                                                decimals: verified.token.decimals,
+                                            };
+                                            
+                                            let mut sell_rx = position_tracker.monitor_position(position);
+                                            
+                                            // Spawn task to handle sell signal
+                                            let tx_manager_clone = tx_manager.clone();
+                                            let db_clone = database.clone();
+                                            let tele_clone = tele_interface.clone();
+                                            let config_clone = config.clone();
+                                            
+                                            tokio::spawn(async move {
+                                                if let Some(sell_signal) = sell_rx.recv().await {
+                                                    info!("⚡ Sell trigger: {} for {}", sell_signal.trigger, sell_signal.position.mint);
+                                                    
+                                                    // Execute SELL with Jito
+                                                    let sell_slippage = config_clone.auto_sell_slippage_bps;
+                                                    
+                                                    match tx_manager_clone.sell_with_jito(
+                                                        &sell_signal.position.mint,
+                                                        sell_signal.position.amount_token_raw,
+                                                        tip_lamports,
+                                                        sell_slippage,
+                                                    ).await {
+                                                        Ok(bundle_id) => {
+                                                            info!("🎯 Auto-sell executed: {} (Bundle: {})", sell_signal.position.mint, bundle_id);
+                                                            
+                                                            // Calculate P/L in SOL
+                                                            let pnl_sol = (sell_signal.position.amount_token_raw as f64 * sell_signal.current_price_sol_per_token
+                                                                - sell_signal.position.amount_sol_invested as f64) / 1_000_000_000.0;
+                                                            
+                                                            // Update database with exit info
+                                                            let trigger_str = match sell_signal.trigger {
+                                                                position_tracker::SellTrigger::ProfitTarget(_) => "PROFIT_TARGET",
+                                                                position_tracker::SellTrigger::StopLoss(_) => "STOP_LOSS",
+                                                                position_tracker::SellTrigger::Timeout => "TIMEOUT",
+                                                            };
+                                                            
+                                                            if let Err(e) = db_clone.update_trade_exit(
+                                                                &sell_signal.position.mint,
+                                                                sell_signal.current_price_sol_per_token,
+                                                                pnl_sol,
+                                                                trigger_str,
+                                                            ).await {
+                                                                error!("Failed to update trade exit: {}", e);
+                                                            }
+                                                            
+                                                            // Send Telegram notification
+                                                            tele_clone.notify_auto_sell(
+                                                                &sell_signal.position.mint,
+                                                                &sell_signal.trigger.to_string(),
+                                                                sell_signal.pnl_percentage,
+                                                                sell_signal.position.entry_price_sol_per_token,
+                                                                sell_signal.current_price_sol_per_token,
+                                                                pnl_sol,
+                                                                &bundle_id,
+                                                            ).await;
+                                                            
+                                                            info!("💰 P/L: {:.4} SOL ({:.2}%)", pnl_sol, sell_signal.pnl_percentage);
+                                                        }
+                                                        Err(e) => {
+                                                            error!("Failed to execute auto-sell for {}: {}", sell_signal.position.mint, e);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("❌ Failed to execute BUY: {}", e);
+                                    }
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            error!("⚠️ Risk verification error for {}: {}", enriched_token.mint, e);
+                        }
+                    }
+                }
+            }
             _ = &mut shutdown_signal => {
-                info!("");
-                info!("================================================");
                 info!("🛑 Shutdown signal received");
-                info!("📊 Cleaning up and exiting...");
-                info!("================================================");
                 break;
             }
         }
     }
 
-    info!("✅ Application terminated gracefully");
+    info!("👋 Shutdown complete");
     Ok(())
-}
-
-/// Validate configuration
-fn validate_config(config: &config::Config) -> Result<()> {
-    if config.helius_api_key.is_empty() {
-        error!("❌ Helius API key is not set in configuration");
-        return Err(anyhow::anyhow!("Missing Helius API key"));
-    }
-    if config.private_key.is_empty() {
-        error!("❌ No private key is setup");
-        return Err(anyhow::anyhow!("Missing private key"));
-    }
-    if config.telegram_token.is_empty() {
-        error!("❌ No telegram bot token is setup");
-        return Err(anyhow::anyhow!("Missing telegram bot token"));
-    }
-    if config.telegram_chat_id.is_empty() {
-        error!("❌ No telegram_chat_id is setup");
-        return Err(anyhow::anyhow!("Missing telegram_chat_id"));
-    }
-    Ok(())
-}
-
-/// Handle enriched token - main decision logic
-async fn handle_enriched_token(token: EnrichedToken) {
-    info!("");
-    info!("╔════════════════════════════════════════════════════════════════");
-    info!("║ 🎯 ENRICHED TOKEN ANALYSIS");
-    info!("╠════════════════════════════════════════════════════════════════");
-    info!("║ Mint:          {}", token.mint);
-    info!("║ Symbol:        {}", token.symbol.as_deref().unwrap_or("N/A"));
-    info!("║ Name:          {}", token.name.as_deref().unwrap_or("N/A"));
-    info!("║ Platform:      {}", token.platform);
-    info!("║ Signature:     {}", token.signature);
-    info!("╠════════════════════════════════════════════════════════════════");
-    
-    // Token details
-    if let Some(decimals) = token.decimals {
-        info!("║ Decimals:      {}", decimals);
-    }
-    if let Some(supply) = token.supply {
-        info!("║ Supply:        {}", format_number(supply as f64));
-    }
-    if let Some(holders) = token.holders {
-        info!("║ Holders:       {}", holders);
-    }
-    
-    info!("╠════════════════════════════════════════════════════════════════");
-    
-    // Authority info (CRITICAL for safety)
-    info!("║ 🔐 AUTHORITY CHECK:");
-    info!("║   Freeze Auth: {}", if token.has_freeze_authority { "❌ YES (RISKY)" } else { "✅ NONE" });
-    info!("║   Mint Auth:   {}", if token.has_mint_authority { "❌ YES (RISKY)" } else { "✅ NONE" });
-    info!("║   Mutable:     {}", if token.is_mutable { "⚠️ YES" } else { "✅ NO" });
-    
-    info!("╠════════════════════════════════════════════════════════════════");
-    
-    // Liquidity info
-    if token.has_liquidity {
-        info!("║ 💧 LIQUIDITY:");
-        if let Some(pool) = &token.pool_info {
-            info!("║   DEX:          {}", pool.dex);
-            info!("║   Pool:         {}", pool.pool_address);
-            info!("║   Base Reserve: {}", format_number(pool.base_reserve));
-            info!("║   Quote Reserve: {}", format_number(pool.quote_reserve));
-            if let Some(liq_usd) = pool.liquidity_usd {
-                info!("║   Liquidity:    ${}", format_number(liq_usd));
-            }
-        }
-    } else {
-        info!("║ 💧 Liquidity:   ❌ NO POOL YET");
-    }
-    
-    info!("╠════════════════════════════════════════════════════════════════");
-    
-    // Market data
-    if let Some(price) = token.price_usd {
-        info!("║ 💰 MARKET DATA:");
-        info!("║   Price:       ${:.10}", price);
-        if let Some(fdv) = token.fdv {
-            info!("║   FDV:         ${}", format_number(fdv));
-        }
-        if let Some(mc) = token.market_cap {
-            info!("║   Market Cap:  ${}", format_number(mc));
-        }
-    }
-    
-    info!("╠════════════════════════════════════════════════════════════════");
-    
-    // Tax info (CRITICAL for trading)
-    info!("║ 📊 TAX ANALYSIS:");
-    if let Some(buy_tax) = token.buy_tax {
-        let buy_status = if buy_tax > 10.0 { "❌ HIGH" } else if buy_tax > 5.0 { "⚠️ MEDIUM" } else { "✅ LOW" };
-        info!("║   Buy Tax:     {:.2}% {}", buy_tax, buy_status);
-    } else {
-        info!("║   Buy Tax:     ⏳ Calculating...");
-    }
-    
-    if let Some(sell_tax) = token.sell_tax {
-        let sell_status = if sell_tax > 10.0 { "❌ HIGH" } else if sell_tax > 5.0 { "⚠️ MEDIUM" } else { "✅ LOW" };
-        info!("║   Sell Tax:    {:.2}% {}", sell_tax, sell_status);
-    } else {
-        info!("║   Sell Tax:    ⏳ Calculating...");
-    }
-    
-    info!("╠════════════════════════════════════════════════════════════════");
-    
-    // Social links
-    if token.social_links.website.is_some() 
-        || token.social_links.twitter.is_some() 
-        || token.social_links.telegram.is_some() {
-        info!("║ 🌐 SOCIAL LINKS:");
-        if let Some(website) = &token.social_links.website {
-            info!("║   Website:     {}", website);
-        }
-        if let Some(twitter) = &token.social_links.twitter {
-            info!("║   Twitter:     {}", twitter);
-        }
-        if let Some(telegram) = &token.social_links.telegram {
-            info!("║   Telegram:    {}", telegram);
-        }
-    }
-    
-    info!("╚════════════════════════════════════════════════════════════════");
-    
-    
-    info!("");
-}
-
-fn format_number(num: f64) -> String {
-    if num >= 1_000_000_000.0 {
-        format!("{:.2}B", num / 1_000_000_000.0)
-    } else if num >= 1_000_000.0 {
-        format!("{:.2}M", num / 1_000_000.0)
-    } else if num >= 1_000.0 {
-        format!("{:.2}K", num / 1_000.0)
-    } else {
-        format!("{:.2}", num)
-    }
 }

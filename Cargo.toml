@@ -33,3 +33,6 @@ chrono = { version = "0.4", features = ["serde"] }
 dptree = "0.3"
 sysinfo = "0.29"
 thiserror = "1.0"
+lazy_static = "1.4"
+parking_lot = "0.12"
+rand = "0.9.2"

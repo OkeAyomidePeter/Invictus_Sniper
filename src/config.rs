@@ -4,11 +4,11 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 
+#[derive(Clone)]
 pub struct Config {
     pub helius_api_key: String,
     pub private_key: String,
     pub telegram_token: String,
-    // pub trading_mode: String,
     pub telegram_chat_id: String,
     pub database_url: String,
     pub min_liquidity_sol: f64,
@@ -18,21 +18,47 @@ pub struct Config {
     pub max_creator_ownership_percentage: f64,
     pub honeypot_check_enabled: bool,
     pub jupiter_api_timeout_ms: u64,
+    // Auto-sell configuration
+    pub auto_sell_enabled: bool,
+    pub auto_sell_profit_target_pct: f64,
+    pub auto_sell_stop_loss_pct: f64,
+    pub auto_sell_timeout_seconds: u64,
+    pub auto_sell_slippage_bps: u16,
+    pub auto_sell_price_check_interval_ms: u64,
+    // Dynamic Jito tip configuration
+    pub jito_base_tip_lamports: u64,
+    pub jito_min_tip_lamports: u64,
+    pub jito_max_tip_lamports: u64,
+    pub jito_dynamic_tips_enabled: bool,
+    // Retry configuration
+    pub tx_retry_max_attempts: usize,
+    pub tx_retry_initial_delay_ms: u64,
+    pub tx_retry_max_delay_ms: u64,
+    pub tx_retry_backoff_multiplier: f64,
+    // Rate limiting
+    pub helius_max_requests_per_second: f64,
+    pub jupiter_max_requests_per_second: f64,
+    pub rate_limiting_enabled: bool,
+    // Wallet monitoring
+    pub wallet_low_balance_alert_sol: f64,
+    pub wallet_monitor_interval_secs: u64,
+    pub wallet_reserve_for_fees_sol: f64,
+    // Parallel trading
+    pub max_concurrent_trades: usize,
+    pub max_open_positions: usize,
+    pub total_exposure_limit_sol: f64,
 }
 
 impl Config {
     pub fn load() -> Self {
         dotenv().ok();
+
         Self {
-            helius_api_key: env::var("HELIUS_API_KEY").expect("HELIUS_API_KEY required"),
-            private_key: env::var("SOLANA_PRIVATE_KEY")
-                .or_else(|_| env::var("SOLANA_PRIVATE_KEY_PATH"))
-                .expect("SOLANA_PRIVATE_KEY or SOLANA_PRIVATE_KEY_PATH required"),
-            telegram_token: env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
-            // trading_mode: env::var("TRADING_MODE").unwrap_or("devnet".to_string()),
-            telegram_chat_id: env::var("TELEGRAM_CHAT_ID").unwrap_or("".to_string()),
-            database_url: env::var("DATABASE_URL").unwrap_or("sqlite:./sniper_bot.db".to_string()),
-            // Risk engine configuration from environment
+            helius_api_key: env::var("HELIUS_API_KEY").expect("HELIUS_API_KEY must be set"),
+            private_key: env::var("SOLANA_PRIVATE_KEY").expect("SOLANA_PRIVATE_KEY must be set"),
+            telegram_token: env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set"),
+            telegram_chat_id: env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID must be set"),
+            database_url: env::var("DATABASE_URL").unwrap_or("sqlite://invictus.db".to_string()),
             min_liquidity_sol: env::var("MIN_LIQUIDITY_SOL")
                 .unwrap_or("10.0".to_string())
                 .parse()
@@ -50,7 +76,7 @@ impl Config {
                 .parse()
                 .expect("MAX_DAILY_EXPOSURE_SOL must be a valid number"),
             max_creator_ownership_percentage: env::var("MAX_CREATOR_OWNERSHIP_PERCENTAGE")
-                .unwrap_or("20.0".to_string())
+                .unwrap_or("50.0".to_string())
                 .parse()
                 .expect("MAX_CREATOR_OWNERSHIP_PERCENTAGE must be a valid number"),
             honeypot_check_enabled: env::var("HONEYPOT_CHECK_ENABLED")
@@ -61,80 +87,143 @@ impl Config {
                 .unwrap_or("5000".to_string())
                 .parse()
                 .expect("JUPITER_API_TIMEOUT_MS must be a valid number"),
+            // Auto-sell configuration
+            auto_sell_enabled: env::var("AUTO_SELL_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("AUTO_SELL_ENABLED must be true or false"),
+            auto_sell_profit_target_pct: env::var("AUTO_SELL_PROFIT_TARGET_PCT")
+                .unwrap_or("50.0".to_string())
+                .parse()
+                .expect("AUTO_SELL_PROFIT_TARGET_PCT must be a valid number"),
+            auto_sell_stop_loss_pct: env::var("AUTO_SELL_STOP_LOSS_PCT")
+                .unwrap_or("20.0".to_string())
+                .parse()
+                .expect("AUTO_SELL_STOP_LOSS_PCT must be a valid number"),
+            auto_sell_timeout_seconds: env::var("AUTO_SELL_TIMEOUT_SECONDS")
+                .unwrap_or("120".to_string())
+                .parse()
+                .expect("AUTO_SELL_TIMEOUT_SECONDS must be a valid number"),
+            auto_sell_slippage_bps: env::var("AUTO_SELL_SLIPPAGE_BPS")
+                .unwrap_or("300".to_string())
+                .parse()
+                .expect("AUTO_SELL_SLIPPAGE_BPS must be a valid number"),
+            auto_sell_price_check_interval_ms: env::var("AUTO_SELL_PRICE_CHECK_INTERVAL_MS")
+                .unwrap_or("2000".to_string())
+                .parse()
+                .expect("AUTO_SELL_PRICE_CHECK_INTERVAL_MS must be a valid number"),
+            // Dynamic Jito tip configuration
+            jito_base_tip_lamports: env::var("JITO_BASE_TIP_LAMPORTS")
+                .unwrap_or("1000000".to_string())
+                .parse()
+                .expect("JITO_BASE_TIP_LAMPORTS must be a valid number"),
+            jito_min_tip_lamports: env::var("JITO_MIN_TIP_LAMPORTS")
+                .unwrap_or("500000".to_string())
+                .parse()
+                .expect("JITO_MIN_TIP_LAMPORTS must be a valid number"),
+            jito_max_tip_lamports: env::var("JITO_MAX_TIP_LAMPORTS")
+                .unwrap_or("5000000".to_string())
+                .parse()
+                .expect("JITO_MAX_TIP_LAMPORTS must be a valid number"),
+            jito_dynamic_tips_enabled: env::var("JITO_DYNAMIC_TIPS_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("JITO_DYNAMIC_TIPS_ENABLED must be true or false"),
+            // Retry configuration
+            tx_retry_max_attempts: env::var("TX_RETRY_MAX_ATTEMPTS")
+                .unwrap_or("3".to_string())
+                .parse()
+                .expect("TX_RETRY_MAX_ATTEMPTS must be a valid number"),
+            tx_retry_initial_delay_ms: env::var("TX_RETRY_INITIAL_DELAY_MS")
+                .unwrap_or("500".to_string())
+                .parse()
+                .expect("TX_RETRY_INITIAL_DELAY_MS must be a valid number"),
+            tx_retry_max_delay_ms: env::var("TX_RETRY_MAX_DELAY_MS")
+                .unwrap_or("5000".to_string())
+                .parse()
+                .expect("TX_RETRY_MAX_DELAY_MS must be a valid number"),
+            tx_retry_backoff_multiplier: env::var("TX_RETRY_BACKOFF_MULTIPLIER")
+                .unwrap_or("2.0".to_string())
+                .parse()
+                .expect("TX_RETRY_BACKOFF_MULTIPLIER must be a valid number"),
+            // Rate limiting
+            helius_max_requests_per_second: env::var("HELIUS_MAX_REQUESTS_PER_SECOND")
+                .unwrap_or("10.0".to_string())
+                .parse()
+                .expect("HELIUS_MAX_REQUESTS_PER_SECOND must be a valid number"),
+            jupiter_max_requests_per_second: env::var("JUPITER_MAX_REQUESTS_PER_SECOND")
+                .unwrap_or("5.0".to_string())
+                .parse()
+                .expect("JUPITER_MAX_REQUESTS_PER_SECOND must be a valid number"),
+            rate_limiting_enabled: env::var("RATE_LIMITING_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("RATE_LIMITING_ENABLED must be true or false"),
+            // Wallet monitoring
+            wallet_low_balance_alert_sol: env::var("WALLET_LOW_BALANCE_ALERT_SOL")
+                .unwrap_or("0.5".to_string())
+                .parse()
+                .expect("WALLET_LOW_BALANCE_ALERT_SOL must be a valid number"),
+            wallet_monitor_interval_secs: env::var("WALLET_MONITOR_INTERVAL_SECS")
+                .unwrap_or("60".to_string())
+                .parse()
+                .expect("WALLET_MONITOR_INTERVAL_SECS must be a valid number"),
+            wallet_reserve_for_fees_sol: env::var("WALLET_RESERVE_FOR_FEES_SOL")
+                .unwrap_or("0.1".to_string())
+                .parse()
+                .expect("WALLET_RESERVE_FOR_FEES_SOL must be a valid number"),
+            // Parallel trading
+            max_concurrent_trades: env::var("MAX_CONCURRENT_TRADES")
+                .unwrap_or("5".to_string())
+                .parse()
+                .expect("MAX_CONCURRENT_TRADES must be a valid number"),
+            max_open_positions: env::var("MAX_OPEN_POSITIONS")
+                .unwrap_or("10".to_string())
+                .parse()
+                .expect("MAX_OPEN_POSITIONS must be a valid number"),
+            total_exposure_limit_sol: env::var("TOTAL_EXPOSURE_LIMIT_SOL")
+                .unwrap_or("10.0".to_string())
+                .parse()
+                .expect("TOTAL_EXPOSURE_LIMIT_SOL must be a valid number"),
         }
     }
 
-    /// Load keypair from file path or raw private key string
+    /// Load keypair from file or base58 string
     pub fn load_keypair(&self) -> Result<Keypair, Box<dyn std::error::Error>> {
-        let contents = if self.private_key.starts_with('/') || self.private_key.contains('.') {
-            // Treat as file path
-            let mut file = File::open(&self.private_key)?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents)?;
-            contents
+        // Try to parse as base58 first
+        if let Ok(bytes) = bs58::decode(&self.private_key).into_vec() {
+            if let Ok(keypair) = Keypair::from_bytes(&bytes) {
+                return Ok(keypair);
+            }
+        }
+
+        // Otherwise try as file path
+        let mut file = File::open(&self.private_key)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        let bytes: Vec<u8> = serde_json::from_str(&contents)?;
+        let keypair = Keypair::from_bytes(&bytes)?;
+        Ok(keypair)
+    }
+
+    fn mask_secret(s: &str) -> String {
+        if s.len() > 8 {
+            format!("{}...{}", &s[..4], &s[s.len() - 4..])
         } else {
-            // Treat as raw private key string
-            self.private_key.clone()
+            "***".to_string()
+        }
+    }
+
+    pub fn display(&self) -> String {
+        let private_key_display = if self.private_key.starts_with('/') || self.private_key.starts_with('.') {
+            format!("file:{}", self.private_key)
+        } else {
+            Self::mask_secret(&self.private_key)
         };
 
-        let contents = contents.trim();
-
-        // Try to parse as base58 first
-        if let Ok(keypair_bytes) = bs58::decode(contents.trim()).into_vec() {
-            if keypair_bytes.len() == 64 {
-                return Ok(Keypair::from_bytes(&keypair_bytes)?);
-            }
-        }
-
-        // Try to parse as JSON array
-        if let Ok(keypair_array) = serde_json::from_str::<Vec<u8>>(&contents) {
-            if keypair_array.len() == 64 {
-                return Ok(Keypair::from_bytes(&keypair_array)?);
-            }
-        }
-
-        // Try to parse as JSON array format
-        if contents.starts_with('[') {
-            let keypair_data: serde_json::Value = serde_json::from_str(contents)?;
-            if let Some(array) = keypair_data.as_array() {
-                let keypair_bytes: Vec<u8> = array
-                    .iter()
-                    .take(64)
-                    .filter_map(|v| v.as_u64().map(|n| n as u8))
-                    .collect();
-
-                if keypair_bytes.len() == 64 {
-                    return Ok(Keypair::from_bytes(&keypair_bytes)?);
-                }
-            }
-        }
-
-        Err("Invalid keypair format".into())
-    }
-
-    /// Mask secrets for logging
-    pub fn mask_secret(secret: &str) -> String {
-        if secret.is_empty() {
-            return "".to_string();
-        }
-        if secret.len() <= 8 {
-            return "***".to_string();
-        }
-        format!("{}...{}", &secret[..4], &secret[secret.len() - 4..])
-    }
-
-    /// Display config with masked secrets
-    pub fn display(&self) -> String {
-        let private_key_display =
-            if self.private_key.starts_with('/') || self.private_key.contains('.') {
-                self.private_key.clone()
-            } else {
-                Self::mask_secret(&self.private_key)
-            };
-
         format!(
-            "Config loaded:  helius_key={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}",
-            // self.trading_mode,
+            "Config loaded: helius_key={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
             Self::mask_secret(&self.helius_api_key),
             private_key_display,
             if self.telegram_token.is_empty() { "not_set".to_string() } else { Self::mask_secret(&self.telegram_token) },
@@ -144,7 +233,104 @@ impl Config {
             self.min_holders,
             self.max_trade_size_sol,
             self.max_daily_exposure_sol,
-            self.honeypot_check_enabled
+            self.honeypot_check_enabled,
+            self.auto_sell_enabled,
+            self.rate_limiting_enabled,
+            self.max_concurrent_trades
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_config_defaults() {
+        // Set only required vars, test defaults for optionals
+        env::set_var("HELIUS_API_KEY", "test_key");
+        env::set_var("SOLANA_PRIVATE_KEY", "test_private_key");
+        env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
+        env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
+
+        let config = Config::load();
+
+        // Test defaults
+        assert_eq!(config.min_liquidity_sol, 10.0);
+        assert_eq!(config.min_holders, 10);
+        assert_eq!(config.max_trade_size_sol, 1.0);
+        assert_eq!(config.auto_sell_enabled, true);
+        assert_eq!(config.auto_sell_profit_target_pct, 50.0);
+        assert_eq!(config.auto_sell_stop_loss_pct, 20.0);
+        assert_eq!(config.jito_base_tip_lamports, 1_000_000);
+        assert_eq!(config.tx_retry_max_attempts, 3);
+        assert_eq!(config.rate_limiting_enabled, true);
+        assert_eq!(config.max_concurrent_trades, 5);
+    }
+
+    #[test]
+    fn test_config_custom_values() {
+        // Set custom values
+        env::set_var("HELIUS_API_KEY", "test_key");
+        env::set_var("SOLANA_PRIVATE_KEY", "test_private_key");
+        env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
+        env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
+        env::set_var("MIN_LIQUIDITY_SOL", "25.0");
+        env::set_var("AUTO_SELL_PROFIT_TARGET_PCT", "100.0");
+        env::set_var("JITO_BASE_TIP_LAMPORTS", "2000000");
+        env::set_var("MAX_CONCURRENT_TRADES", "10");
+
+        let config = Config::load();
+
+        assert_eq!(config.min_liquidity_sol, 25.0);
+        assert_eq!(config.auto_sell_profit_target_pct, 100.0);
+        assert_eq!(config.jito_base_tip_lamports, 2_000_000);
+        assert_eq!(config.max_concurrent_trades, 10);
+    }
+
+    #[test]
+    fn test_tip_limits() {
+        env::set_var("HELIUS_API_KEY", "test_key");
+        env::set_var("SOLANA_PRIVATE_KEY", "test_private_key");
+        env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
+        env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
+
+        let config = Config::load();
+
+        // Test tip ranges
+        assert!(config.jito_min_tip_lamports < config.jito_base_tip_lamports);
+        assert!(config.jito_base_tip_lamports < config.jito_max_tip_lamports);
+        assert_eq!(config.jito_min_tip_lamports, 500_000);
+        assert_eq!(config.jito_max_tip_lamports, 5_000_000);
+    }
+
+    #[test]
+    fn test_retry_config() {
+        env::set_var("HELIUS_API_KEY", "test_key");
+        env::set_var("SOLANA_PRIVATE_KEY", "test_private_key");
+        env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
+        env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
+
+        let config = Config::load();
+
+        assert_eq!(config.tx_retry_max_attempts, 3);
+        assert_eq!(config.tx_retry_initial_delay_ms, 500);
+        assert_eq!(config.tx_retry_max_delay_ms, 5000);
+        assert_eq!(config.tx_retry_backoff_multiplier, 2.0);
+    }
+
+    #[test]
+    fn test_rate_limiting_defaults() {
+        env::set_var("HELIUS_API_KEY", "test_key");
+        env::set_var("SOLANA_PRIVATE_KEY", "test_private_key");
+        env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
+        env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
+
+        let config = Config::load();
+
+        assert_eq!(config.helius_max_requests_per_second, 10.0);
+        assert_eq!(config.jupiter_max_requests_per_second, 5.0);
+        assert!(config.rate_limiting_enabled);
     }
 }
