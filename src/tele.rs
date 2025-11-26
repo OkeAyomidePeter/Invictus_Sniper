@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::db::Database;
+use crate::wallet_monitor::WalletMonitor;
 use log::{info, warn};
 use std::sync::Arc;
 use teloxide::{
@@ -31,10 +32,11 @@ pub struct TelegramInterface {
     db: Arc<Database>,
     shutdown_tx: Sender<()>,
     allowed_chat_id: i64,
+    wallet_monitor: Option<Arc<WalletMonitor>>,
 }
 
 impl TelegramInterface {
-    pub fn new(config: &Config, db: Arc<Database>, shutdown_tx: Sender<()>) -> Self {
+    pub fn new(config: &Config, db: Arc<Database>, shutdown_tx: Sender<()>, wallet_monitor: Option<Arc<WalletMonitor>>) -> Self {
         let bot = Arc::new(Bot::new(&config.telegram_token));
         let allowed_chat_id = config.telegram_chat_id.parse::<i64>().unwrap_or(0);
         
@@ -43,6 +45,7 @@ impl TelegramInterface {
             db,
             shutdown_tx,
             allowed_chat_id,
+            wallet_monitor,
         }
     }
 
@@ -113,7 +116,8 @@ impl TelegramInterface {
         .dependencies(teloxide::dptree::deps![
             self.db,
             self.shutdown_tx,
-            AllowedChatId(self.allowed_chat_id)
+            AllowedChatId(self.allowed_chat_id),
+            self.wallet_monitor
         ])
         .build()
         .dispatch()
@@ -209,6 +213,7 @@ async fn message_handler(
     db: Arc<Database>,
     shutdown_tx: Sender<()>,
     allowed_chat_id: AllowedChatId,
+    wallet_monitor: Option<Arc<WalletMonitor>>,
 ) -> ResponseResult<()> {
     if msg.chat.id.0 != allowed_chat_id.0 {
         warn!("⚠️ Unauthorized access from chat ID: {}", msg.chat.id);
@@ -243,6 +248,72 @@ async fn message_handler(
                     }
                 }
                 bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+            }
+            "💰 Wallet Balance" => {
+                if let Some(monitor) = &wallet_monitor {
+                    match monitor.get_balance().await {
+                        Ok(balance_lamports) => {
+                            let balance_sol = balance_lamports as f64 / 1_000_000_000.0;
+                            let available = monitor.get_available_balance().await.unwrap_or(0) as f64 / 1_000_000_000.0;
+                            let text = format!(
+                                "<b>💰 Wallet Balance</b>\n\n\
+                                • <b>Total:</b> {:.4} SOL\n\
+                                • <b>Available:</b> {:.4} SOL\n\
+                                • <b>Reserved (fees):</b> {:.4} SOL",
+                                balance_sol,
+                                available,
+                                balance_sol - available
+                            );
+                            bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+                        }
+                        Err(e) => {
+                            bot.send_message(msg.chat.id, format!("❌ Failed to get balance: {}", e)).send().await?;
+                        }
+                    }
+                } else {
+                    bot.send_message(msg.chat.id, "❌ Wallet monitoring not enabled").send().await?;
+                }
+            }
+            "📈 Active Positions" => {
+                let positions = db.get_active_positions().await.unwrap_or_default();
+                let mut text = "<b>📈 Active Positions:</b>\n\n".to_string();
+                if positions.is_empty() {
+                    text.push_str("No active positions.");
+                } else {
+                    for (mint, entry_price, amount, timestamp) in positions {
+                        let elapsed = chrono::Utc::now().timestamp() - timestamp;
+                        let minutes = elapsed / 60;
+                        text.push_str(&format!(
+                            "• {}...\n  Entry: {:.10} SOL\n  Amount: {} tokens\n  Time: {}m ago\n\n",
+                            &mint[..8.min(mint.len())],
+                            entry_price,
+                            amount,
+                            minutes
+                        ));
+                    }
+                }
+                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+            }
+            "🔍 System Status" => {
+                // Simple health check
+                let token_count = db.get_token_count().await.unwrap_or(0);
+                let trade_count = db.get_trade_count().await.unwrap_or(0);
+                let wallet_status = if wallet_monitor.is_some() { "✅ Online" } else { "⚠️ Disabled" };
+                
+                let text = format!(
+                    "<b>🔍 System Status</b>\n\n\
+                    • <b>Database:</b> ✅ Connected ({} tokens, {} trades)\n\
+                    • <b>Wallet Monitor:</b> {}\n\
+                    • <b>Telegram:</b> ✅ Online\n\
+                    • <b>Bot Core:</b> ✅ Running",
+                    token_count,
+                    trade_count,
+                    wallet_status
+                );
+                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+            }
+            "📊 Detailed Stats" => {
+                send_detailed_stats(&bot, msg.chat.id, &db).await?;
             }
             "💀 Kill Bot" => {
                 let keyboard = ReplyMarkup::Keyboard(
@@ -325,14 +396,50 @@ fn create_main_keyboard() -> ReplyMarkup {
         KeyboardMarkup::new([
             vec![
                 KeyboardButton::new("📊 Stats"),
-                KeyboardButton::new("📜 Recent Trades"),
+                KeyboardButton::new("📊 Detailed Stats"),
             ],
             vec![
+                KeyboardButton::new("📜 Recent Trades"),
                 KeyboardButton::new("🏆 Top Tokens"),
+            ],
+            vec![
+                KeyboardButton::new("💰 Wallet Balance"),
+                KeyboardButton::new("📈 Active Positions"),
+            ],
+            vec![
+                KeyboardButton::new("🔍 System Status"),
                 KeyboardButton::new("💀 Kill Bot"),
             ],
             vec![KeyboardButton::new("❓ Help")],
         ])
         .resize_keyboard(true),
     )
+}
+
+/// Send detailed trade statistics
+async fn send_detailed_stats(bot: &Bot, chat_id: ChatId, db: &Database) -> ResponseResult<()> {
+    let (total_trades, closed_trades, total_pnl, win_rate, active_positions) = 
+        db.get_trade_statistics().await.unwrap_or((0, 0, 0.0, 0.0, 0));
+    
+    let pnl_emoji = if total_pnl > 0.0 { "✅" } else if total_pnl < 0.0 { "🛑" } else { "➖" };
+    let pnl_sign = if total_pnl > 0.0 { "+" } else { "" };
+    
+    let text = format!(
+        "<b>📊 Detailed Statistics</b>\n\n\
+        • <b>Total Trades:</b> {}\n\
+        • <b>Closed Positions:</b> {}\n\
+        • <b>Active Positions:</b> {}\n\
+        • <b>Win Rate:</b> {:.1}%\n\
+        • <b>Total P/L:</b> {} {}{:.4} SOL",
+        total_trades,
+        closed_trades,
+        active_positions,
+        win_rate,
+        pnl_emoji,
+        pnl_sign,
+        total_pnl
+    );
+    
+    bot.send_message(chat_id, text).parse_mode(ParseMode::Html).send().await?;
+    Ok(())
 }

@@ -98,11 +98,28 @@ async fn main() -> Result<()> {
     // Initialize Database
     let database = std::sync::Arc::new(Database::new("sqlite://invictus.db").await?);
 
+    // Initialize Wallet Monitor
+    let wallet_monitor = std::sync::Arc::new(wallet_monitor::WalletMonitor::new(
+        format!("https://mainnet.helius-rpc.com/?api-key={}", config.helius_api_key),
+        presigner.pubkey(),
+        config.wallet_low_balance_alert_sol,
+        config.wallet_reserve_for_fees_sol,
+        config.wallet_monitor_interval_secs,
+    ));
+    
+    // Start wallet monitoring in background
+    let _wallet_alerts_rx = wallet_monitor.clone().start_monitoring();
+
     // Shutdown Channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 
-    // Initialize Telegram Interface
-    let tele_interface = std::sync::Arc::new(TelegramInterface::new(&config, database.clone(), shutdown_tx));
+    // Initialize Telegram Interface with wallet monitor
+    let tele_interface = std::sync::Arc::new(TelegramInterface::new(
+        &config, 
+        database.clone(), 
+        shutdown_tx,
+        Some(wallet_monitor.clone())
+    ));
     let tele_for_spawn = tele_interface.as_ref().clone();
     tokio::spawn(async move { tele_for_spawn.run().await });
 

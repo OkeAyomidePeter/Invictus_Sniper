@@ -3,6 +3,19 @@ name = "Invictus"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "invictus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "invictus"
+path = "src/main.rs"
+
+[[bin]]
+name = "invictus-gui"
+path = "src/bin/invictus-gui.rs"
+
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -36,3 +49,6 @@ thiserror = "1.0"
 lazy_static = "1.4"
 parking_lot = "0.12"
 rand = "0.9.2"
+eframe = "0.24"
+egui = "0.24"
+tracing-subscriber = "0.3"

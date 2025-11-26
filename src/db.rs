@@ -231,4 +231,66 @@ impl Database {
         .await?;
         Ok(rows)
     }
+
+    /// Get all active positions (BUY trades without exit_price)
+    pub async fn get_active_positions(&self) -> Result<Vec<(String, f64, i64, i64)>> {
+        // Returns (mint, entry_price, amount_token, timestamp)
+        let rows: Vec<(String, f64, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT mint, entry_price, amount_token, timestamp 
+            FROM trades 
+            WHERE action = 'BUY' AND exit_price IS NULL
+            ORDER BY timestamp DESC
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Get detailed trade statistics including P/L
+    pub async fn get_trade_statistics(&self) -> Result<(i64, i64, f64, f64, i64)> {
+        // Returns (total_trades, closed_trades, total_pnl, win_rate, active_positions)
+        let total_trades: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM trades")
+            .fetch_one(&self.pool)
+            .await?;
+
+        let closed_trades: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trades WHERE exit_price IS NOT NULL"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total_pnl: (Option<f64>,) = sqlx::query_as(
+            "SELECT SUM(pnl_sol) FROM trades WHERE pnl_sol IS NOT NULL"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let winning_trades: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trades WHERE pnl_sol > 0"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let active_positions: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trades WHERE action = 'BUY' AND exit_price IS NULL"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let win_rate = if closed_trades.0 > 0 {
+            (winning_trades.0 as f64 / closed_trades.0 as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok((
+            total_trades.0,
+            closed_trades.0,
+            total_pnl.0.unwrap_or(0.0),
+            win_rate,
+            active_positions.0,
+        ))
+    }
 }

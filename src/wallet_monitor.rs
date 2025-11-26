@@ -43,7 +43,7 @@ impl WalletMonitor {
 
     /// Start monitoring wallet balance in background task
     /// Returns channel for receiving alerts
-    pub fn start_monitoring(self) -> mpsc::Receiver<WalletAlert> {
+    pub fn start_monitoring(self: Arc<Self>) -> mpsc::Receiver<WalletAlert> {
         let (tx, rx) = mpsc::channel(10);
         
         tokio::spawn(async move {
