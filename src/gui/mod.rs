@@ -2,10 +2,19 @@ pub mod config_tab;
 pub mod logs_tab;
 pub mod status_tab;
 pub mod theme;
+pub mod bot_runtime;
+pub mod dashboard_tab;
+pub mod positions_tab;
+pub mod trades_tab;
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use chrono::Local;
+
+use theme::{Theme, ThemeColors};
+use bot_runtime::{BotRuntime, BotState, BotMetrics, BotEvent};
+use crate::config::Config;
 
 #[derive(Clone)]
 pub struct ConfigData {
@@ -68,18 +77,11 @@ pub struct ConfigData {
 impl Default for ConfigData {
     fn default() -> Self {
         Self {
-            // Core Configuration
             helius_api_key: String::new(),
             solana_private_key: String::new(),
-            
-            // Telegram Bot
             telegram_bot_token: String::new(),
             telegram_chat_id: String::new(),
-            
-            // Database
             database_url: "sqlite://invictus.db".to_string(),
-            
-            // Risk Parameters
             min_liquidity_sol: "10.0".to_string(),
             min_holders: "10".to_string(),
             max_trade_size_sol: "1.0".to_string(),
@@ -87,38 +89,26 @@ impl Default for ConfigData {
             max_creator_ownership_percentage: "50.0".to_string(),
             honeypot_check_enabled: true,
             jupiter_api_timeout_ms: "5000".to_string(),
-            
-            // Auto-Sell Configuration
             auto_sell_enabled: true,
             auto_sell_profit_target_pct: "50.0".to_string(),
             auto_sell_stop_loss_pct: "20.0".to_string(),
             auto_sell_timeout_seconds: "120".to_string(),
             auto_sell_slippage_bps: "300".to_string(),
             auto_sell_price_check_interval_ms: "2000".to_string(),
-            
-            // Dynamic Jito Tips
             jito_dynamic_tips_enabled: true,
             jito_base_tip_lamports: "1000000".to_string(),
             jito_min_tip_lamports: "500000".to_string(),
             jito_max_tip_lamports: "5000000".to_string(),
-            
-            // Retry Logic
             tx_retry_max_attempts: "3".to_string(),
             tx_retry_initial_delay_ms: "500".to_string(),
             tx_retry_max_delay_ms: "5000".to_string(),
             tx_retry_backoff_multiplier: "2.0".to_string(),
-            
-            // Rate Limiting
             rate_limiting_enabled: true,
             helius_max_requests_per_second: "10.0".to_string(),
             jupiter_max_requests_per_second: "5.0".to_string(),
-            
-            // Wallet Monitoring
             wallet_low_balance_alert_sol: "0.5".to_string(),
             wallet_monitor_interval_secs: "60".to_string(),
             wallet_reserve_for_fees_sol: "0.1".to_string(),
-            
-            // Parallel Trading
             max_concurrent_trades: "5".to_string(),
             max_open_positions: "10".to_string(),
             total_exposure_limit_sol: "10.0".to_string(),
@@ -126,20 +116,71 @@ impl Default for ConfigData {
     }
 }
 
+impl ConfigData {
+    fn to_config(&self) -> Result<Config, String> {
+        Ok(Config {
+            helius_api_key: self.helius_api_key.clone(),
+            private_key: self.solana_private_key.clone(),
+            telegram_token: self.telegram_bot_token.clone(),
+            telegram_chat_id: self.telegram_chat_id.clone(),
+            database_url: self.database_url.clone(),
+            min_liquidity_sol: self.min_liquidity_sol.parse().map_err(|_| "Invalid min_liquidity_sol")?,
+            min_holders: self.min_holders.parse().map_err(|_| "Invalid min_holders")?,
+            max_trade_size_sol: self.max_trade_size_sol.parse().map_err(|_| "Invalid max_trade_size_sol")?,
+            max_daily_exposure_sol: self.max_daily_exposure_sol.parse().map_err(|_| "Invalid max_daily_exposure_sol")?,
+            max_creator_ownership_percentage: self.max_creator_ownership_percentage.parse().map_err(|_| "Invalid max_creator_ownership_percentage")?,
+            honeypot_check_enabled: self.honeypot_check_enabled,
+            jupiter_api_timeout_ms: self.jupiter_api_timeout_ms.parse().map_err(|_| "Invalid jupiter_api_timeout_ms")?,
+            auto_sell_enabled: self.auto_sell_enabled,
+            auto_sell_profit_target_pct: self.auto_sell_profit_target_pct.parse().map_err(|_| "Invalid auto_sell_profit_target_pct")?,
+            auto_sell_stop_loss_pct: self.auto_sell_stop_loss_pct.parse().map_err(|_| "Invalid auto_sell_stop_loss_pct")?,
+            auto_sell_timeout_seconds: self.auto_sell_timeout_seconds.parse().map_err(|_| "Invalid auto_sell_timeout_seconds")?,
+            auto_sell_slippage_bps: self.auto_sell_slippage_bps.parse().map_err(|_| "Invalid auto_sell_slippage_bps")?,
+            auto_sell_price_check_interval_ms: self.auto_sell_price_check_interval_ms.parse().map_err(|_| "Invalid auto_sell_price_check_interval_ms")?,
+            jito_base_tip_lamports: self.jito_base_tip_lamports.parse().map_err(|_| "Invalid jito_base_tip_lamports")?,
+            jito_min_tip_lamports: self.jito_min_tip_lamports.parse().map_err(|_| "Invalid jito_min_tip_lamports")?,
+            jito_max_tip_lamports: self.jito_max_tip_lamports.parse().map_err(|_| "Invalid jito_max_tip_lamports")?,
+            jito_dynamic_tips_enabled: self.jito_dynamic_tips_enabled,
+            tx_retry_max_attempts: self.tx_retry_max_attempts.parse().map_err(|_| "Invalid tx_retry_max_attempts")?,
+            tx_retry_initial_delay_ms: self.tx_retry_initial_delay_ms.parse().map_err(|_| "Invalid tx_retry_initial_delay_ms")?,
+            tx_retry_max_delay_ms: self.tx_retry_max_delay_ms.parse().map_err(|_| "Invalid tx_retry_max_delay_ms")?,
+            tx_retry_backoff_multiplier: self.tx_retry_backoff_multiplier.parse().map_err(|_| "Invalid tx_retry_backoff_multiplier")?,
+            helius_max_requests_per_second: self.helius_max_requests_per_second.parse().map_err(|_| "Invalid helius_max_requests_per_second")?,
+            jupiter_max_requests_per_second: self.jupiter_max_requests_per_second.parse().map_err(|_| "Invalid jupiter_max_requests_per_second")?,
+            rate_limiting_enabled: self.rate_limiting_enabled,
+            wallet_low_balance_alert_sol: self.wallet_low_balance_alert_sol.parse().map_err(|_| "Invalid wallet_low_balance_alert_sol")?,
+            wallet_monitor_interval_secs: self.wallet_monitor_interval_secs.parse().map_err(|_| "Invalid wallet_monitor_interval_secs")?,
+            wallet_reserve_for_fees_sol: self.wallet_reserve_for_fees_sol.parse().map_err(|_| "Invalid wallet_reserve_for_fees_sol")?,
+            max_concurrent_trades: self.max_concurrent_trades.parse().map_err(|_| "Invalid max_concurrent_trades")?,
+            max_open_positions: self.max_open_positions.parse().map_err(|_| "Invalid max_open_positions")?,
+            total_exposure_limit_sol: self.total_exposure_limit_sol.parse().map_err(|_| "Invalid total_exposure_limit_sol")?,
+        })
+    }
+}
+
 pub struct InvictusGUI {
     config: ConfigData,
     current_tab: Tab,
+    theme: Theme,
     logs: Arc<Mutex<Vec<LogEntry>>>,
-    log_receiver: Option<mpsc::UnboundedReceiver<LogEntry>>,
-    bot_status: BotStatus,
+    event_receiver: Option<mpsc::UnboundedReceiver<BotEvent>>,
+    bot_runtime: Option<BotRuntime>,
+    bot_state: BotState,
+    bot_metrics: BotMetrics,
     status_message: String,
+    log_filter: Option<LogLevel>,
+    auto_scroll: bool,
+    positions: Vec<positions_tab::Position>,
+    trades: Vec<trades_tab::Trade>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
+    Dashboard,
     Configuration,
+    Positions,
+    Trades,
     Logs,
-    Status,
 }
 
 #[derive(Clone)]
@@ -157,24 +198,45 @@ pub enum LogLevel {
     Debug,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum BotStatus {
-    Stopped,
-    Running,
-    Error,
-}
-
 impl InvictusGUI {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let (_log_tx, log_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         
-        Self {
+        let mut app = Self {
             config: ConfigData::default(),
-            current_tab: Tab::Configuration,
+            current_tab: Tab::Dashboard,
+            theme: Theme::Dark,
             logs: Arc::new(Mutex::new(Vec::new())),
-            log_receiver: Some(log_rx),
-            bot_status: BotStatus::Stopped,
-            status_message: "Bot not started".to_string(),
+            event_receiver: Some(event_rx),
+            bot_runtime: Some(BotRuntime::new(event_tx)),
+            bot_state: BotState::Stopped,
+            bot_metrics: BotMetrics::default(),
+            status_message: String::new(),
+            log_filter: None,
+            auto_scroll: true,
+            positions: Vec::new(),
+            trades: Vec::new(),
+        };
+        
+        // Try to load existing config
+        app.load_config_from_env();
+        
+        app
+    }
+    
+    fn add_log(&mut self, level: LogLevel, message: String) {
+        let timestamp = Local::now().format("%H:%M:%S").to_string();
+        let entry = LogEntry {
+            timestamp,
+            level,
+            message,
+        };
+        
+        if let Ok(mut logs) = self.logs.lock() {
+            logs.push(entry);
+            if logs.len() > 1000 {
+                logs.remove(0);
+            }
         }
     }
     
@@ -188,29 +250,21 @@ impl InvictusGUI {
         writeln!(file, "# ============================================")?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Core Configuration")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "HELIUS_API_KEY={}", self.config.helius_api_key)?;
         writeln!(file, "SOLANA_PRIVATE_KEY={}", self.config.solana_private_key)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Telegram Bot")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "TELEGRAM_BOT_TOKEN={}", self.config.telegram_bot_token)?;
         writeln!(file, "TELEGRAM_CHAT_ID={}", self.config.telegram_chat_id)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Database")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "DATABASE_URL={}", self.config.database_url)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Risk Parameters")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "MIN_LIQUIDITY_SOL={}", self.config.min_liquidity_sol)?;
         writeln!(file, "MIN_HOLDERS={}", self.config.min_holders)?;
         writeln!(file, "MAX_TRADE_SIZE_SOL={}", self.config.max_trade_size_sol)?;
@@ -220,9 +274,7 @@ impl InvictusGUI {
         writeln!(file, "JUPITER_API_TIMEOUT_MS={}", self.config.jupiter_api_timeout_ms)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Auto-Sell Configuration")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "AUTO_SELL_ENABLED={}", self.config.auto_sell_enabled)?;
         writeln!(file, "AUTO_SELL_PROFIT_TARGET_PCT={}", self.config.auto_sell_profit_target_pct)?;
         writeln!(file, "AUTO_SELL_STOP_LOSS_PCT={}", self.config.auto_sell_stop_loss_pct)?;
@@ -231,43 +283,33 @@ impl InvictusGUI {
         writeln!(file, "AUTO_SELL_PRICE_CHECK_INTERVAL_MS={}", self.config.auto_sell_price_check_interval_ms)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Dynamic Jito Tips")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "JITO_DYNAMIC_TIPS_ENABLED={}", self.config.jito_dynamic_tips_enabled)?;
         writeln!(file, "JITO_BASE_TIP_LAMPORTS={}", self.config.jito_base_tip_lamports)?;
         writeln!(file, "JITO_MIN_TIP_LAMPORTS={}", self.config.jito_min_tip_lamports)?;
         writeln!(file, "JITO_MAX_TIP_LAMPORTS={}", self.config.jito_max_tip_lamports)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Retry Logic")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "TX_RETRY_MAX_ATTEMPTS={}", self.config.tx_retry_max_attempts)?;
         writeln!(file, "TX_RETRY_INITIAL_DELAY_MS={}", self.config.tx_retry_initial_delay_ms)?;
         writeln!(file, "TX_RETRY_MAX_DELAY_MS={}", self.config.tx_retry_max_delay_ms)?;
         writeln!(file, "TX_RETRY_BACKOFF_MULTIPLIER={}", self.config.tx_retry_backoff_multiplier)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Rate Limiting")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "RATE_LIMITING_ENABLED={}", self.config.rate_limiting_enabled)?;
         writeln!(file, "HELIUS_MAX_REQUESTS_PER_SECOND={}", self.config.helius_max_requests_per_second)?;
         writeln!(file, "JUPITER_MAX_REQUESTS_PER_SECOND={}", self.config.jupiter_max_requests_per_second)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Wallet Monitoring")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "WALLET_LOW_BALANCE_ALERT_SOL={}", self.config.wallet_low_balance_alert_sol)?;
         writeln!(file, "WALLET_MONITOR_INTERVAL_SECS={}", self.config.wallet_monitor_interval_secs)?;
         writeln!(file, "WALLET_RESERVE_FOR_FEES_SOL={}", self.config.wallet_reserve_for_fees_sol)?;
         writeln!(file)?;
         
-        writeln!(file, "# ----------------")?;
         writeln!(file, "# Parallel Trading")?;
-        writeln!(file, "# ----------------")?;
         writeln!(file, "MAX_CONCURRENT_TRADES={}", self.config.max_concurrent_trades)?;
         writeln!(file, "MAX_OPEN_POSITIONS={}", self.config.max_open_positions)?;
         writeln!(file, "TOTAL_EXPOSURE_LIMIT_SOL={}", self.config.total_exposure_limit_sol)?;
@@ -332,51 +374,230 @@ impl InvictusGUI {
 
 impl eframe::App for InvictusGUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Poll for new log entries
-        if let Some(receiver) = &mut self.log_receiver {
-            while let Ok(entry) = receiver.try_recv() {
-                if let Ok(mut logs) = self.logs.lock() {
-                    logs.push(entry);
-                    // Keep only last 1000 logs
-                    // Keep only last 1000 logs
-                    let len = logs.len();
-                    if len > 1000 {
-                        logs.drain(0..len - 1000);
-                    }
+        // Process bot events - collect them first to avoid borrow checker issues
+        let mut events = Vec::new();
+        if let Some(receiver) = &mut self.event_receiver {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+        
+        // Now process the collected events
+        for event in events {
+            match event {
+                BotEvent::StateChanged(state) => {
+                    self.bot_state = state;
+                }
+                BotEvent::MetricsUpdated(metrics) => {
+                    self.bot_metrics = metrics;
+                }
+                BotEvent::LogMessage { level, message } => {
+                    let log_level = match level.as_str() {
+                        "WARN" => LogLevel::Warn,
+                        "ERROR" => LogLevel::Error,
+                        "DEBUG" => LogLevel::Debug,
+                        _ => LogLevel::Info,
+                    };
+                    self.add_log(log_level, message);
+                }
+                BotEvent::Error(err) => {
+                    self.add_log(LogLevel::Error, err);
                 }
             }
         }
         
-        theme::configure_fonts(ctx);
-        
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("🚀 Invictus Sniper Bot - Configuration");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let status_text = match self.bot_status {
-                        BotStatus::Stopped => "⭕ Stopped",
-                        BotStatus::Running => "🟢 Running",
-                        BotStatus::Error => "🔴 Error",
-                    };
-                    ui.label(status_text);
-                });
-            });
-        });
-        
-        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.current_tab, Tab::Configuration, "⚙️ Configuration");
-                ui.selectable_value(&mut self.current_tab, Tab::Logs, "📋 Logs");
-                ui.selectable_value(&mut self.current_tab, Tab::Status, "📊 Status");
-            });
-        });
-        
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.current_tab {
-                Tab::Configuration => config_tab::show(ui, self),
-                Tab::Logs => logs_tab::show(ui, &self.logs),
-                Tab::Status => status_tab::show(ui, &self.bot_status, &self.status_message),
+        // Update metrics if bot is running
+        if self.bot_state == BotState::Running {
+            if let Some(runtime) = &self.bot_runtime {
+                self.bot_metrics = runtime.get_metrics();
             }
+        }
+        
+        // Apply theme
+        theme::configure_fonts(ctx);
+        theme::apply_theme(ctx, self.theme);
+        let colors = ThemeColors::from_theme(self.theme);
+        
+        // Top panel with title and theme toggle
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(colors.surface)
+                .inner_margin(egui::Margin::symmetric(20.0, 15.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("🚀 Invictus Sniper Bot")
+                                .size(24.0)
+                                .color(colors.primary)
+                                .strong()
+                        );
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Theme toggle
+                            let theme_icon = match self.theme {
+                                Theme::Light => "🌙",
+                                Theme::Dark => "☀️",
+                            };
+                            
+                            if ui.button(egui::RichText::new(theme_icon).size(18.0)).clicked() {
+                                self.theme.toggle();
+                            }
+                            
+                            ui.add_space(20.0);
+                            
+                            // Status indicator
+                            let (status_icon, status_color) = match self.bot_state {
+                                BotState::Stopped => ("⭕", colors.text_secondary),
+                                BotState::Starting => ("⏳", colors.warning),
+                                BotState::Running => ("🟢", colors.success),
+                                BotState::Stopping => ("⏳", colors.warning),
+                                BotState::Error => ("🔴", colors.error),
+                            };
+                            
+                            ui.label(egui::RichText::new(status_icon).size(16.0));
+                            ui.label(
+                                egui::RichText::new(format!("{:?}", self.bot_state))
+                                    .size(14.0)
+                                    .color(status_color)
+                            );
+                        });
+                    });
+                });
         });
+        
+        // Side panel for navigation
+        egui::SidePanel::left("nav_panel")
+            .resizable(false)
+            .exact_width(200.0)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(colors.surface)
+                    .inner_margin(egui::Margin::symmetric(10.0, 20.0))
+                    .show(ui, |ui| {
+                        ui.add_space(10.0);
+                        
+                        let tab_button = |ui: &mut egui::Ui, icon: &str, text: &str, tab: Tab, current: Tab| {
+                            let is_selected = tab == current;
+                            let bg_color = if is_selected { colors.primary } else { colors.surface };
+                            let text_color = if is_selected { egui::Color32::WHITE } else { colors.text_primary };
+                            
+                            let button = egui::Button::new(
+                                egui::RichText::new(format!("{} {}", icon, text))
+                                    .size(15.0)
+                                    .color(text_color)
+                            )
+                            .fill(bg_color)
+                            .rounding(8.0)
+                            .min_size(egui::vec2(180.0, 40.0));
+                            
+                            ui.add(button).clicked()
+                        };
+                        
+                        if tab_button(ui, "📊", "Dashboard", Tab::Dashboard, self.current_tab) {
+                            self.current_tab = Tab::Dashboard;
+                        }
+                        ui.add_space(5.0);
+                        
+                        if tab_button(ui, "⚙️", "Configuration", Tab::Configuration, self.current_tab) {
+                            self.current_tab = Tab::Configuration;
+                        }
+                        ui.add_space(5.0);
+                        
+                        if tab_button(ui, "📈", "Positions", Tab::Positions, self.current_tab) {
+                            self.current_tab = Tab::Positions;
+                        }
+                        ui.add_space(5.0);
+                        
+                        if tab_button(ui, "📜", "Trades", Tab::Trades, self.current_tab) {
+                            self.current_tab = Tab::Trades;
+                        }
+                        ui.add_space(5.0);
+                        
+                        if tab_button(ui, "📋", "Logs", Tab::Logs, self.current_tab) {
+                            self.current_tab = Tab::Logs;
+                        }
+                    });
+            });
+        
+        // Central panel for content
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(colors.background).inner_margin(egui::Margin::same(20.0)))
+            .show(ctx, |ui| {
+                let mut start_bot = false;
+                let mut stop_bot = false;
+                
+                match self.current_tab {
+                    Tab::Dashboard => {
+                        dashboard_tab::show(
+                            ui,
+                            &colors,
+                            self.bot_state,
+                            &self.bot_metrics,
+                            &mut start_bot,
+                            &mut stop_bot,
+                        );
+                    }
+                    Tab::Configuration => {
+                        config_tab::show(ui, self, &colors);
+                    }
+                    Tab::Positions => {
+                        positions_tab::show(ui, &colors, &self.positions);
+                    }
+                    Tab::Trades => {
+                        trades_tab::show(ui, &colors, &self.trades);
+                    }
+                    Tab::Logs => {
+                        logs_tab::show(
+                            ui,
+                            &colors,
+                            &self.logs,
+                            &mut self.log_filter,
+                            &mut self.auto_scroll,
+                        );
+                    }
+                }
+                
+                // Handle bot start/stop
+                if start_bot {
+                    match self.config.to_config() {
+                        Ok(config) => {
+                            if let Some(runtime) = &mut self.bot_runtime {
+                                match runtime.start(config) {
+                                    Ok(_) => {
+                                        self.add_log(LogLevel::Info, "Bot started successfully".to_string());
+                                        self.status_message = "✅ Bot started".to_string();
+                                    }
+                                    Err(e) => {
+                                        self.add_log(LogLevel::Error, format!("Failed to start bot: {}", e));
+                                        self.status_message = format!("❌ Failed to start: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.add_log(LogLevel::Error, format!("Invalid configuration: {}", e));
+                            self.status_message = format!("❌ Invalid config: {}", e);
+                        }
+                    }
+                }
+                
+                if stop_bot {
+                    if let Some(runtime) = &mut self.bot_runtime {
+                        match runtime.stop() {
+                            Ok(_) => {
+                                self.add_log(LogLevel::Info, "Bot stopped successfully".to_string());
+                                self.status_message = "✅ Bot stopped".to_string();
+                            }
+                            Err(e) => {
+                                self.add_log(LogLevel::Error, format!("Failed to stop bot: {}", e));
+                                self.status_message = format!("❌ Failed to stop: {}", e);
+                            }
+                        }
+                    }
+                }
+            });
+        
+        // Request repaint for smooth animations
+        ctx.request_repaint();
     }
 }
