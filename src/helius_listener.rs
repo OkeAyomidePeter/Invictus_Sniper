@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -47,27 +47,15 @@ pub struct PoolCreationEvent {
     pub is_graduated: bool,      // NEW: True if migrated from bonding curve
 }
 
-/// Token platform detection
+/// Token platform detection (GRADUATED TOKENS ONLY)
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum TokenPlatform {
-    PumpFun,           // Graduated from Pump.fun bonding curve
-    BonkFun,           // Graduated from Bonk.fun bonding curve
-    RaydiumLaunchlab,  // Raydium native launch
-    Standard,          // Standard SPL token
-    Unknown,
+    PumpFun,   // Graduated from Pump.fun bonding curve
+    BonkFun,   // Graduated from Bonk.fun bonding curve
+    Unknown,   // Not from a tracked platform
 }
 
 impl TokenPlatform {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "Pump.fun" => Self::PumpFun,
-            "Bonk.fun" => Self::BonkFun,
-            "Raydium Launchlab" => Self::RaydiumLaunchlab,
-            "Standard" => Self::Standard,
-            _ => Self::Unknown,
-        }
-    }
-
     fn is_graduated(&self) -> bool {
         matches!(self, Self::PumpFun | Self::BonkFun)
     }
@@ -136,20 +124,7 @@ const PUMPFUN_MIGRATION_ACCOUNT: &str = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5
 /// Bonk.fun program ID
 const BONK_FUN_PROGRAM_ID: &str = "FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1";
 
-/// Raydium Launchlab program ID
-const RAYDIUM_LAUNCHLAB_PROGRAM_ID: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
 
-/// Orca Whirlpool program ID
-const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-
-/// Jupiter Aggregator v6 program ID
-const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
-
-/// Meteora DLMM
-const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
-
-/// Phoenix DEX program ID
-const PHOENIX_PROGRAM_ID: &str = "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY";
 
 // ========== WELL-KNOWN TOKENS (TO EXCLUDE) ==========
 
@@ -193,6 +168,10 @@ const POPCAT_MINT: &str = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr";
 const WS_POOL_SIZE: usize = 3; // Number of concurrent WebSocket connections
 const PING_INTERVAL_SECS: u64 = 30; // Send ping every 30 seconds to keep connection alive
 
+// ========== SNIPER BOT CONFIGURATION ==========
+/// Maximum age for graduated tokens (in seconds) - only snipe fresh tokens
+const MAX_TOKEN_AGE_SECONDS: i64 = 60; // 1 minute
+
 /// Start the Helius listener with connection pool and optimized sniper architecture
 pub async fn start(config: &Config) -> Result<mpsc::Receiver<ClassifiedEvent>> {
     let (raw_tx, raw_rx) = mpsc::channel::<RawTxEvent>(2000); // Increased buffer for multiple connections
@@ -200,9 +179,9 @@ pub async fn start(config: &Config) -> Result<mpsc::Receiver<ClassifiedEvent>> {
 
     let api_key = config.helius_api_key.clone();
 
-    info!("🚀 Starting Helius Sniper Listener (OPTIMIZED FOR SPEED)");
-    info!("🎯 Strategy: Monitor pool creation + platform detection");
-    info!("⚡ Focus: Pump.fun/Bonk.fun graduated tokens ONLY");
+    info!("🚀 Starting Helius Sniper Listener (GRADUATED TOKENS ONLY)");
+    info!("🎯 Strategy: Monitor Pump.fun/Bonk.fun graduated tokens EXCLUSIVELY");
+    info!("⚡ Focus: Fresh graduated tokens (max age: {}s)", MAX_TOKEN_AGE_SECONDS);
     info!("🔗 Connection Pool: {} WebSocket connections", WS_POOL_SIZE);
     info!("💓 Heartbeat: Ping every {}s to prevent disconnection", PING_INTERVAL_SECS);
 
@@ -294,16 +273,12 @@ async fn connect_and_listen(
         .await?;
     info!("[Connection #{}] 🎯 PRIORITY: Subscribed to Pump.fun Migration Account", connection_id);
 
-    // ========== POOL CREATION MONITORING (ALL DEXes) ==========
+    // ========== POOL CREATION MONITORING (RAYDIUM ONLY - WHERE GRADUATED TOKENS MIGRATE) ==========
     let dex_programs = vec![
         (10, RAYDIUM_AMM_V4_PROGRAM_ID, "Raydium AMM v4"),
         (11, RAYDIUM_CPMM_PROGRAM_ID, "Raydium CPMM"),
         (12, RAYDIUM_LIQUIDITY_POOL_V4, "Raydium Liquidity Pool v4"),
-        (13, ORCA_WHIRLPOOL_PROGRAM_ID, "Orca Whirlpool"),
-        (14, JUPITER_V6_PROGRAM_ID, "Jupiter v6"),
-        (15, METEORA_DLMM_PROGRAM_ID, "Meteora DLMM"),
-        (16, PHOENIX_PROGRAM_ID, "Phoenix DEX"),
-        (17, PUMP_FUN_PROGRAM_ID, "Pump.fun"), // Direct pool creation
+        (13, PUMP_FUN_PROGRAM_ID, "Pump.fun"), // Direct pool creation
     ];
 
     for (id, program_id, name) in dex_programs {
@@ -324,7 +299,7 @@ async fn connect_and_listen(
         write
             .send(Message::Text(subscribe_msg.to_string()))
             .await?;
-        info!("[Connection #{}] 📡 Subscribed to pool creation: {}", connection_id, name);
+        info!("[Connection #{}] 📡 Subscribed to graduated token pool: {}", connection_id, name);
     }
 
     // ========== HEARTBEAT/PING TASK ==========
@@ -550,12 +525,43 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     // CRITICAL: Reject ALL non-graduated tokens
     // Only process Pump.fun and Bonk.fun graduated tokens
     if !is_graduated {
-        warn!("🚫 REJECTED: Non-graduated token {} - GRADUATED ONLY MODE", token_mint);
-        warn!("   Platform: {:?} | Graduated: {} | DEX: N/A", token_platform, is_graduated);
-        return None;
+        return None; // Silent rejection for non-graduated tokens
     }
 
-    info!("🎓 GRADUATED TOKEN DETECTED: {} (platform: {:?})", token_mint, token_platform);
+    // ========== AGE FILTER: FRESH TOKENS ONLY ==========
+    // Reject tokens older than MAX_TOKEN_AGE_SECONDS
+    if let Some(timestamp) = event.timestamp {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        let token_age = current_time - timestamp;
+        
+        if token_age > MAX_TOKEN_AGE_SECONDS {
+            warn!(
+                "🚫 REJECTED (AGE): Token is {} seconds old (max: {}s) - {} (platform: {:?})",
+                token_age, MAX_TOKEN_AGE_SECONDS, token_mint, token_platform
+            );
+            return None;
+        }
+        
+        info!(
+            "✅ AGE CHECK PASSED: Token is {} seconds old (max: {}s) - {} (platform: {:?})",
+            token_age, MAX_TOKEN_AGE_SECONDS, token_mint, token_platform
+        );
+    } else {
+        warn!(
+            "⚠️ No timestamp available for token {} - cannot verify age, proceeding with caution",
+            token_mint
+        );
+    }
+
+    // ========== ALL VALIDATIONS PASSED ==========
+    info!(
+        "✅ TOKEN ACCEPTED: {} paired with {} | Platform: {:?} | DEX: TBD | Age: FRESH",
+        token_mint, pair_token, token_platform
+    );
 
     // Detect DEX
     let dex = detect_dex_from_logs(logs_array)?;
@@ -603,11 +609,6 @@ fn detect_token_platform(
                 if pubkey == BONK_FUN_PROGRAM_ID {
                     return TokenPlatform::BonkFun;
                 }
-                
-                // Check for Raydium Launchlab
-                if pubkey == RAYDIUM_LAUNCHLAB_PROGRAM_ID {
-                    return TokenPlatform::RaydiumLaunchlab;
-                }
             }
         }
     }
@@ -628,18 +629,14 @@ fn detect_token_platform(
             if log_str.contains(BONK_FUN_PROGRAM_ID) {
                 return TokenPlatform::BonkFun;
             }
-            if log_str.contains(RAYDIUM_LAUNCHLAB_PROGRAM_ID) {
-                return TokenPlatform::RaydiumLaunchlab;
-            }
         }
     }
 
-    // DEFAULT: Treat as Standard (SAFE)
-    // If we can't cryptographically prove it's from a platform, assume it's not
-    TokenPlatform::Standard
+    // DEFAULT: Unknown (not from tracked platforms)
+    TokenPlatform::Unknown
 }
 
-/// Detect DEX from logs
+/// Detect DEX from logs (RAYDIUM ONLY - where graduated tokens migrate)
 fn detect_dex_from_logs(logs: &[serde_json::Value]) -> Option<String> {
     for log in logs {
         if let Some(log_str) = log.as_str() {
@@ -648,18 +645,6 @@ fn detect_dex_from_logs(logs: &[serde_json::Value]) -> Option<String> {
             }
             if log_str.contains(RAYDIUM_CPMM_PROGRAM_ID) {
                 return Some("Raydium CPMM".to_string());
-            }
-            if log_str.contains(ORCA_WHIRLPOOL_PROGRAM_ID) {
-                return Some("Orca Whirlpool".to_string());
-            }
-            if log_str.contains(METEORA_DLMM_PROGRAM_ID) {
-                return Some("Meteora DLMM".to_string());
-            }
-            if log_str.contains(JUPITER_V6_PROGRAM_ID) {
-                return Some("Jupiter v6".to_string());
-            }
-            if log_str.contains(PHOENIX_PROGRAM_ID) {
-                return Some("Phoenix".to_string());
             }
             if log_str.contains(PUMP_FUN_PROGRAM_ID) {
                 return Some("Pump.fun".to_string()); 
@@ -716,13 +701,21 @@ fn extract_pool_tokens(
     // Extract raw tokens first
     let (token_a, token_b) = if let Some(meta) = meta {
         if let Some(post_balances) = meta.get("postTokenBalances").and_then(|b| b.as_array()) {
-            if post_balances.len() >= 2 {
-                let token_a = post_balances[0].get("mint")?.as_str()?;
-                let token_b = post_balances[1].get("mint")?.as_str()?;
-                (token_a.to_string(), token_b.to_string())
-            } else if post_balances.len() == 1 {
-                let token = post_balances[0].get("mint")?.as_str()?;
-                (token.to_string(), "So11111111111111111111111111111111111111112".to_string())
+            // CRITICAL FIX: Deduplicate tokens from postTokenBalances
+            // The same token can appear multiple times (different accounts)
+            let mut unique_tokens = HashSet::new();
+            for balance in post_balances {
+                if let Some(mint) = balance.get("mint").and_then(|m| m.as_str()) {
+                    unique_tokens.insert(mint.to_string());
+                }
+            }
+            
+            let tokens: Vec<String> = unique_tokens.into_iter().collect();
+            
+            if tokens.len() >= 2 {
+                (tokens[0].clone(), tokens[1].clone())
+            } else if tokens.len() == 1 {
+                (tokens[0].clone(), "So11111111111111111111111111111111111111112".to_string())
             } else {
                 // Fallback to account keys parsing
                 extract_from_account_keys(transaction)?
@@ -750,6 +743,20 @@ fn extract_pool_tokens(
         (token_a, token_b)
     };
 
+    // SAFETY CHECK: Ensure we never return identical tokens
+    if new_token == pair_token {
+        warn!(
+            "⚠️ Token extraction error: Extracted identical tokens ({}). This indicates a transaction parsing issue.",
+            new_token
+        );
+        return None;
+    }
+
+    info!(
+        "🔍 Extracted token pair: new_token={}, pair_token={}",
+        new_token, pair_token
+    );
+
     Some((new_token, pair_token))
 }
 
@@ -758,24 +765,31 @@ fn extract_from_account_keys(transaction: &serde_json::Value) -> Option<(String,
     let message = transaction.get("message")?;
     let account_keys = message.get("accountKeys")?.as_array()?;
 
-    let mut tokens = Vec::new();
+    // Use HashSet to deduplicate tokens
+    let mut tokens = HashSet::new();
     for key in account_keys {
         if let Some(pubkey) = key.get("pubkey").and_then(|p| p.as_str()) {
             if !is_program_id(pubkey) && is_token_mint(pubkey) {
-                tokens.push(pubkey.to_string());
+                tokens.insert(pubkey.to_string());
             }
         } else if let Some(pubkey_str) = key.as_str() {
             if !is_program_id(pubkey_str) && is_token_mint(pubkey_str) {
-                tokens.push(pubkey_str.to_string());
+                tokens.insert(pubkey_str.to_string());
             }
         }
     }
 
+    // Convert to Vec for indexing
+    let tokens: Vec<String> = tokens.into_iter().collect();
+
     if tokens.len() >= 2 {
+        // Ensure we have exactly 2 different tokens
         Some((tokens[0].clone(), tokens[1].clone()))
     } else if tokens.len() == 1 {
+        // Single token paired with SOL
         Some((tokens[0].clone(), "So11111111111111111111111111111111111111112".to_string()))
     } else {
+        warn!("⚠️ Token extraction failed: Found {} unique tokens in account keys", tokens.len());
         None
     }
 }
@@ -790,11 +804,6 @@ fn is_program_id(address: &str) -> bool {
             | RAYDIUM_LIQUIDITY_POOL_V4
             | PUMP_FUN_PROGRAM_ID
             | BONK_FUN_PROGRAM_ID
-            | RAYDIUM_LAUNCHLAB_PROGRAM_ID
-            | ORCA_WHIRLPOOL_PROGRAM_ID
-            | JUPITER_V6_PROGRAM_ID
-            | METEORA_DLMM_PROGRAM_ID
-            | PHOENIX_PROGRAM_ID
             | "11111111111111111111111111111111"
             | "ComputeBudget111111111111111111111111111111"
     )
@@ -864,11 +873,7 @@ fn is_valid_new_token_pair(token_a: &str, token_b: &str) -> bool {
         return false;
     }
 
-    // Valid new token pair
-    info!(
-        "✅ Valid new token pair detected: {} paired with {}",
-        new_token, pair_token
-    );
+    // Valid pair structure (age and platform validation happens later)
     true
 }
 
