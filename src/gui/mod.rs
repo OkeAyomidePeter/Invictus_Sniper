@@ -6,6 +6,8 @@ pub mod bot_runtime;
 pub mod dashboard_tab;
 pub mod positions_tab;
 pub mod trades_tab;
+pub mod logger;
+
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -199,9 +201,7 @@ pub enum LogLevel {
 }
 
 impl InvictusGUI {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        
+    pub fn new(_cc: &eframe::CreationContext<'_>, event_rx: mpsc::UnboundedReceiver<BotEvent>, event_tx: mpsc::UnboundedSender<BotEvent>) -> Self {
         let mut app = Self {
             config: ConfigData::default(),
             current_tab: Tab::Dashboard,
@@ -318,57 +318,68 @@ impl InvictusGUI {
     }
     
     pub fn load_config_from_env(&mut self) {
-        if let Ok(content) = std::fs::read_to_string(".env") {
-            for line in content.lines() {
-                if line.starts_with('#') || line.trim().is_empty() {
-                    continue;
-                }
-                
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim();
-                    let value = value.trim();
-                    
-                    match key {
-                        "HELIUS_API_KEY" => self.config.helius_api_key = value.to_string(),
-                        "SOLANA_PRIVATE_KEY" => self.config.solana_private_key = value.to_string(),
-                        "TELEGRAM_BOT_TOKEN" => self.config.telegram_bot_token = value.to_string(),
-                        "TELEGRAM_CHAT_ID" => self.config.telegram_chat_id = value.to_string(),
-                        "DATABASE_URL" => self.config.database_url = value.to_string(),
-                        "MIN_LIQUIDITY_SOL" => self.config.min_liquidity_sol = value.to_string(),
-                        "MIN_HOLDERS" => self.config.min_holders = value.to_string(),
-                        "MAX_TRADE_SIZE_SOL" => self.config.max_trade_size_sol = value.to_string(),
-                        "MAX_DAILY_EXPOSURE_SOL" => self.config.max_daily_exposure_sol = value.to_string(),
-                        "MAX_CREATOR_OWNERSHIP_PERCENTAGE" => self.config.max_creator_ownership_percentage = value.to_string(),
-                        "HONEYPOT_CHECK_ENABLED" => self.config.honeypot_check_enabled = value.parse().unwrap_or(true),
-                        "JUPITER_API_TIMEOUT_MS" => self.config.jupiter_api_timeout_ms = value.to_string(),
-                        "AUTO_SELL_ENABLED" => self.config.auto_sell_enabled = value.parse().unwrap_or(true),
-                        "AUTO_SELL_PROFIT_TARGET_PCT" => self.config.auto_sell_profit_target_pct = value.to_string(),
-                        "AUTO_SELL_STOP_LOSS_PCT" => self.config.auto_sell_stop_loss_pct = value.to_string(),
-                        "AUTO_SELL_TIMEOUT_SECONDS" => self.config.auto_sell_timeout_seconds = value.to_string(),
-                        "AUTO_SELL_SLIPPAGE_BPS" => self.config.auto_sell_slippage_bps = value.to_string(),
-                        "AUTO_SELL_PRICE_CHECK_INTERVAL_MS" => self.config.auto_sell_price_check_interval_ms = value.to_string(),
-                        "JITO_DYNAMIC_TIPS_ENABLED" => self.config.jito_dynamic_tips_enabled = value.parse().unwrap_or(true),
-                        "JITO_BASE_TIP_LAMPORTS" => self.config.jito_base_tip_lamports = value.to_string(),
-                        "JITO_MIN_TIP_LAMPORTS" => self.config.jito_min_tip_lamports = value.to_string(),
-                        "JITO_MAX_TIP_LAMPORTS" => self.config.jito_max_tip_lamports = value.to_string(),
-                        "TX_RETRY_MAX_ATTEMPTS" => self.config.tx_retry_max_attempts = value.to_string(),
-                        "TX_RETRY_INITIAL_DELAY_MS" => self.config.tx_retry_initial_delay_ms = value.to_string(),
-                        "TX_RETRY_MAX_DELAY_MS" => self.config.tx_retry_max_delay_ms = value.to_string(),
-                        "TX_RETRY_BACKOFF_MULTIPLIER" => self.config.tx_retry_backoff_multiplier = value.to_string(),
-                        "RATE_LIMITING_ENABLED" => self.config.rate_limiting_enabled = value.parse().unwrap_or(true),
-                        "HELIUS_MAX_REQUESTS_PER_SECOND" => self.config.helius_max_requests_per_second = value.to_string(),
-                        "JUPITER_MAX_REQUESTS_PER_SECOND" => self.config.jupiter_max_requests_per_second = value.to_string(),
-                        "WALLET_LOW_BALANCE_ALERT_SOL" => self.config.wallet_low_balance_alert_sol = value.to_string(),
-                        "WALLET_MONITOR_INTERVAL_SECS" => self.config.wallet_monitor_interval_secs = value.to_string(),
-                        "WALLET_RESERVE_FOR_FEES_SOL" => self.config.wallet_reserve_for_fees_sol = value.to_string(),
-                        "MAX_CONCURRENT_TRADES" => self.config.max_concurrent_trades = value.to_string(),
-                        "MAX_OPEN_POSITIONS" => self.config.max_open_positions = value.to_string(),
-                        "TOTAL_EXPOSURE_LIMIT_SOL" => self.config.total_exposure_limit_sol = value.to_string(),
-                        _ => {}
-                    }
+        // Load .env file
+        dotenv::dotenv().ok();
+        
+        // Helper to load env var into string field
+        let load_str = |field: &mut String, key: &str| {
+            if let Ok(val) = std::env::var(key) {
+                *field = val;
+            }
+        };
+        
+        // Helper to load env var into bool field
+        let load_bool = |field: &mut bool, key: &str| {
+            if let Ok(val) = std::env::var(key) {
+                if let Ok(parsed) = val.parse() {
+                    *field = parsed;
                 }
             }
-        }
+        };
+
+        load_str(&mut self.config.helius_api_key, "HELIUS_API_KEY");
+        load_str(&mut self.config.solana_private_key, "SOLANA_PRIVATE_KEY");
+        load_str(&mut self.config.telegram_bot_token, "TELEGRAM_BOT_TOKEN");
+        load_str(&mut self.config.telegram_chat_id, "TELEGRAM_CHAT_ID");
+        load_str(&mut self.config.database_url, "DATABASE_URL");
+        
+        load_str(&mut self.config.min_liquidity_sol, "MIN_LIQUIDITY_SOL");
+        load_str(&mut self.config.min_holders, "MIN_HOLDERS");
+        load_str(&mut self.config.max_trade_size_sol, "MAX_TRADE_SIZE_SOL");
+        load_str(&mut self.config.max_daily_exposure_sol, "MAX_DAILY_EXPOSURE_SOL");
+        load_str(&mut self.config.max_creator_ownership_percentage, "MAX_CREATOR_OWNERSHIP_PERCENTAGE");
+        
+        load_bool(&mut self.config.honeypot_check_enabled, "HONEYPOT_CHECK_ENABLED");
+        load_str(&mut self.config.jupiter_api_timeout_ms, "JUPITER_API_TIMEOUT_MS");
+        
+        load_bool(&mut self.config.auto_sell_enabled, "AUTO_SELL_ENABLED");
+        load_str(&mut self.config.auto_sell_profit_target_pct, "AUTO_SELL_PROFIT_TARGET_PCT");
+        load_str(&mut self.config.auto_sell_stop_loss_pct, "AUTO_SELL_STOP_LOSS_PCT");
+        load_str(&mut self.config.auto_sell_timeout_seconds, "AUTO_SELL_TIMEOUT_SECONDS");
+        load_str(&mut self.config.auto_sell_slippage_bps, "AUTO_SELL_SLIPPAGE_BPS");
+        load_str(&mut self.config.auto_sell_price_check_interval_ms, "AUTO_SELL_PRICE_CHECK_INTERVAL_MS");
+        
+        load_bool(&mut self.config.jito_dynamic_tips_enabled, "JITO_DYNAMIC_TIPS_ENABLED");
+        load_str(&mut self.config.jito_base_tip_lamports, "JITO_BASE_TIP_LAMPORTS");
+        load_str(&mut self.config.jito_min_tip_lamports, "JITO_MIN_TIP_LAMPORTS");
+        load_str(&mut self.config.jito_max_tip_lamports, "JITO_MAX_TIP_LAMPORTS");
+        
+        load_str(&mut self.config.tx_retry_max_attempts, "TX_RETRY_MAX_ATTEMPTS");
+        load_str(&mut self.config.tx_retry_initial_delay_ms, "TX_RETRY_INITIAL_DELAY_MS");
+        load_str(&mut self.config.tx_retry_max_delay_ms, "TX_RETRY_MAX_DELAY_MS");
+        load_str(&mut self.config.tx_retry_backoff_multiplier, "TX_RETRY_BACKOFF_MULTIPLIER");
+        
+        load_bool(&mut self.config.rate_limiting_enabled, "RATE_LIMITING_ENABLED");
+        load_str(&mut self.config.helius_max_requests_per_second, "HELIUS_MAX_REQUESTS_PER_SECOND");
+        load_str(&mut self.config.jupiter_max_requests_per_second, "JUPITER_MAX_REQUESTS_PER_SECOND");
+        
+        load_str(&mut self.config.wallet_low_balance_alert_sol, "WALLET_LOW_BALANCE_ALERT_SOL");
+        load_str(&mut self.config.wallet_monitor_interval_secs, "WALLET_MONITOR_INTERVAL_SECS");
+        load_str(&mut self.config.wallet_reserve_for_fees_sol, "WALLET_RESERVE_FOR_FEES_SOL");
+        
+        load_str(&mut self.config.max_concurrent_trades, "MAX_CONCURRENT_TRADES");
+        load_str(&mut self.config.max_open_positions, "MAX_OPEN_POSITIONS");
+        load_str(&mut self.config.total_exposure_limit_sol, "TOTAL_EXPOSURE_LIMIT_SOL");
     }
 }
 
@@ -435,8 +446,8 @@ impl eframe::App for InvictusGUI {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Theme toggle
                             let theme_icon = match self.theme {
-                                Theme::Light => "🌙",
-                                Theme::Dark => "☀️",
+                                Theme::Light => egui_phosphor::regular::MOON,
+                                Theme::Dark => egui_phosphor::regular::SUN,
                             };
                             
                             if ui.button(egui::RichText::new(theme_icon).size(18.0)).clicked() {
@@ -493,27 +504,27 @@ impl eframe::App for InvictusGUI {
                             ui.add(button).clicked()
                         };
                         
-                        if tab_button(ui, "📊", "Dashboard", Tab::Dashboard, self.current_tab) {
+                        if tab_button(ui, egui_phosphor::regular::CHART_BAR, "Dashboard", Tab::Dashboard, self.current_tab) {
                             self.current_tab = Tab::Dashboard;
                         }
                         ui.add_space(5.0);
                         
-                        if tab_button(ui, "⚙️", "Configuration", Tab::Configuration, self.current_tab) {
+                        if tab_button(ui, egui_phosphor::regular::GEAR, "Configuration", Tab::Configuration, self.current_tab) {
                             self.current_tab = Tab::Configuration;
                         }
                         ui.add_space(5.0);
                         
-                        if tab_button(ui, "📈", "Positions", Tab::Positions, self.current_tab) {
+                        if tab_button(ui, egui_phosphor::regular::TREND_UP, "Positions", Tab::Positions, self.current_tab) {
                             self.current_tab = Tab::Positions;
                         }
                         ui.add_space(5.0);
                         
-                        if tab_button(ui, "📜", "Trades", Tab::Trades, self.current_tab) {
+                        if tab_button(ui, egui_phosphor::regular::LIST_DASHES, "Trades", Tab::Trades, self.current_tab) {
                             self.current_tab = Tab::Trades;
                         }
                         ui.add_space(5.0);
                         
-                        if tab_button(ui, "📋", "Logs", Tab::Logs, self.current_tab) {
+                        if tab_button(ui, egui_phosphor::regular::TERMINAL_WINDOW, "Logs", Tab::Logs, self.current_tab) {
                             self.current_tab = Tab::Logs;
                         }
                     });

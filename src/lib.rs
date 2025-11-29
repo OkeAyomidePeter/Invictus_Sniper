@@ -12,7 +12,7 @@ pub mod position_tracker;
 pub mod presigner;
 pub mod rate_limiter;
 pub mod retry;
-pub mod risk_engine;
+
 pub mod scoring;
 pub mod tele;
 pub mod tx;

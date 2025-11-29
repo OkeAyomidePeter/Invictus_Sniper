@@ -14,7 +14,7 @@ pub fn show(
     
     // Header with controls
     ui.horizontal(|ui| {
-        ui.heading(egui::RichText::new("📋 Logs").size(28.0).color(colors.text_primary));
+        ui.heading(egui::RichText::new("Logs").size(28.0).color(colors.text_primary));
         
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Auto-scroll toggle
@@ -71,7 +71,7 @@ pub fn show(
                     if logs_vec.is_empty() {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
-                            ui.label(egui::RichText::new("📭").size(48.0));
+                            ui.label(egui::RichText::new(egui_phosphor::regular::TRAY).size(48.0).color(colors.text_secondary));
                             ui.add_space(10.0);
                             ui.label(
                                 egui::RichText::new("No logs yet")
@@ -90,17 +90,17 @@ pub fn show(
                             }
                             
                             let (level_icon, _level_color) = match entry.level {
-                                LogLevel::Info => ("ℹ️", colors.primary),
-                                LogLevel::Warn => ("⚠️", colors.warning),
-                                LogLevel::Error => ("❌", colors.error),
-                                LogLevel::Debug => ("🔧", colors.text_secondary),
+                                LogLevel::Info => (egui_phosphor::regular::INFO, colors.primary),
+                                LogLevel::Warn => (egui_phosphor::regular::WARNING, colors.warning),
+                                LogLevel::Error => (egui_phosphor::regular::X_CIRCLE, colors.error),
+                                LogLevel::Debug => (egui_phosphor::regular::WRENCH, colors.text_secondary),
                             };
                             
                             egui::Frame::none()
                                 .inner_margin(egui::Margin::symmetric(15.0, 8.0))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(level_icon).size(16.0));
+                                        ui.label(egui::RichText::new(level_icon).size(16.0).color(_level_color));
                                         
                                         ui.label(
                                             egui::RichText::new(&entry.timestamp)

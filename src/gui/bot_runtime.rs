@@ -8,12 +8,12 @@ use crate::config::Config;
 use crate::helius_listener;
 use crate::enrichment;
 use crate::scoring::TokenScorer;
-use crate::risk_engine::RiskEngine;
+// use crate::risk_engine::RiskEngine;
 use crate::presigner::Presigner;
 use crate::tx::TransactionManager;
 use crate::db::Database;
 use crate::tele::TelegramInterface;
-use crate::position_tracker::PositionTracker;
+use crate::position_tracker::{PositionTracker, Position, SellTrigger};
 use crate::wallet_monitor::WalletMonitor;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -192,7 +192,7 @@ async fn run_bot_logic(
 
     // Initialize components
     let scorer = TokenScorer::new();
-    let risk_engine = RiskEngine::new(&config);
+    // let risk_engine = RiskEngine::new(&config);
     let presigner = Arc::new(Presigner::new(&config));
     let tx_manager = TransactionManager::new(presigner.clone(), &config);
     let database = Arc::new(Database::new("sqlite://invictus.db").await?);
@@ -291,37 +291,160 @@ async fn run_bot_logic(
                     }
 
                     // Risk verification and trading logic (same as main.rs)
-                    match risk_engine.verify_token(enriched_token.clone()).await {
-                        Ok(verified) => {
-                            if !verified.is_honeypot {
-                                // Execute buy logic...
-                                let buy_amount_sol_lamports = (config.max_trade_size_sol * 1_000_000_000.0) as u64;
-                                let tip_lamports = 1_000_000;
-                                let slippage_bps = 300;
+                    // Direct Buy (Risk Engine Removed)
+                    let _ = event_tx.send(BotEvent::LogMessage {
+                        level: "INFO".to_string(),
+                        message: format!("🚀 HIGH SCORE: {} ({:.1}/70) - EXECUTING IMMEDIATE BUY", enriched_token.mint, score),
+                    });
 
-                                match tx_manager.buy_with_jito(
-                                    &verified.token.mint,
-                                    buy_amount_sol_lamports,
-                                    tip_lamports,
-                                    slippage_bps,
-                                ).await {
-                                    Ok(bundle_id) => {
-                                        let _ = event_tx.send(BotEvent::LogMessage {
+                    // Execute BUY with Jito
+                    let buy_amount_sol_lamports = (config.max_trade_size_sol * 1_000_000_000.0) as u64;
+                    let tip_lamports = 1_000_000; // 0.001 SOL tip
+                    let slippage_bps = 300; // 3% slippage
+                    
+                    let _ = event_tx.send(BotEvent::LogMessage {
+                        level: "INFO".to_string(),
+                        message: format!("💰 Executing BUY for {} ({} SOL)", enriched_token.mint, config.max_trade_size_sol),
+                    });
+                    
+                    match tx_manager.buy_with_jito(
+                        &enriched_token.mint,
+                        buy_amount_sol_lamports,
+                        tip_lamports,
+                        slippage_bps,
+                    ).await {
+                        Ok(bundle_id) => {
+                            let _ = event_tx.send(BotEvent::LogMessage {
+                                level: "INFO".to_string(),
+                                message: format!("🚀 BUY executed successfully! Bundle: {}", bundle_id),
+                            });
+                            
+                            // Calculate entry price (estimated based on liquidity)
+                            let entry_price_estimate = if let Some(liq) = enriched_token.initial_liquidity_sol {
+                                liq / (enriched_token.supply.unwrap_or(1_000_000_000) as f64)
+                            } else {
+                                0.0
+                            };
+                            
+                            // Record trade in database
+                            if let Err(e) = database.record_trade(
+                                &enriched_token.mint,
+                                "BUY",
+                                0, // Token amount unknown until we query balance
+                                buy_amount_sol_lamports,
+                                &bundle_id,
+                                Some(&bundle_id),
+                                Some(entry_price_estimate),
+                            ).await {
+                                error!("Failed to record BUY trade: {}", e);
+                            }
+                            
+                            // Start auto-sell monitoring if enabled
+                            if config.auto_sell_enabled {
+                                let _ = event_tx.send(BotEvent::LogMessage {
+                                    level: "INFO".to_string(),
+                                    message: format!("📊 Starting auto-sell monitoring for {}", enriched_token.mint),
+                                });
+                                
+                                // Sleep briefly to allow transaction to settle
+                                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                                
+                                // Query token balance to get exact amount
+                                // For now, estimate based on buy amount
+                                let estimated_token_amount = (buy_amount_sol_lamports as f64 / entry_price_estimate) as u64;
+                                
+                                let position = Position {
+                                    mint: enriched_token.mint.clone(),
+                                    entry_price_sol_per_token: entry_price_estimate,
+                                    entry_time: std::time::Instant::now(),
+                                    amount_token_raw: estimated_token_amount,
+                                    amount_sol_invested: buy_amount_sol_lamports,
+                                    decimals: enriched_token.decimals,
+                                };
+                                
+                                let mut sell_rx = position_tracker.monitor_position(position);
+                                
+                                // Spawn task to handle sell signal
+                                let tx_manager_clone = tx_manager.clone();
+                                let db_clone = database.clone();
+                                let tele_clone = tele_interface.clone();
+                                let config_clone = config.clone();
+                                let event_tx_clone = event_tx.clone(); // Clone for the task
+                                
+                                tokio::spawn(async move {
+                                    if let Some(sell_signal) = sell_rx.recv().await {
+                                        let _ = event_tx_clone.send(BotEvent::LogMessage {
                                             level: "INFO".to_string(),
-                                            message: format!("🚀 BUY executed: {}", bundle_id),
+                                            message: format!("⚡ Sell trigger: {} for {}", sell_signal.trigger, sell_signal.position.mint),
                                         });
                                         
-                                        // Record trade and start position monitoring
-                                        // (implementation continues as in main.rs)
+                                        // Execute SELL with Jito
+                                        let sell_slippage = config_clone.auto_sell_slippage_bps;
+                                        
+                                        match tx_manager_clone.sell_with_jito(
+                                            &sell_signal.position.mint,
+                                            sell_signal.position.amount_token_raw,
+                                            tip_lamports,
+                                            sell_slippage,
+                                        ).await {
+                                            Ok(bundle_id) => {
+                                                let _ = event_tx_clone.send(BotEvent::LogMessage {
+                                                    level: "INFO".to_string(),
+                                                    message: format!("🎯 Auto-sell executed: {} (Bundle: {})", sell_signal.position.mint, bundle_id),
+                                                });
+                                                
+                                                // Calculate P/L in SOL
+                                                let pnl_sol = (sell_signal.position.amount_token_raw as f64 * sell_signal.current_price_sol_per_token
+                                                    - sell_signal.position.amount_sol_invested as f64) / 1_000_000_000.0;
+                                                
+                                                // Update database with exit info
+                                                let trigger_str = match sell_signal.trigger {
+                                                    SellTrigger::ProfitTarget(_) => "PROFIT_TARGET",
+                                                    SellTrigger::StopLoss(_) => "STOP_LOSS",
+                                                    SellTrigger::Timeout => "TIMEOUT",
+                                                };
+                                                
+                                                if let Err(e) = db_clone.update_trade_exit(
+                                                    &sell_signal.position.mint,
+                                                    sell_signal.current_price_sol_per_token,
+                                                    pnl_sol,
+                                                    trigger_str,
+                                                ).await {
+                                                    error!("Failed to update trade exit: {}", e);
+                                                }
+                                                
+                                                // Send Telegram notification
+                                                tele_clone.notify_auto_sell(
+                                                    &sell_signal.position.mint,
+                                                    &sell_signal.trigger.to_string(),
+                                                    sell_signal.pnl_percentage,
+                                                    sell_signal.position.entry_price_sol_per_token,
+                                                    sell_signal.current_price_sol_per_token,
+                                                    pnl_sol,
+                                                    &bundle_id,
+                                                ).await;
+                                                
+                                                let _ = event_tx_clone.send(BotEvent::LogMessage {
+                                                    level: "INFO".to_string(),
+                                                    message: format!("💰 P/L: {:.4} SOL ({:.2}%)", pnl_sol, sell_signal.pnl_percentage),
+                                                });
+                                            }
+                                            Err(e) => {
+                                                let _ = event_tx_clone.send(BotEvent::LogMessage {
+                                                    level: "ERROR".to_string(),
+                                                    message: format!("Failed to execute auto-sell for {}: {}", sell_signal.position.mint, e),
+                                                });
+                                            }
+                                        }
                                     }
-                                    Err(e) => {
-                                        error!("Buy failed: {}", e);
-                                    }
-                                }
+                                });
                             }
                         }
                         Err(e) => {
-                            error!("Risk verification error: {}", e);
+                            let _ = event_tx.send(BotEvent::LogMessage {
+                                level: "ERROR".to_string(),
+                                message: format!("❌ Failed to execute BUY: {}", e),
+                            });
                         }
                     }
                 }

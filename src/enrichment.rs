@@ -12,6 +12,31 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::collections::HashMap;
 
+// ========== NEW STRUCTS ==========
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SocialLinks {
+    pub twitter: Option<String>,
+    pub telegram: Option<String>,
+    pub website: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenMetadata {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub socials: Option<SocialLinks>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HolderAnalysis {
+    pub top_1_pct: f64,      // % held by top 1 holder (excluding pool)
+    pub top_10_pct: f64,     // % held by top 10 holders (excluding pool)
+    pub unique_holders: Option<u64>, // Total holder count (if available)
+}
+
+
 /// Fully enriched token ready for scoring/trading
 #[derive(Debug, Clone, Serialize)]
 /// Enriched Token - GRADUATED TOKENS ONLY (Pump.fun/Bonk.fun)
@@ -47,6 +72,12 @@ pub struct EnrichedToken {
     pub has_freeze_authority: bool,
     pub has_mint_authority: bool,
     
+    // ========== METADATA & SOCIALS ==========
+    pub metadata: Option<TokenMetadata>,
+    
+    // ========== HOLDER ANALYSIS ==========
+    pub holders: Option<HolderAnalysis>,
+
     // ========== TIMING ==========
     pub enrichment_timestamp: i64,
     pub enrichment_duration_ms: u128,
@@ -249,27 +280,37 @@ async fn enrich_token(
     
     // ========== PARALLEL RPC CALLS ==========
     // Fetch all required data concurrently for maximum speed
+    // "Scatter-Gather" pattern: Fire all requests, wait for slowest
     let (
         mint_account_data,
         liquidity_data,
+        metadata_data,
+        holder_data
     ) = tokio::join!(
         fetch_mint_account_cached(client, api_key, &pool_event.token_mint),
         fetch_liquidity_data(client, api_key, &pool_event.pool_address, &pool_event.pair_token),
+        fetch_token_metadata(client, api_key, &pool_event.token_mint),
+        fetch_holder_analysis(client, api_key, &pool_event.token_mint, &pool_event.pool_address)
     );
 
     assemble_enriched_token(
         pool_event,
         mint_account_data.ok(),
         liquidity_data.ok(),
+        metadata_data.ok(),
+        holder_data.ok(),
         start_time,
     )
 }
 
 /// Assemble EnrichedToken from fetched data
+/// Assemble EnrichedToken from fetched data
 fn assemble_enriched_token(
     pool_event: PoolCreationEvent,
     mint_data: Option<MintAccountData>,
     liq_data: Option<LiquidityData>,
+    metadata: Option<TokenMetadata>,
+    holders: Option<HolderAnalysis>,
     start_time: std::time::Instant,
 ) -> Result<EnrichedToken> {
     // Extract decimals (CRITICAL)
@@ -301,6 +342,21 @@ fn assemble_enriched_token(
         decimals,
     );
 
+    // Fix Holder Analysis Percentages
+    // The fetcher returned raw amounts in the pct fields (hacky but efficient)
+    let final_holders = if let Some(mut h) = holders {
+        if let Some(s) = supply {
+            let s_f64 = s as f64;
+            if s_f64 > 0.0 {
+                h.top_1_pct = (h.top_1_pct / s_f64) * 100.0;
+                h.top_10_pct = (h.top_10_pct / s_f64) * 100.0;
+            }
+        }
+        Some(h)
+    } else {
+        None
+    };
+
     let enriched = EnrichedToken {
         // Core identification
         mint: pool_event.token_mint.clone(),
@@ -331,6 +387,11 @@ fn assemble_enriched_token(
         // Risk flags (authority checks only)
         has_freeze_authority,
         has_mint_authority,
+        
+        // New Metrics
+        metadata,
+        holders: final_holders,
+
         
         // Timing
         enrichment_timestamp: chrono::Utc::now().timestamp(),
@@ -580,6 +641,175 @@ async fn fetch_transfer_fee(
         .map(|basis_points| basis_points as f64 / 100.0);
 
     fee.ok_or_else(|| anyhow::anyhow!("No transfer fee found"))
+}
+
+/// Fetch token metadata using Helius DAS API (getAsset)
+async fn fetch_token_metadata(
+    client: &Client,
+    api_key: &str,
+    mint: &str,
+) -> Result<TokenMetadata> {
+    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
+    
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": "my-id",
+        "method": "getAsset",
+        "params": {
+            "id": mint
+        }
+    });
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .context("Failed to fetch asset metadata")?;
+
+    let json: serde_json::Value = response.json().await?;
+    
+    let result = json.get("result").context("No result in getAsset")?;
+    let content = result.get("content").context("No content in asset")?;
+    let metadata = content.get("metadata").context("No metadata in content")?;
+    
+    let name = metadata.get("name").and_then(|s| s.as_str()).unwrap_or("Unknown").to_string();
+    let symbol = metadata.get("symbol").and_then(|s| s.as_str()).unwrap_or("UNK").to_string();
+    let uri = result.get("content").and_then(|c| c.get("json_uri")).and_then(|s| s.as_str()).unwrap_or("").to_string();
+
+    // Fetch JSON URI for socials (if available)
+    let mut socials = None;
+    if !uri.is_empty() {
+        // Optimization: Spawn this as a separate task or just do it here?
+        // Doing it here adds latency. For now, let's do it here but with a short timeout.
+        if let Ok(json_meta) = client.get(&uri).timeout(Duration::from_millis(500)).send().await {
+            if let Ok(meta_body) = json_meta.json::<serde_json::Value>().await {
+                let twitter = meta_body.get("twitter").and_then(|s| s.as_str()).map(|s| s.to_string());
+                let telegram = meta_body.get("telegram").and_then(|s| s.as_str()).map(|s| s.to_string());
+                let website = meta_body.get("website").and_then(|s| s.as_str()).map(|s| s.to_string());
+                
+                if twitter.is_some() || telegram.is_some() || website.is_some() {
+                    socials = Some(SocialLinks {
+                        twitter,
+                        telegram,
+                        website,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(TokenMetadata {
+        name,
+        symbol,
+        uri,
+        socials,
+    })
+}
+
+/// Fetch holder analysis using getTokenLargestAccounts
+async fn fetch_holder_analysis(
+    client: &Client,
+    api_key: &str,
+    mint: &str,
+    pool_address: &str,
+) -> Result<HolderAnalysis> {
+    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
+    
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenLargestAccounts",
+        "params": [
+            mint
+        ]
+    });
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .context("Failed to fetch largest accounts")?;
+
+    let json: serde_json::Value = response.json().await?;
+    
+    let accounts = json
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .and_then(|v| v.as_array())
+        .context("No accounts found")?;
+
+    if accounts.is_empty() {
+        return Err(anyhow::anyhow!("No holders found"));
+    }
+
+    // Calculate total supply from holders (approximation) or pass supply in?
+    // We'll use the sum of top 20 as "circulating" for this check if supply isn't handy,
+    // but better to calculate percentages based on the amounts returned.
+    // The API returns raw amounts.
+    
+    let mut total_held = 0.0;
+    let mut top_1_amount = 0.0;
+    let mut top_10_amount = 0.0;
+    let mut count = 0;
+
+    for (i, acc) in accounts.iter().enumerate() {
+        let amount = acc.get("amount").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let address = acc.get("address").and_then(|s| s.as_str()).unwrap_or("");
+
+        // CRITICAL: Exclude the Pool Address
+        if address == pool_address {
+            continue;
+        }
+
+        if count == 0 {
+            top_1_amount = amount;
+        }
+        if count < 10 {
+            top_10_amount += amount;
+        }
+        
+        total_held += amount;
+        count += 1;
+    }
+
+    // If we only found the pool, return 0s
+    if total_held == 0.0 {
+        return Ok(HolderAnalysis {
+            top_1_pct: 0.0,
+            top_10_pct: 0.0,
+            unique_holders: None,
+        });
+    }
+
+    // We need total supply to calculate true percentages.
+    // Since we don't have it easily here without passing it down, 
+    // we can use the sum of top 20 + pool as a proxy for total supply, 
+    // OR just return the raw amounts? 
+    // Better: We fetched supply in `fetch_mint_account_cached`. 
+    // But we are running in parallel! We don't have supply yet.
+    // Solution: Return raw amounts or percentages of *visible* supply?
+    // Actually, `getTokenLargestAccounts` returns amounts. 
+    // Let's assume the supply is roughly the sum of top 20 + pool for fresh tokens.
+    // Or better, let's just return the raw amounts and calculate percentages in `assemble`?
+    // No, `assemble` has the supply. Let's return raw amounts here and convert to pct in `assemble`?
+    // The struct expects f64 pct. 
+    // Let's fetch supply inside here? No, redundant.
+    // Let's change the struct to return amounts, then calculate pct in `assemble`.
+    
+    // WAIT: `assemble` receives `mint_data` which has supply.
+    // So `fetch_holder_analysis` should return the amounts, and `assemble` calculates the %.
+    // But I defined `HolderAnalysis` with `top_1_pct`.
+    // Let's stick to the plan: `assemble` will do the math.
+    // I will modify `HolderAnalysis` to store amounts temporarily? 
+    // No, I'll just change the return type of this function to a temporary struct or tuple.
+    
+    Ok(HolderAnalysis {
+        top_1_pct: top_1_amount, // TEMPORARY: This is actually AMOUNT, not PCT. We fix in assemble.
+        top_10_pct: top_10_amount, // TEMPORARY: This is actually AMOUNT.
+        unique_holders: None,
+    })
 }
 
 // ========== HELPER FUNCTIONS ==========

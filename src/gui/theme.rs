@@ -59,19 +59,19 @@ impl ThemeColors {
 
     fn dark() -> Self {
         Self {
-            background: egui::Color32::from_rgb(15, 23, 42),      // Slate 900
-            surface: egui::Color32::from_rgb(30, 41, 59),         // Slate 800
-            surface_hover: egui::Color32::from_rgb(51, 65, 85),   // Slate 700
-            primary: egui::Color32::from_rgb(129, 140, 248),      // Indigo 400
-            primary_hover: egui::Color32::from_rgb(99, 102, 241),
-            secondary: egui::Color32::from_rgb(167, 139, 250),    // Purple 400
-            text_primary: egui::Color32::from_rgb(248, 250, 252),
-            text_secondary: egui::Color32::from_rgb(148, 163, 184),
-            success: egui::Color32::from_rgb(74, 222, 128),
-            warning: egui::Color32::from_rgb(251, 146, 60),
-            error: egui::Color32::from_rgb(248, 113, 113),
-            border: egui::Color32::from_rgb(51, 65, 85),
-            shadow: egui::Color32::from_rgba_premultiplied(0, 0, 0, 30),
+            background: egui::Color32::from_rgb(10, 10, 12),      // Very dark (almost black)
+            surface: egui::Color32::from_rgb(24, 24, 27),         // Zinc 900
+            surface_hover: egui::Color32::from_rgb(39, 39, 42),   // Zinc 800
+            primary: egui::Color32::from_rgb(99, 102, 241),       // Indigo 500
+            primary_hover: egui::Color32::from_rgb(129, 140, 248), // Indigo 400
+            secondary: egui::Color32::from_rgb(168, 85, 247),     // Purple 500
+            text_primary: egui::Color32::from_rgb(250, 250, 250), // Zinc 50
+            text_secondary: egui::Color32::from_rgb(161, 161, 170), // Zinc 400
+            success: egui::Color32::from_rgb(34, 197, 94),        // Green 500
+            warning: egui::Color32::from_rgb(249, 115, 22),       // Orange 500
+            error: egui::Color32::from_rgb(239, 68, 68),          // Red 500
+            border: egui::Color32::from_rgb(39, 39, 42),          // Zinc 800
+            shadow: egui::Color32::from_rgba_premultiplied(0, 0, 0, 60),
         }
     }
 }

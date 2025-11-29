@@ -116,7 +116,7 @@ const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qK
 const RAYDIUM_LIQUIDITY_POOL_V4: &str = "RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZqXgEr";
 
 /// Pump.fun program ID (Bonding curve platform)
-const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwi3bTW1w4Q5PgdHzCfyqXYUVh";
+const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 /// **CRITICAL: Pump.fun Migration Account** - Monitors token graduations
 const PUMPFUN_MIGRATION_ACCOUNT: &str = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg";

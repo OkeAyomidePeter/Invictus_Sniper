@@ -59,7 +59,54 @@ impl TokenScorer {
             score = 70.0;
         }
 
-        info!("📊 SCORING: {} -> {:.1}/70 (Liq: {:.1} SOL, Platform: Graduated)", 
+        // =====================================================================
+        // 3. METADATA SCORING (Max 20 points)
+        // =====================================================================
+        if let Some(metadata) = &token.metadata {
+            if let Some(socials) = &metadata.socials {
+                let mut social_score = 0.0;
+                if socials.twitter.is_some() { social_score += 10.0; }
+                if socials.telegram.is_some() { social_score += 5.0; }
+                if socials.website.is_some() { social_score += 5.0; }
+                
+                score += social_score;
+                info!("    + Socials: {:.1} points", social_score);
+            }
+        }
+
+        // =====================================================================
+        // 4. HOLDER SCORING (Max 10 points + Penalties)
+        // =====================================================================
+        if let Some(holders) = &token.holders {
+            // Penalty: Top 1 holder > 30% (excluding pool)
+            if holders.top_1_pct > 30.0 {
+                score -= 50.0; // Huge penalty for whale dominance
+                warn!("    - PENALTY: Top 1 holder owns {:.1}%", holders.top_1_pct);
+            }
+            
+            // Penalty: Top 10 holders > 70%
+            if holders.top_10_pct > 70.0 {
+                score -= 20.0;
+                warn!("    - PENALTY: Top 10 holders own {:.1}%", holders.top_10_pct);
+            }
+
+            // Bonus: Good distribution (Top 1 < 10%)
+            if holders.top_1_pct < 10.0 {
+                score += 10.0;
+            }
+        }
+
+        // Final Cap at 100
+        if score > 100.0 {
+            score = 100.0;
+        }
+        
+        // Minimum score 0
+        if score < 0.0 {
+            score = 0.0;
+        }
+
+        info!("📊 SCORING: {} -> {:.1}/100 (Liq: {:.1} SOL, Platform: Graduated)", 
             token.mint, 
             score, 
             token.initial_liquidity_sol.unwrap_or(0.0)
@@ -100,6 +147,8 @@ mod tests {
             has_mint_authority: has_mint,
             enrichment_timestamp: 1234567890,
             enrichment_duration_ms: 100,
+            metadata: None,
+            holders: None,
         }
     }
 
