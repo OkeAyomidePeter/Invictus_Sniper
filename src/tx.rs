@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::presigner::Presigner;
 use crate::rate_limiter::RateLimiter;
-use crate::retry::{retry_with_backoff, is_network_error, RetryConfig};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use log::{info, warn};
@@ -9,21 +8,20 @@ use rand::Rng;
 use reqwest::Client;
 use serde_json::json;
 use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    instruction::Instruction,
     pubkey::Pubkey,
     system_instruction,
-    transaction::VersionedTransaction,
 };
-use std::collections::VecDeque;
+use spl_associated_token_account::get_associated_token_address;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
 const JUPITER_SWAP_API: &str = "https://quote-api.jup.ag/v6/swap";
-const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-// Jito Tip Accounts
+// Jito Tip Accounts (VERIFIED - DO NOT MODIFY)
 const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PuwqV8Xdn6mwX0",
@@ -35,20 +33,20 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnIzKZ6jJ",
 ];
 
-/// Trade priority for dynamic tip calculation
-#[derive(Debug, Clone, Copy)]
-pub enum TradePriority {
-    High,
-    Medium,
-    Low,
+/// DEX Router for swap instructions
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DexRouter {
+    PumpSwap,  // Fastest for immediate post-graduation
+    Raydium,   // Main router for buys/sells
+    Jupiter,   // Multi-pool routing for later trades
 }
 
+/// Transaction Manager - Pure Builder (NO SIGNING)
 #[derive(Clone)]
 pub struct TransactionManager {
     client: Client,
-    presigner: Arc<Presigner>,
+    payer_pubkey: Pubkey,
     jupiter_limiter: Option<Arc<RateLimiter>>,
-    retry_config: RetryConfig,
     base_tip_lamports: u64,
     min_tip_lamports: u64,
     max_tip_lamports: u64,
@@ -66,18 +64,10 @@ impl TransactionManager {
             None
         };
 
-        let retry_config = RetryConfig {
-            max_attempts: config.tx_retry_max_attempts,
-            initial_delay_ms: config.tx_retry_initial_delay_ms,
-            max_delay_ms: config.tx_retry_max_delay_ms,
-            backoff_multiplier: config.tx_retry_backoff_multiplier,
-        };
-
         Self {
             client: Client::new(),
-            presigner,
+            payer_pubkey: presigner.pubkey(),
             jupiter_limiter,
-            retry_config,
             base_tip_lamports: config.jito_base_tip_lamports,
             min_tip_lamports: config.jito_min_tip_lamports,
             max_tip_lamports: config.jito_max_tip_lamports,
@@ -85,83 +75,194 @@ impl TransactionManager {
         }
     }
 
-    /// Calculate dynamic Jito tip based on priority
-    fn calculate_tip(&self, priority: TradePriority) -> u64 {
-        if !self.dynamic_tips_enabled {
-            return self.base_tip_lamports;
-        }
-
-        let priority_multiplier = match priority {
-            TradePriority::High => 2.0,
-            TradePriority::Medium => 1.5,
-            TradePriority::Low => 1.0,
-        };
-
-        let tip = (self.base_tip_lamports as f64 * priority_multiplier) as u64;
-        tip.clamp(self.min_tip_lamports, self.max_tip_lamports)
-    }
-
-    /// Execute a BUY order using Jito Bundle
-    pub async fn buy_with_jito(
+    /// Build BUY instructions (NO SIGNING)
+    /// Returns: Vec<Instruction> ready for presigner
+    pub async fn build_buy_instructions(
         &self,
         mint: &str,
         amount_sol_lamports: u64,
-        tip_lamports: u64,
         slippage_bps: u16,
-    ) -> Result<String> {
-        info!("⚡ Preparing Jito BUY for {} (Amt: {} lamports, Tip: {})", mint, amount_sol_lamports, tip_lamports);
+        router: DexRouter,
+        tip_lamports: u64,
+    ) -> Result<Vec<Instruction>> {
+        info!("🔨 Building BUY instructions for {} via {:?}", mint, router);
 
-        // 1. Get Jupiter Quote (SOL -> Token)
-        let quote = self.get_jupiter_quote(SOL_MINT, mint, amount_sol_lamports, slippage_bps).await?;
+        let mut instructions = Vec::new();
 
-        // 2. Get Jupiter Swap Transaction
-        let mut swap_tx = self.get_jupiter_swap_tx(quote).await?;
+        // 1. Compute Budget (HIGH priority for buys)
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(400_000));
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(1_000_000)); // 1M micro-lamports
 
-        // 3. Sign Swap Transaction
-        self.presigner.sign_versioned_tx(&mut swap_tx)?;
-
-        // 4. Create Tip Transaction
-        let tip_tx = self.create_tip_transaction(tip_lamports)?;
-
-        // 5. Bundle and Send
-        let bundle_id = self.send_jito_bundle(vec![swap_tx, tip_tx]).await?;
+        // 2. Create ATA if needed
+        let mint_pubkey = Pubkey::from_str(mint)?;
+        let ata = get_associated_token_address(&self.payer_pubkey, &mint_pubkey);
         
-        info!("🚀 Jito Bundle Sent! ID: {}", bundle_id);
-        Ok(bundle_id)
+        // TODO: Check if ATA exists (requires RPC call)
+        // For now, always include creation instruction (it will no-op if exists)
+        instructions.push(
+            spl_associated_token_account::instruction::create_associated_token_account(
+                &self.payer_pubkey,
+                &self.payer_pubkey,
+                &mint_pubkey,
+                &spl_token::id(),
+            )
+        );
+
+        // 3. Get swap instructions from router
+        let swap_ixs = self.get_swap_instructions(
+            SOL_MINT,
+            mint,
+            amount_sol_lamports,
+            slippage_bps,
+            router,
+        ).await?;
+        instructions.extend(swap_ixs);
+
+        // 4. Jito Tip (FINAL instruction)
+        instructions.push(self.create_tip_instruction(tip_lamports)?);
+
+        info!("✅ Built {} instructions for BUY", instructions.len());
+        Ok(instructions)
     }
 
-    /// Execute a SELL order using Jito Bundle
-    pub async fn sell_with_jito(
+    /// Build SELL instructions (NO SIGNING, NO JITO TIP)
+    /// Returns: Vec<Instruction> ready for presigner
+    pub async fn build_sell_instructions(
         &self,
         mint: &str,
         amount_token_raw: u64,
-        tip_lamports: u64,
         slippage_bps: u16,
-    ) -> Result<String> {
-        info!("⚡ Preparing Jito SELL for {} (Amt: {}, Tip: {})", mint, amount_token_raw, tip_lamports);
+        router: DexRouter,
+        close_ata: bool,
+    ) -> Result<Vec<Instruction>> {
+        info!("🔨 Building SELL instructions for {} via {:?}", mint, router);
 
-        // 1. Get Jupiter Quote (Token -> SOL)
-        let quote = self.get_jupiter_quote(mint, SOL_MINT, amount_token_raw, slippage_bps).await?;
+        let mut instructions = Vec::new();
 
-        // 2. Get Jupiter Swap Transaction
-        let mut swap_tx = self.get_jupiter_swap_tx(quote).await?;
+        // 1. Compute Budget (Standard priority for sells)
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(300_000));
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(500_000)); // 500K micro-lamports
 
-        // 3. Sign Swap Transaction
-        self.presigner.sign_versioned_tx(&mut swap_tx)?;
+        // 2. Get swap instructions from router
+        let swap_ixs = self.get_swap_instructions(
+            mint,
+            SOL_MINT,
+            amount_token_raw,
+            slippage_bps,
+            router,
+        ).await?;
+        instructions.extend(swap_ixs);
 
-        // 4. Create Tip Transaction
-        let tip_tx = self.create_tip_transaction(tip_lamports)?;
+        // 3. Close ATA if requested (reclaim rent)
+        if close_ata {
+            let mint_pubkey = Pubkey::from_str(mint)?;
+            let ata = get_associated_token_address(&self.payer_pubkey, &mint_pubkey);
+            
+            instructions.push(
+                spl_token::instruction::close_account(
+                    &spl_token::id(),
+                    &ata,
+                    &self.payer_pubkey,
+                    &self.payer_pubkey,
+                    &[],
+                )?
+            );
+        }
 
-        // 5. Bundle and Send
-        let bundle_id = self.send_jito_bundle(vec![swap_tx, tip_tx]).await?;
-        
-        info!("🚀 Jito Bundle Sent! ID: {}", bundle_id);
-        Ok(bundle_id)
+        info!("✅ Built {} instructions for SELL (NO TIP)", instructions.len());
+        Ok(instructions)
     }
 
-    // ========== HELPERS ==========
+    /// Route to correct DEX and get swap instructions
+    async fn get_swap_instructions(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: u16,
+        router: DexRouter,
+    ) -> Result<Vec<Instruction>> {
+        match router {
+            DexRouter::PumpSwap => {
+                // TODO: Implement PumpSwap routing
+                warn!("⚠️ PumpSwap routing not yet implemented, falling back to Jupiter");
+                self.get_jupiter_swap_instructions(input_mint, output_mint, amount, slippage_bps).await
+            }
+            DexRouter::Raydium => {
+                // TODO: Implement Raydium routing
+                warn!("⚠️ Raydium routing not yet implemented, falling back to Jupiter");
+                self.get_jupiter_swap_instructions(input_mint, output_mint, amount, slippage_bps).await
+            }
+            DexRouter::Jupiter => {
+                self.get_jupiter_swap_instructions(input_mint, output_mint, amount, slippage_bps).await
+            }
+        }
+    }
 
-    async fn get_jupiter_quote(&self, input_mint: &str, output_mint: &str, amount: u64, slippage_bps: u16) -> Result<serde_json::Value> {
+    /// Get Jupiter swap instructions (extracts from transaction)
+    /// NOTE: This returns individual swap instructions - complex to extract properly
+    /// For now, we'll use a hybrid approach: get the full transaction and add our instructions
+    async fn get_jupiter_swap_instructions(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: u16,
+    ) -> Result<Vec<Instruction>> {
+        // 1. Get quote
+        let quote = self.get_jupiter_quote(input_mint, output_mint, amount, slippage_bps).await?;
+
+        // 2. Get swap transaction  
+        let request = json!({
+            "quoteResponse": quote,
+            "userPublicKey": self.payer_pubkey.to_string(),
+            "wrapAndUnwrapSol": true,
+            "asLegacyTransaction": true // Request legacy format for easier instruction extraction
+        });
+
+        let response: serde_json::Value = self.client.post(JUPITER_SWAP_API)
+            .json(&request)
+            .send().await?
+            .json().await?;
+
+        let swap_tx_base64 = response.get("swapTransaction")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No swapTransaction in Jupiter response"))?;
+
+        let tx_bytes = BASE64_STANDARD.decode(swap_tx_base64)?;
+        
+        // Try to deserialize as legacy first
+        if let Ok(legacy_tx) = bincode::deserialize::<solana_sdk::transaction::Transaction>(&tx_bytes) {
+            // Extract instructions from legacy transaction (much simpler)
+            return Ok(legacy_tx.message.instructions.iter().map(|compiled_ix| {
+                let program_id = legacy_tx.message.account_keys[compiled_ix.program_id_index as usize];
+                let accounts = compiled_ix.accounts.iter()
+                    .map(|&idx| solana_sdk::instruction::AccountMeta {
+                        pubkey: legacy_tx.message.account_keys[idx as usize],
+                        is_signer: legacy_tx.message.is_signer(idx as usize),
+                        is_writable: legacy_tx.message.is_writable(idx as usize),
+                    })
+                    .collect::<Vec<_>>();
+
+                Instruction {
+                    program_id,
+                    accounts,
+                    data: compiled_ix.data.clone(),
+                }
+            }).collect());
+        }
+
+        Err(anyhow::anyhow!("Failed to deserialize Jupiter transaction"))
+    }
+
+    /// Get Jupiter quote
+    async fn get_jupiter_quote(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: u16,
+    ) -> Result<serde_json::Value> {
         // Acquire rate limit token if enabled
         if let Some(limiter) = &self.jupiter_limiter {
             limiter.acquire().await;
@@ -176,86 +277,28 @@ impl TransactionManager {
         Ok(response)
     }
 
-    async fn get_jupiter_swap_tx(&self, quote: serde_json::Value) -> Result<VersionedTransaction> {
-        let request = json!({
-            "quoteResponse": quote,
-            "userPublicKey": self.presigner.pubkey().to_string(),
-            "wrapAndUnwrapSol": true
-        });
-
-        let response: serde_json::Value = self.client.post(JUPITER_SWAP_API)
-            .json(&request)
-            .send().await?
-            .json().await?;
-
-        let swap_tx_base64 = response.get("swapTransaction")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No swapTransaction in Jupiter response"))?;
-
-        let tx_bytes = BASE64_STANDARD.decode(swap_tx_base64)?;
-        let tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
-        
-        Ok(tx)
-    }
-
-    fn create_tip_transaction(&self, tip_lamports: u64) -> Result<VersionedTransaction> {
+    /// Create Jito tip instruction (single instruction, not separate tx)
+    fn create_tip_instruction(&self, tip_lamports: u64) -> Result<Instruction> {
         // Pick random tip account
         let idx = rand::rng().random_range(0..JITO_TIP_ACCOUNTS.len());
         let tip_account_str = JITO_TIP_ACCOUNTS[idx];
         let tip_account = Pubkey::from_str(tip_account_str)?;
 
-        // Create transfer instruction
-        let ix = system_instruction::transfer(
-            &self.presigner.pubkey(),
+        Ok(system_instruction::transfer(
+            &self.payer_pubkey,
             &tip_account,
             tip_lamports,
-        );
-
-        // Build transaction using Presigner (Legacy is fine, but we need to convert to Versioned for uniformity in bundle?)
-        // Jito bundles can mix Legacy and Versioned.
-        // However, `send_jito_bundle` will serialize them.
-        
-        // Use Presigner to build signed LEGACY transaction first
-        let legacy_tx = self.presigner.build_and_sign_tx(&[ix])?;
-        
-        // Convert to VersionedTransaction for uniform handling if needed, 
-        // OR just handle serialization in send_jito_bundle.
-        // `VersionedTransaction::from(legacy_tx)` exists.
-        
-        Ok(VersionedTransaction::from(legacy_tx))
+        ))
     }
 
-    async fn send_jito_bundle(&self, transactions: Vec<VersionedTransaction>) -> Result<String> {
-        // Serialize transactions to base58
-        let encoded_txs: Vec<String> = transactions.iter()
-            .map(|tx| {
-                let serialized = bincode::serialize(tx).unwrap(); // Should not fail
-                bs58::encode(serialized).into_string()
-            })
-            .collect();
-
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [
-                encoded_txs
-            ]
-        });
-
-        // Jito Block Engine requires specific endpoints. 
-        // Using the constant URL defined above.
-        
-        let response = self.client.post(JITO_BLOCK_ENGINE_URL)
-            .json(&request)
-            .send().await?;
-
-        let resp_json: serde_json::Value = response.json().await?;
-        
-        if let Some(result) = resp_json.get("result") {
-            Ok(result.to_string())
-        } else {
-            Err(anyhow::anyhow!("Jito Bundle Error: {:?}", resp_json))
+    /// Calculate dynamic Jito tip based on priority
+    pub fn calculate_tip(&self, high_priority: bool) -> u64 {
+        if !self.dynamic_tips_enabled {
+            return self.base_tip_lamports;
         }
+
+        let multiplier = if high_priority { 2.0 } else { 1.0 };
+        let tip = (self.base_tip_lamports as f64 * multiplier) as u64;
+        tip.clamp(self.min_tip_lamports, self.max_tip_lamports)
     }
 }

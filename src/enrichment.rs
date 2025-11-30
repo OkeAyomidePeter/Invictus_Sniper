@@ -261,10 +261,10 @@ async fn enrich_token(
         return Err(anyhow::anyhow!("Cannot enrich well-known token: {}", pool_event.token_mint));
     }
 
-    // SNIPER BOT: GRADUATED TOKENS ONLY (Pump.fun/Bonk.fun)
+    // SNIPER BOT: GRADUATED TOKENS ONLY (Pump.fun/Bonk.fun/LaunchLab)
     // Reject ALL non-graduated tokens - too risky for sniper bot
     if !pool_event.is_graduated {
-        warn!("🚫 REJECTED: Non-graduated token - GRADUATED ONLY MODE (Pump.fun/Bonk.fun)");
+        warn!("🚫 REJECTED: Non-graduated token - GRADUATED ONLY MODE");
         return Err(anyhow::anyhow!("Rejected non-graduated token: {}", pool_event.token_mint));
     }
     
@@ -273,9 +273,9 @@ async fn enrich_token(
     // All tokens reaching this point are graduated (Pump.fun/Bonk.fun)
     // No need for tiered logic or tax simulation
     
-    info!("⚡ Enriching graduated token: {} ({})", 
+    info!("⚡ Enriching graduated token: {} ({:?})", 
         pool_event.token_mint,
-        if pool_event.is_graduated { "Pump.fun/Bonk.fun" } else { "ERROR" }
+        pool_event.token_platform
     );
     
     // ========== PARALLEL RPC CALLS ==========
@@ -285,13 +285,18 @@ async fn enrich_token(
         mint_account_data,
         liquidity_data,
         metadata_data,
-        holder_data
+        holder_data,
+        sol_price_data
     ) = tokio::join!(
         fetch_mint_account_cached(client, api_key, &pool_event.token_mint),
         fetch_liquidity_data(client, api_key, &pool_event.pool_address, &pool_event.pair_token),
         fetch_token_metadata(client, api_key, &pool_event.token_mint),
-        fetch_holder_analysis(client, api_key, &pool_event.token_mint, &pool_event.pool_address)
+        fetch_holder_analysis(client, api_key, &pool_event.token_mint, &pool_event.pool_address),
+        get_or_fetch_sol_price(client)
     );
+
+    // Use fetched price or default if failed
+    let sol_price = sol_price_data.unwrap_or(150.0);
 
     assemble_enriched_token(
         pool_event,
@@ -299,6 +304,7 @@ async fn enrich_token(
         liquidity_data.ok(),
         metadata_data.ok(),
         holder_data.ok(),
+        sol_price,
         start_time,
     )
 }
@@ -310,7 +316,8 @@ fn assemble_enriched_token(
     mint_data: Option<MintAccountData>,
     liq_data: Option<LiquidityData>,
     metadata: Option<TokenMetadata>,
-    holders: Option<HolderAnalysis>,
+    holders: Option<HolderAmounts>,
+    sol_price: f64,
     start_time: std::time::Instant,
 ) -> Result<EnrichedToken> {
     // Extract decimals (CRITICAL)
@@ -340,19 +347,36 @@ fn assemble_enriched_token(
         &liq_data,
         supply,
         decimals,
+        sol_price,
     );
 
     // Fix Holder Analysis Percentages
-    // The fetcher returned raw amounts in the pct fields (hacky but efficient)
-    let final_holders = if let Some(mut h) = holders {
+    // The fetcher returns raw amounts. We calculate percentages here using supply.
+    let final_holders = if let Some(h_amounts) = holders {
         if let Some(s) = supply {
             let s_f64 = s as f64;
             if s_f64 > 0.0 {
-                h.top_1_pct = (h.top_1_pct / s_f64) * 100.0;
-                h.top_10_pct = (h.top_10_pct / s_f64) * 100.0;
+                Some(HolderAnalysis {
+                    top_1_pct: (h_amounts.top_1_amount / s_f64) * 100.0,
+                    top_10_pct: (h_amounts.top_10_amount / s_f64) * 100.0,
+                    unique_holders: h_amounts.unique_holders,
+                })
+            } else {
+                // Supply is 0, cannot calculate pct
+                Some(HolderAnalysis {
+                    top_1_pct: 0.0,
+                    top_10_pct: 0.0,
+                    unique_holders: h_amounts.unique_holders,
+                })
             }
+        } else {
+            // No supply info, return 0s
+             Some(HolderAnalysis {
+                top_1_pct: 0.0,
+                top_10_pct: 0.0,
+                unique_holders: h_amounts.unique_holders,
+            })
         }
-        Some(h)
     } else {
         None
     };
@@ -429,6 +453,10 @@ async fn fetch_mint_account_cached(
     // Update cache
     {
         let mut cache = MINT_CACHE.lock();
+        // Prevent unbounded growth
+        if cache.len() > 1000 {
+            cache.clear();
+        }
         cache.insert(mint.to_string(), MintAccountCache {
             data: data.clone(),
             timestamp: now,
@@ -489,11 +517,7 @@ struct LiquidityData {
     liquidity_token: Option<f64>,
 }
 
-#[derive(Debug)]
-struct PoolReserves {
-    reserve_sol: f64,
-    reserve_token: f64,
-}
+
 
 // SOL Price cache
 #[derive(Debug, Clone)]
@@ -592,56 +616,7 @@ async fn fetch_liquidity_data(
     })
 }
 
-/// Fetch transfer fee for a mint (Token-2022)
-async fn fetch_transfer_fee(
-    client: &Client,
-    api_key: &str,
-    mint: &str,
-) -> Result<f64> {
-    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
-    
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getAccountInfo",
-        "params": [
-            mint,
-            {
-                "encoding": "jsonParsed"
-            }
-        ]
-    });
 
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await?;
-
-    let account_json: serde_json::Value = response.json().await?;
-    
-    // Parse extensions from account data
-    let fee = account_json
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .and_then(|v| v.get("data"))
-        .and_then(|d| d.get("parsed"))
-        .and_then(|p| p.get("info"))
-        .and_then(|i| i.get("extensions"))
-        .and_then(|exts| exts.as_array())
-        .and_then(|arr| {
-            arr.iter().find(|ext| {
-                ext.get("extension").and_then(|e| e.as_str()) == Some("transferFeeConfig")
-            })
-        })
-        .and_then(|fee_ext| fee_ext.get("state"))
-        .and_then(|s| s.get("newerTransferFee"))
-        .and_then(|f| f.get("transferFeeBasisPoints"))
-        .and_then(|b| b.as_u64())
-        .map(|basis_points| basis_points as f64 / 100.0);
-
-    fee.ok_or_else(|| anyhow::anyhow!("No transfer fee found"))
-}
 
 /// Fetch token metadata using Helius DAS API (getAsset)
 async fn fetch_token_metadata(
@@ -680,8 +655,8 @@ async fn fetch_token_metadata(
     // Fetch JSON URI for socials (if available)
     let mut socials = None;
     if !uri.is_empty() {
-        // Optimization: Spawn this as a separate task or just do it here?
-        // Doing it here adds latency. For now, let's do it here but with a short timeout.
+        // Fetch JSON URI for socials (if available)
+        // Using a short timeout (500ms) to prevent blocking the pipeline
         if let Ok(json_meta) = client.get(&uri).timeout(Duration::from_millis(500)).send().await {
             if let Ok(meta_body) = json_meta.json::<serde_json::Value>().await {
                 let twitter = meta_body.get("twitter").and_then(|s| s.as_str()).map(|s| s.to_string());
@@ -707,13 +682,20 @@ async fn fetch_token_metadata(
     })
 }
 
+/// Temporary struct to hold raw amounts before percentage calculation
+struct HolderAmounts {
+    top_1_amount: f64,
+    top_10_amount: f64,
+    unique_holders: Option<u64>,
+}
+
 /// Fetch holder analysis using getTokenLargestAccounts
 async fn fetch_holder_analysis(
     client: &Client,
     api_key: &str,
     mint: &str,
     pool_address: &str,
-) -> Result<HolderAnalysis> {
+) -> Result<HolderAmounts> {
     let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
     
     let request_body = json!({
@@ -754,7 +736,7 @@ async fn fetch_holder_analysis(
     let mut top_10_amount = 0.0;
     let mut count = 0;
 
-    for (i, acc) in accounts.iter().enumerate() {
+    for (_i, acc) in accounts.iter().enumerate() {
         let amount = acc.get("amount").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let address = acc.get("address").and_then(|s| s.as_str()).unwrap_or("");
 
@@ -776,9 +758,9 @@ async fn fetch_holder_analysis(
 
     // If we only found the pool, return 0s
     if total_held == 0.0 {
-        return Ok(HolderAnalysis {
-            top_1_pct: 0.0,
-            top_10_pct: 0.0,
+        return Ok(HolderAmounts {
+            top_1_amount: 0.0,
+            top_10_amount: 0.0,
             unique_holders: None,
         });
     }
@@ -805,9 +787,9 @@ async fn fetch_holder_analysis(
     // I will modify `HolderAnalysis` to store amounts temporarily? 
     // No, I'll just change the return type of this function to a temporary struct or tuple.
     
-    Ok(HolderAnalysis {
-        top_1_pct: top_1_amount, // TEMPORARY: This is actually AMOUNT, not PCT. We fix in assemble.
-        top_10_pct: top_10_amount, // TEMPORARY: This is actually AMOUNT.
+    Ok(HolderAmounts {
+        top_1_amount, 
+        top_10_amount,
         unique_holders: None,
     })
 }
@@ -820,6 +802,7 @@ fn calculate_market_metrics(
     liq_data: &Option<LiquidityData>,
     supply: Option<u64>,
     decimals: u8,
+    sol_price_usd: f64,
 ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
     let liq = match liq_data.as_ref() {
         Some(l) => l,
@@ -854,8 +837,7 @@ fn calculate_market_metrics(
         None
     };
 
-    // Get real-time SOL price (with caching)
-    let sol_price_usd = get_cached_sol_price();
+    // Get real-time SOL price (passed in)
     let price_usd = price_sol.map(|p| p * sol_price_usd);
 
     // Calculate circulating supply (in human-readable units)
@@ -870,29 +852,24 @@ fn calculate_market_metrics(
     (price_sol, price_usd, market_cap, fdv)
 }
 
-/// Get cached SOL price or fetch new one if expired (30s TTL)
-fn get_cached_sol_price() -> f64 {
-    const CACHE_TTL_SECONDS: i64 = 120;
-    const DEFAULT_SOL_PRICE: f64 = 150.0; // Fallback if all APIs fail
+/// Get cached SOL price or fetch new one if expired (async)
+async fn get_or_fetch_sol_price(client: &Client) -> Result<f64> {
+    const CACHE_TTL_SECONDS: i64 = 30;
 
     let now = chrono::Utc::now().timestamp();
     
-    // Check cache
+    // Check cache first
     {
         let cache = SOL_PRICE_CACHE.lock();
         if let Some(cached) = cache.as_ref() {
             if now - cached.timestamp < CACHE_TTL_SECONDS {
-                return cached.price;
+                return Ok(cached.price);
             }
         }
     }
 
     // Cache expired or empty, fetch new price
-    // Note: This is sync code, so we return default and spawn async fetch
-    // In production, you might want to use tokio::task::block_in_place
-    // For now, return cached value (even if stale) or default
-    let cache = SOL_PRICE_CACHE.lock();
-    cache.as_ref().map(|c| c.price).unwrap_or(DEFAULT_SOL_PRICE)
+    update_sol_price_cache(client).await
 }
 
 /// Fetch real-time SOL price from multiple sources with fallback
@@ -919,9 +896,10 @@ pub async fn update_sol_price_cache(client: &Client) -> Result<f64> {
     Ok(price)
 }
 
-/// Fetch SOL price from Jupiter Price API v2
+/// Fetch SOL price from Jupiter Price API v3 (Lite)
 async fn fetch_sol_price_jupiter(client: &Client) -> Result<f64> {
-    let url = "https://price.jup.ag/v4/price?ids=SOL";
+    // Using the specific Lite API endpoint for SOL
+    let url = "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112";
     
     let response = client
         .get(url)
@@ -932,10 +910,10 @@ async fn fetch_sol_price_jupiter(client: &Client) -> Result<f64> {
 
     let json: serde_json::Value = response.json().await?;
     
+    // Parse response: {"So11...": {"usdPrice": ...}}
     let price = json
-        .get("data")
-        .and_then(|d| d.get("SOL"))
-        .and_then(|s| s.get("price"))
+        .get("So11111111111111111111111111111111111111112")
+        .and_then(|d| d.get("usdPrice"))
         .and_then(|p| p.as_f64())
         .context("Failed to parse Jupiter price")?;
 

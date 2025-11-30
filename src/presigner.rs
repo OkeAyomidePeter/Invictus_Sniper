@@ -14,6 +14,7 @@ use solana_sdk::{
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use std::str::FromStr;
 
 /// Manages blockhash updates and rapid transaction signing
 pub struct Presigner {
@@ -25,7 +26,7 @@ pub struct Presigner {
 
 impl Presigner {
     pub fn new(config: &Config) -> Self {
-        let rpc_url = "https://api.mainnet-beta.solana.com".to_string(); // Should be from config
+        let rpc_url = config.rpc_url.clone();
         let rpc_client = Arc::new(RpcClient::new_with_commitment(
             rpc_url.clone(),
             CommitmentConfig::confirmed(),
@@ -110,16 +111,43 @@ impl Presigner {
         &self,
         instructions: &[Instruction],
     ) -> Result<Transaction> {
+        // 1. Validate instructions
+        self.validate_instructions(instructions)?;
+
         let payer_pubkey = self.keypair.pubkey();
         let recent_blockhash = self.get_blockhash();
 
         let message = Message::new(instructions, Some(&payer_pubkey));
+        
+        // 2. Verify Payer Match (Critical)
+        if message.account_keys.get(0) != Some(&payer_pubkey) {
+            return Err(anyhow::anyhow!("Transaction payer mismatch! Expected {}", payer_pubkey));
+        }
+
         let mut tx = Transaction::new_unsigned(message);
         
         // Sign immediately
         tx.try_sign(&[self.keypair.as_ref()], recent_blockhash)?;
         
         Ok(tx)
+    }
+
+    /// Validate instructions for safety and best practices
+    fn validate_instructions(&self, instructions: &[Instruction]) -> Result<()> {
+        if instructions.is_empty() {
+            return Err(anyhow::anyhow!("Transaction has no instructions"));
+        }
+
+        // Check for Compute Budget (Critical for landing)
+        let compute_budget_program = Pubkey::from_str("ComputeBudget111111111111111111111111111111").unwrap();
+        let has_compute_budget = instructions.iter().any(|ix| ix.program_id == compute_budget_program);
+
+        if !has_compute_budget {
+            warn!("⚠️ Transaction missing Compute Budget instruction - likely to fail!");
+            // We could return Err here, but for now just warn
+        }
+
+        Ok(())
     }
 
     /// Send a transaction immediately
@@ -131,8 +159,17 @@ impl Presigner {
 
     /// Sign an existing VersionedTransaction with the loaded keypair
     pub fn sign_versioned_tx(&self, tx: &mut VersionedTransaction) -> Result<()> {
+        // Verify we are the payer (first account in static keys)
+        let payer = tx.message.static_account_keys().get(0)
+            .ok_or_else(|| anyhow::anyhow!("Transaction has no account keys"))?;
+            
+        if payer != &self.keypair.pubkey() {
+             return Err(anyhow::anyhow!("Transaction payer mismatch! Expected {}, got {}", self.keypair.pubkey(), payer));
+        }
+
         let message_data = tx.message.serialize();
         let signature = self.keypair.sign_message(&message_data);
+        
         // Assuming we are the primary/only signer or the first one.
         // Jupiter transactions usually expect the user to be the first signer.
         if tx.signatures.is_empty() {
@@ -143,5 +180,76 @@ impl Presigner {
             tx.signatures[0] = signature;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::system_instruction;
+
+    // Helper to create a dummy config
+    fn create_test_config() -> Config {
+        Config {
+            helius_api_key: "test".to_string(),
+            rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
+            private_key: Keypair::new().to_base58_string(), // Random key
+            telegram_token: "".to_string(),
+            telegram_chat_id: "".to_string(),
+            database_url: "".to_string(),
+            min_liquidity_sol: 0.0,
+            min_holders: 0,
+            max_trade_size_sol: 0.0,
+            max_daily_exposure_sol: 0.0,
+            max_creator_ownership_percentage: 0.0,
+            honeypot_check_enabled: false,
+            jupiter_api_timeout_ms: 0,
+            auto_sell_enabled: false,
+            auto_sell_profit_target_pct: 0.0,
+            auto_sell_stop_loss_pct: 0.0,
+            auto_sell_timeout_seconds: 0,
+            auto_sell_slippage_bps: 0,
+            auto_sell_price_check_interval_ms: 0,
+            jito_base_tip_lamports: 0,
+            jito_min_tip_lamports: 0,
+            jito_max_tip_lamports: 0,
+            jito_dynamic_tips_enabled: false,
+            tx_retry_max_attempts: 0,
+            tx_retry_initial_delay_ms: 0,
+            tx_retry_max_delay_ms: 0,
+            tx_retry_backoff_multiplier: 0.0,
+            helius_max_requests_per_second: 0.0,
+            jupiter_max_requests_per_second: 0.0,
+            rate_limiting_enabled: false,
+            wallet_low_balance_alert_sol: 0.0,
+            wallet_monitor_interval_secs: 0,
+            wallet_reserve_for_fees_sol: 0.0,
+            max_concurrent_trades: 0,
+            max_open_positions: 0,
+            total_exposure_limit_sol: 0.0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_validate_empty_instructions() {
+        let config = create_test_config();
+        let presigner = Presigner::new(&config);
+        
+        let result = presigner.validate_instructions(&[]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "Transaction has no instructions");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_validate_missing_compute_budget() {
+        let config = create_test_config();
+        let presigner = Presigner::new(&config);
+        
+        // Create a simple transfer instruction (no compute budget)
+        let ix = system_instruction::transfer(&Pubkey::new_unique(), &Pubkey::new_unique(), 1000);
+        
+        // It should warn but NOT error (based on current implementation)
+        let result = presigner.validate_instructions(&[ix]);
+        assert!(result.is_ok());
     }
 }

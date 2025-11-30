@@ -52,12 +52,13 @@ pub struct PoolCreationEvent {
 pub enum TokenPlatform {
     PumpFun,   // Graduated from Pump.fun bonding curve
     BonkFun,   // Graduated from Bonk.fun bonding curve
+    RaydiumLaunchLab, // Graduated from Raydium LaunchLab
     Unknown,   // Not from a tracked platform
 }
 
 impl TokenPlatform {
     fn is_graduated(&self) -> bool {
-        matches!(self, Self::PumpFun | Self::BonkFun)
+        matches!(self, Self::PumpFun | Self::BonkFun | Self::RaydiumLaunchLab)
     }
 }
 
@@ -112,8 +113,11 @@ const RAYDIUM_AMM_V4_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSU
 /// Raydium CPMM program ID (Concentrated liquidity)
 const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
-/// Raydium Liquidity Pool V4
-const RAYDIUM_LIQUIDITY_POOL_V4: &str = "RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZqXgEr";
+/// Raydium LaunchLab (Community-powered token launches)
+const RAYDIUM_LAUNCHLAB_PROGRAM_ID: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+
+/// PumpSwap / Pump.fun AMM (Post-bonding curve trading)
+const PUMP_FUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 /// Pump.fun program ID (Bonding curve platform)
 const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -277,8 +281,9 @@ async fn connect_and_listen(
     let dex_programs = vec![
         (10, RAYDIUM_AMM_V4_PROGRAM_ID, "Raydium AMM v4"),
         (11, RAYDIUM_CPMM_PROGRAM_ID, "Raydium CPMM"),
-        (12, RAYDIUM_LIQUIDITY_POOL_V4, "Raydium Liquidity Pool v4"),
-        (13, PUMP_FUN_PROGRAM_ID, "Pump.fun"), // Direct pool creation
+        (12, RAYDIUM_LAUNCHLAB_PROGRAM_ID, "Raydium LaunchLab"),
+        // (13, PUMP_FUN_PROGRAM_ID, "Pump.fun"), // REMOVED: We don't want bonding curve events
+        (14, PUMP_FUN_AMM_PROGRAM_ID, "PumpSwap"), // Pump.fun AMM
     ];
 
     for (id, program_id, name) in dex_programs {
@@ -566,6 +571,28 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     // Detect DEX
     let dex = detect_dex_from_logs(logs_array)?;
 
+    // ========== CRITICAL FIX: IGNORE PUMP.FUN BONDING CURVE EVENTS ==========
+    // We only want GRADUATED tokens that have moved to Raydium or PumpSwap.
+    // "Pump.fun" DEX means it's still on the bonding curve (fresh mint).
+    if dex == "Pump.fun" {
+        // Optional: Log at debug level if needed, but for now silent rejection or warn
+        // warn!("🚫 REJECTED: Token {} is still on Pump.fun bonding curve (not graduated)", token_mint);
+        return None;
+    }
+
+    // ========== GRADUATION VERIFICATION (BONK.FUN & LAUNCHLAB) ==========
+    // Ensure these tokens are actually on a valid AMM (Raydium or PumpSwap)
+    if token_platform == TokenPlatform::BonkFun || token_platform == TokenPlatform::RaydiumLaunchLab {
+        let is_valid_dex = dex.starts_with("Raydium") || dex == "PumpSwap";
+        if !is_valid_dex {
+            warn!(
+                "🚫 REJECTED: Token {} (platform: {:?}) detected on invalid DEX '{}' - waiting for graduation to Raydium/PumpSwap",
+                token_mint, token_platform, dex
+            );
+            return None;
+        }
+    }
+
     // Extract pool address
     let pool_address = extract_pool_address(transaction, meta, logs_array)?;
 
@@ -609,6 +636,11 @@ fn detect_token_platform(
                 if pubkey == BONK_FUN_PROGRAM_ID {
                     return TokenPlatform::BonkFun;
                 }
+
+                // Check for Raydium LaunchLab program
+                if pubkey == RAYDIUM_LAUNCHLAB_PROGRAM_ID {
+                    return TokenPlatform::RaydiumLaunchLab;
+                }
             }
         }
     }
@@ -629,6 +661,17 @@ fn detect_token_platform(
             if log_str.contains(BONK_FUN_PROGRAM_ID) {
                 return TokenPlatform::BonkFun;
             }
+            
+            // Check for Raydium LaunchLab
+            if log_str.contains(RAYDIUM_LAUNCHLAB_PROGRAM_ID) {
+                // Check for specific graduation instructions if possible, or assume presence means interaction
+                // Launchlab graduation often involves "migrate_to_amm"
+                if log_str.contains("migrate_to_amm") || log_str.contains("migrate_to_cpswap") {
+                     return TokenPlatform::RaydiumLaunchLab;
+                }
+                // Fallback: if we see the program ID, it's likely a LaunchLab token
+                return TokenPlatform::RaydiumLaunchLab;
+            }
         }
     }
 
@@ -648,6 +691,12 @@ fn detect_dex_from_logs(logs: &[serde_json::Value]) -> Option<String> {
             }
             if log_str.contains(PUMP_FUN_PROGRAM_ID) {
                 return Some("Pump.fun".to_string()); 
+            }
+            if log_str.contains(RAYDIUM_LAUNCHLAB_PROGRAM_ID) {
+                return Some("Raydium LaunchLab".to_string());
+            }
+            if log_str.contains(PUMP_FUN_AMM_PROGRAM_ID) {
+                return Some("PumpSwap".to_string());
             }
         }
     }
@@ -801,7 +850,8 @@ fn is_program_id(address: &str) -> bool {
         SPL_TOKEN_PROGRAM_ID
             | RAYDIUM_AMM_V4_PROGRAM_ID
             | RAYDIUM_CPMM_PROGRAM_ID
-            | RAYDIUM_LIQUIDITY_POOL_V4
+            | RAYDIUM_LAUNCHLAB_PROGRAM_ID
+            | PUMP_FUN_AMM_PROGRAM_ID
             | PUMP_FUN_PROGRAM_ID
             | BONK_FUN_PROGRAM_ID
             | "11111111111111111111111111111111"

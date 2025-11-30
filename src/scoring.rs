@@ -36,19 +36,19 @@ impl TokenScorer {
         // =====================================================================
         // 2. LIQUIDITY SCORING (Max 70 points)
         // =====================================================================
+        // Pump.fun tokens usually graduate with ~70-80 SOL.
+        // We want to ensure it's a "healthy" graduation.
         if let Some(liquidity_sol) = token.initial_liquidity_sol {
-            if liquidity_sol >= 50.0 {
-                score += 70.0; // Excellent liquidity
-            } else if liquidity_sol >= 20.0 {
-                score += 50.0; // Good liquidity
-            } else if liquidity_sol >= 10.0 {
-                score += 30.0; // Decent liquidity
-            } else if liquidity_sol >= 5.0 {
-                score += 15.0; // Minimal liquidity
-            } else if liquidity_sol >= 1.0 {
-                score += 5.0;  // Very low liquidity
+            if liquidity_sol >= 60.0 {
+                score += 70.0; // Standard/Good Graduation (~$10k+)
+            } else if liquidity_sol >= 30.0 {
+                score += 40.0; // Low but acceptable
+            } else {
+                // < 30 SOL is suspicious for a graduated token
+                // It might mean liquidity was pulled or it's a weird migration
+                score += 0.0; 
+                warn!("    - LOW LIQUIDITY: {:.1} SOL (Expected > 30)", liquidity_sol);
             }
-            // < 1 SOL gets 0 points for liquidity
         }
 
         // GRADUATED TOKENS ONLY - No tax checks
@@ -93,6 +93,28 @@ impl TokenScorer {
             // Bonus: Good distribution (Top 1 < 10%)
             if holders.top_1_pct < 10.0 {
                 score += 10.0;
+            }
+
+            // NEW: Unique Holder Count
+            if let Some(unique) = holders.unique_holders {
+                if unique > 100 {
+                    score += 10.0; // Healthy community
+                    info!("    + Community: {} unique holders", unique);
+                } else if unique < 20 {
+                    score -= 20.0; // Ghost town / Dev wallet farm
+                    warn!("    - PENALTY: Only {} unique holders", unique);
+                }
+            }
+        }
+
+        // =====================================================================
+        // 5. MARKET CAP CHECK (Penalty only)
+        // =====================================================================
+        // If MC is super low (<$50k), it means price dumped below graduation.
+        if let Some(mc) = token.market_cap {
+            if mc < 50_000.0 {
+                score -= 10.0;
+                warn!("    - PENALTY: Low Market Cap (${:.0})", mc);
             }
         }
 
@@ -155,7 +177,7 @@ mod tests {
     #[test]
     fn test_freeze_authority_returns_zero() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(50.0), true, false);
+        let token = create_test_token(Some(70.0), true, false);
         
         let score = scorer.score(&token);
         assert_eq!(score, 0.0);
@@ -164,7 +186,7 @@ mod tests {
     #[test]
     fn test_mint_authority_returns_zero() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(50.0), false, true);
+        let token = create_test_token(Some(70.0), false, true);
         
         let score = scorer.score(&token);
         assert_eq!(score, 0.0);
@@ -173,7 +195,7 @@ mod tests {
     #[test]
     fn test_excellent_liquidity() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(50.0), false, false);
+        let token = create_test_token(Some(65.0), false, false); // > 60
         
         let score = scorer.score(&token);
         assert_eq!(score, 70.0);
@@ -182,54 +204,59 @@ mod tests {
     #[test]
     fn test_good_liquidity() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(25.0), false, false);
+        let token = create_test_token(Some(40.0), false, false); // > 30
         
         let score = scorer.score(&token);
-        assert_eq!(score, 50.0);
+        assert_eq!(score, 40.0);
     }
 
     #[test]
-    fn test_decent_liquidity() {
+    fn test_low_liquidity_penalty() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(15.0), false, false);
+        let token = create_test_token(Some(20.0), false, false); // < 30
         
         let score = scorer.score(&token);
-        assert_eq!(score, 30.0);
+        assert_eq!(score, 0.0); // Should be 0
     }
 
     #[test]
-    fn test_minimal_liquidity() {
+    fn test_unique_holder_bonus() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(7.0), false, false);
+        let mut token = create_test_token(Some(70.0), false, false);
+        token.holders = Some(crate::enrichment::HolderAnalysis {
+            top_1_pct: 5.0,
+            top_10_pct: 20.0,
+            unique_holders: Some(150), // > 100 bonus
+        });
         
         let score = scorer.score(&token);
-        assert_eq!(score, 15.0);
+        // 70 (liq) + 10 (holders < 10%) + 10 (unique > 100) = 90
+        assert_eq!(score, 90.0);
     }
 
     #[test]
-    fn test_very_low_liquidity() {
+    fn test_unique_holder_penalty() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(2.0), false, false);
+        let mut token = create_test_token(Some(70.0), false, false);
+        token.holders = Some(crate::enrichment::HolderAnalysis {
+            top_1_pct: 5.0,
+            top_10_pct: 20.0,
+            unique_holders: Some(10), // < 20 penalty
+        });
         
         let score = scorer.score(&token);
-        assert_eq!(score, 5.0);
+        // 70 (liq) + 10 (holders < 10%) - 20 (unique < 20) = 60
+        assert_eq!(score, 60.0);
     }
 
     #[test]
-    fn test_no_liquidity() {
+    fn test_market_cap_penalty() {
         let scorer = TokenScorer::new();
-        let token = create_test_token(Some(0.5), false, false);
+        let mut token = create_test_token(Some(70.0), false, false);
+        token.market_cap = Some(40_000.0); // < 50k penalty
         
         let score = scorer.score(&token);
-        assert_eq!(score, 0.0);
-    }
-
-    #[test]
-    fn test_none_liquidity() {
-        let scorer = TokenScorer::new();
-        let token = create_test_token(None, false, false);
-        
-        let score = scorer.score(&token);
-        assert_eq!(score, 0.0);
+        // 70 (liq) - 10 (low MC) = 60
+        assert_eq!(score, 60.0);
     }
 }

@@ -22,6 +22,7 @@ use crate::config::Config;
 pub struct ConfigData {
     // Core Configuration
     pub helius_api_key: String,
+    pub rpc_url: String,
     pub solana_private_key: String,
     
     // Telegram Bot
@@ -80,6 +81,7 @@ impl Default for ConfigData {
     fn default() -> Self {
         Self {
             helius_api_key: String::new(),
+            rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             solana_private_key: String::new(),
             telegram_bot_token: String::new(),
             telegram_chat_id: String::new(),
@@ -122,6 +124,7 @@ impl ConfigData {
     fn to_config(&self) -> Result<Config, String> {
         Ok(Config {
             helius_api_key: self.helius_api_key.clone(),
+            rpc_url: self.rpc_url.clone(),
             private_key: self.solana_private_key.clone(),
             telegram_token: self.telegram_bot_token.clone(),
             telegram_chat_id: self.telegram_chat_id.clone(),
@@ -252,6 +255,7 @@ impl InvictusGUI {
         
         writeln!(file, "# Core Configuration")?;
         writeln!(file, "HELIUS_API_KEY={}", self.config.helius_api_key)?;
+        writeln!(file, "SOLANA_RPC_URL={}", self.config.rpc_url)?;
         writeln!(file, "SOLANA_PRIVATE_KEY={}", self.config.solana_private_key)?;
         writeln!(file)?;
         
@@ -338,6 +342,7 @@ impl InvictusGUI {
         };
 
         load_str(&mut self.config.helius_api_key, "HELIUS_API_KEY");
+        load_str(&mut self.config.rpc_url, "SOLANA_RPC_URL");
         load_str(&mut self.config.solana_private_key, "SOLANA_PRIVATE_KEY");
         load_str(&mut self.config.telegram_bot_token, "TELEGRAM_BOT_TOKEN");
         load_str(&mut self.config.telegram_chat_id, "TELEGRAM_CHAT_ID");
