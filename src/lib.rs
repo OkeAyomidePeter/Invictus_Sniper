@@ -17,3 +17,4 @@ pub mod scoring;
 pub mod tele;
 pub mod tx;
 pub mod wallet_monitor;
+pub mod watchlist;

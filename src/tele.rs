@@ -17,7 +17,7 @@ type ResponseResult<T> = Result<T, RequestError>;
 #[derive(Clone)]
 struct AllowedChatId(i64);
 
-#[derive(BotCommands, Clone)]
+#[derive(BotCommands, Clone, Debug)]
 #[command(rename = "lowercase")]
 enum Command {
     Start,
@@ -133,13 +133,16 @@ async fn command_handler(
     shutdown_tx: Sender<()>,
     allowed_chat_id: AllowedChatId,
 ) -> ResponseResult<()> {
+    info!("📨 Received command: {:?} from chat ID: {}", cmd, msg.chat.id);
+    
     if msg.chat.id.0 != allowed_chat_id.0 {
         warn!("⚠️ Unauthorized access from chat ID: {}", msg.chat.id);
         return Ok(());
     }
 
-    match cmd {
+    let result = match cmd {
         Command::Start => {
+            info!("Processing /start command");
             let welcome_msg = r#"🤖 <b>Invictus Bot Control Panel</b>
 
 Welcome to the Invictus Bot Telegram interface!
@@ -158,12 +161,15 @@ Use the buttons below for quick access:
                 .parse_mode(ParseMode::Html)
                 .reply_markup(create_main_keyboard())
                 .send()
-                .await?;
+                .await
+                .map(|_| ())
         }
         Command::Stats => {
-            send_stats(&bot, msg.chat.id, &db).await?;
+            info!("Processing /stats command");
+            send_stats(&bot, msg.chat.id, &db).await
         }
         Command::Kill => {
+            info!("Processing /kill command");
             let keyboard = ReplyMarkup::Keyboard(
                 KeyboardMarkup::new([
                     vec![
@@ -178,9 +184,11 @@ Use the buttons below for quick access:
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .send()
-                .await?;
+                .await
+                .map(|_| ())
         }
         Command::Help => {
+            info!("Processing /help command");
             let help_msg = r#"📖 <b>Help & Commands</b>
 
 <b>Bot Commands:</b>
@@ -198,10 +206,21 @@ Use the persistent keyboard buttons below for quick access to all features.
                 .parse_mode(ParseMode::Html)
                 .reply_markup(create_main_keyboard())
                 .send()
-                .await?;
+                .await
+                .map(|_| ())
+        }
+    };
+    
+    match result {
+        Ok(_) => {
+            info!("✅ Command processed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            warn!("❌ Error processing command: {}", e);
+            Err(e)
         }
     }
-    Ok(())
 }
 
 // The original callback_handler is removed as its functionality is now integrated into message_handler
@@ -215,17 +234,22 @@ async fn message_handler(
     allowed_chat_id: AllowedChatId,
     wallet_monitor: Option<Arc<WalletMonitor>>,
 ) -> ResponseResult<()> {
+    info!("📨 Received message from chat ID: {}",msg.chat.id);
+    
     if msg.chat.id.0 != allowed_chat_id.0 {
         warn!("⚠️ Unauthorized access from chat ID: {}", msg.chat.id);
         return Ok(());
     }
 
     if let Some(text) = msg.text() {
-        match text {
+        info!("📝 Message text: {}", text);
+        let result = match text {
             "📊 Stats" => {
-                send_stats(&bot, msg.chat.id, &db).await?;
+                info!("Processing Stats button");
+                send_stats(&bot, msg.chat.id, &db).await
             }
             "📜 Recent Trades" => {
+                info!("Processing Recent Trades button");
                 let trades = db.get_recent_trades(5).await.unwrap_or_default();
                 let mut text = "<b>📜 Recent Trades:</b>\n\n".to_string();
                 if trades.is_empty() {
@@ -235,9 +259,10 @@ async fn message_handler(
                         text.push_str(&format!("• {} {}... @ {:.4} SOL\n", action, &mint[..8.min(mint.len())], price));
                     }
                 }
-                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await.map(|_| ())
             }
             "🏆 Top Tokens" => {
+                info!("Processing Top Tokens button");
                 let tokens = db.get_top_tokens(5).await.unwrap_or_default();
                 let mut text = "<b>🏆 Top Tokens:</b>\n\n".to_string();
                 if tokens.is_empty() {
@@ -247,9 +272,10 @@ async fn message_handler(
                         text.push_str(&format!("• {}... [{:.1}] {:.1} SOL\n", &mint[..8.min(mint.len())], score, liq));
                     }
                 }
-                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await.map(|_| ())
             }
             "💰 Wallet Balance" => {
+                info!("Processing Wallet Balance button");
                 if let Some(monitor) = &wallet_monitor {
                     match monitor.get_balance().await {
                         Ok(balance_lamports) => {
@@ -264,17 +290,18 @@ async fn message_handler(
                                 available,
                                 balance_sol - available
                             );
-                            bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+                            bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await.map(|_| ())
                         }
                         Err(e) => {
-                            bot.send_message(msg.chat.id, format!("❌ Failed to get balance: {}", e)).send().await?;
+                            bot.send_message(msg.chat.id, format!("❌ Failed to get balance: {}", e)).send().await.map(|_| ())
                         }
                     }
                 } else {
-                    bot.send_message(msg.chat.id, "❌ Wallet monitoring not enabled").send().await?;
+                    bot.send_message(msg.chat.id, "❌ Wallet monitoring not enabled").send().await.map(|_| ())
                 }
             }
             "📈 Active Positions" => {
+                info!("Processing Active Positions button");
                 let positions = db.get_active_positions().await.unwrap_or_default();
                 let mut text = "<b>📈 Active Positions:</b>\n\n".to_string();
                 if positions.is_empty() {
@@ -292,9 +319,10 @@ async fn message_handler(
                         ));
                     }
                 }
-                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await.map(|_| ())
             }
             "🔍 System Status" => {
+                info!("Processing System Status button");
                 // Simple health check
                 let token_count = db.get_token_count().await.unwrap_or(0);
                 let trade_count = db.get_trade_count().await.unwrap_or(0);
@@ -310,12 +338,14 @@ async fn message_handler(
                     trade_count,
                     wallet_status
                 );
-                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await?;
+                bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await.map(|_| ())
             }
             "📊 Detailed Stats" => {
-                send_detailed_stats(&bot, msg.chat.id, &db).await?;
+                info!("Processing Detailed Stats button");
+                send_detailed_stats(&bot, msg.chat.id, &db).await
             }
             "💀 Kill Bot" => {
+                info!("Processing Kill Bot button");
                 let keyboard = ReplyMarkup::Keyboard(
                     KeyboardMarkup::new([
                         vec![
@@ -330,24 +360,31 @@ async fn message_handler(
                     .parse_mode(ParseMode::Html)
                     .reply_markup(keyboard)
                     .send()
-                    .await?;
+                    .await
+                    .map(|_| ())
             }
             "✅ Confirm Kill" => {
-                bot.send_message(msg.chat.id, "💀 <b>SHUTTING DOWN...</b>")
+                info!("Processing Confirm Kill button");
+                let result = bot.send_message(msg.chat.id, "💀 <b>SHUTTING DOWN...</b>")
                     .parse_mode(ParseMode::Html)
                     .send()
-                    .await?;
+                    .await
+                    .map(|_| ());
                 info!("💀 Kill signal from Telegram!");
                 let _ = shutdown_tx.send(()).await;
+                result
             }
             "❌ Cancel" => {
+                info!("Processing Cancel button");
                 bot.send_message(msg.chat.id, "✅ <b>Operation cancelled.</b>")
                     .parse_mode(ParseMode::Html)
                     .reply_markup(create_main_keyboard())
                     .send()
-                    .await?;
+                    .await
+                    .map(|_| ())
             }
             "❓ Help" => {
+                info!("Processing Help button");
                 let help_msg = r#"📖 <b>Help & Commands</b>
 
 <b>Bot Commands:</b>
@@ -365,14 +402,30 @@ Use the persistent keyboard buttons below for quick access to all features.
                     .parse_mode(ParseMode::Html)
                     .reply_markup(create_main_keyboard())
                     .send()
-                    .await?;
+                    .await
+                    .map(|_| ())
             }
             _ => {
+                info!("Ignoring unknown message: {}", text);
                 // Unknown text message, ignore
+                return Ok(());
+            }
+        };
+        
+        match result {
+            Ok(_) => {
+                info!("✅ Message processed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("❌ Error processing message: {}", e);
+                Err(e)
             }
         }
+    } else {
+        info!("Message has no text content");
+        Ok(())
     }
-    Ok(())
 }
 
 async fn send_stats(bot: &Bot, chat_id: ChatId, db: &Database) -> ResponseResult<()> {

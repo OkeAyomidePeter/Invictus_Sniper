@@ -11,6 +11,7 @@ mod position_tracker;
 mod rate_limiter;
 mod retry;
 mod wallet_monitor;
+mod watchlist;
 
 use anyhow::Result;
 use log::{error, info, warn};
@@ -23,6 +24,7 @@ use db::Database;
 use tele::TelegramInterface;
 use config::Config;
 use position_tracker::{PositionTracker, Position};
+use watchlist::{Watchlist, BuySignal};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -126,6 +128,18 @@ async fn main() -> Result<()> {
     // Initialize Position Tracker
     let position_tracker = PositionTracker::new(&config);
 
+    // Initialize Watchlist
+    let (buy_tx, mut buy_rx) = tokio::sync::mpsc::channel::<BuySignal>(100);
+    let watchlist = std::sync::Arc::new(Watchlist::new(&config, buy_tx));
+    
+    // Start Watchlist Monitoring
+    if config.dip_strategy_enabled {
+        watchlist.start_monitoring().await;
+        info!("👀 Dip Strategy ENABLED: High score tokens will be added to watchlist");
+    } else {
+        info!("⚡ Dip Strategy DISABLED: Instant buying mode active");
+    }
+
     info!("🚀 Sniper Bot Initialized & Running...");
 
     // Main Event Loop
@@ -224,6 +238,10 @@ async fn main() -> Result<()> {
                                     amount_token_raw: estimated_token_amount,
                                     amount_sol_invested: buy_amount_sol_lamports,
                                     decimals: enriched_token.decimals,
+                                    highest_price_reached: entry_price_estimate,
+                                    partial_exit_executed: false,
+                                    remaining_amount_pct: 100.0,
+                                    timeout_extensions: 0,
                                 };
                                 
                                 let mut sell_rx = position_tracker.monitor_position(position);
@@ -266,8 +284,11 @@ async fn main() -> Result<()> {
                                                                 // Update database with exit info
                                                                 let trigger_str = match sell_signal.trigger {
                                                                     position_tracker::SellTrigger::ProfitTarget(_) => "PROFIT_TARGET",
+                                                                    position_tracker::SellTrigger::PartialProfit(_) => "PARTIAL_PROFIT",
+                                                                    position_tracker::SellTrigger::TrailingStopLoss(_) => "TRAILING_STOP",
                                                                     position_tracker::SellTrigger::StopLoss(_) => "STOP_LOSS",
                                                                     position_tracker::SellTrigger::Timeout => "TIMEOUT",
+                                                                    position_tracker::SellTrigger::ExtendedTimeout(_) => "EXTENDED_TIMEOUT",
                                                                 };
                                                                 
                                                                 if let Err(e) = db_clone.update_trade_exit(
@@ -329,6 +350,165 @@ async fn main() -> Result<()> {
             _ = &mut shutdown_signal => {
                 info!("🛑 Shutdown signal received");
                 break;
+            }
+            Some(buy_signal) = buy_rx.recv() => {
+                // Handle Buy Signal from Watchlist
+                let token = buy_signal.token;
+                info!("🚀 WATCHLIST BUY TRIGGERED: {} | Price: {:.9} | Vol: ${:.0}", 
+                    token.mint, buy_signal.current_price, buy_signal.volume_5m);
+
+                // Execute BUY
+                let buy_amount_sol_lamports = (config.max_trade_size_sol * 1_000_000_000.0) as u64;
+                let tip_lamports = tx_manager.calculate_tip(true);
+                let slippage_bps = 300;
+                
+                let buy_result = tx_manager.build_buy_instructions(
+                    &token.mint,
+                    buy_amount_sol_lamports,
+                    slippage_bps,
+                    tx::DexRouter::Jupiter,
+                    tip_lamports,
+                ).await;
+                
+                match buy_result {
+                    Ok(instructions) => {
+                        match presigner.build_and_sign_tx(&instructions) {
+                            Ok(signed_tx) => {
+                                match presigner.send_transaction(&signed_tx) {
+                                    Ok(signature) => {
+                                        let bundle_id = signature;
+                                        info!("🚀 Watchlist BUY executed! Signature: {}", bundle_id);
+                                        
+                                        let entry_price = buy_signal.current_price;
+                                        
+                                        if let Err(e) = database.record_trade(
+                                            &token.mint,
+                                            "BUY",
+                                            0,
+                                            buy_amount_sol_lamports,
+                                            &bundle_id,
+                                            Some(&bundle_id),
+                                            Some(entry_price),
+                                        ).await {
+                                            error!("Failed to record BUY trade: {}", e);
+                                        }
+                                        
+                                        if config.auto_sell_enabled {
+                                            info!("📊 Starting auto-sell monitoring for {}", token.mint);
+                                            
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                                            
+                                            let estimated_token_amount = (buy_amount_sol_lamports as f64 / entry_price) as u64;
+                                            
+                                            let position = Position {
+                                                mint: token.mint.clone(),
+                                                entry_price_sol_per_token: entry_price,
+                                                entry_time: std::time::Instant::now(),
+                                                amount_token_raw: estimated_token_amount,
+                                                amount_sol_invested: buy_amount_sol_lamports,
+                                                decimals: token.decimals,
+                                                highest_price_reached: entry_price,
+                                                partial_exit_executed: false,
+                                                remaining_amount_pct: 100.0,
+                                                timeout_extensions: 0,
+                                            };
+                                            
+                                            let mut sell_rx = position_tracker.monitor_position(position);
+                                            
+                                            let tx_manager_clone = tx_manager.clone();
+                                            let db_clone = database.clone();
+                                            let tele_clone = tele_interface.clone();
+                                            let config_clone = config.clone();
+                                            
+                                            tokio::spawn(async move {
+                                                if let Some(sell_signal) = sell_rx.recv().await {
+                                                    info!("⚡ Sell trigger: {} for {}", sell_signal.trigger, sell_signal.position.mint);
+                                                    
+                                                    let sell_slippage = config_clone.auto_sell_slippage_bps;
+                                                    
+                                                    let sell_result = tx_manager_clone.build_sell_instructions(
+                                                        &sell_signal.position.mint,
+                                                        sell_signal.position.amount_token_raw,
+                                                        sell_slippage,
+                                                        tx::DexRouter::Jupiter,
+                                                        true,
+                                                    ).await;
+                                                    
+                                                    match sell_result {
+                                                        Ok(instructions) => {
+                                                            let presigner_sell = std::sync::Arc::new(presigner::Presigner::new(&config_clone));
+                                                            match presigner_sell.build_and_sign_tx(&instructions) {
+                                                                Ok(signed_tx) => {
+                                                                    match presigner_sell.send_transaction(&signed_tx) {
+                                                                        Ok(signature) => {
+                                                                            let bundle_id = signature;
+                                                                            info!("🎯 Auto-sell executed: {} (Signature: {})", sell_signal.position.mint, bundle_id);
+                                                                            
+                                                                            let pnl_sol = (sell_signal.position.amount_token_raw as f64 * sell_signal.current_price_sol_per_token
+                                                                                - sell_signal.position.amount_sol_invested as f64) / 1_000_000_000.0;
+                                                                            
+                                                                            let trigger_str = match sell_signal.trigger {
+                                                                                position_tracker::SellTrigger::ProfitTarget(_) => "PROFIT_TARGET",
+                                                                                position_tracker::SellTrigger::PartialProfit(_) => "PARTIAL_PROFIT",
+                                                                                position_tracker::SellTrigger::TrailingStopLoss(_) => "TRAILING_STOP",
+                                                                                position_tracker::SellTrigger::StopLoss(_) => "STOP_LOSS",
+                                                                                position_tracker::SellTrigger::Timeout => "TIMEOUT",
+                                                                                position_tracker::SellTrigger::ExtendedTimeout(_) => "EXTENDED_TIMEOUT",
+                                                                            };
+                                                                            
+                                                                            if let Err(e) = db_clone.update_trade_exit(
+                                                                                &sell_signal.position.mint,
+                                                                                sell_signal.current_price_sol_per_token,
+                                                                                pnl_sol,
+                                                                                trigger_str,
+                                                                            ).await {
+                                                                                error!("Failed to update trade exit: {}", e);
+                                                                            }
+                                                                            
+                                                                            tele_clone.notify_auto_sell(
+                                                                                &sell_signal.position.mint,
+                                                                                &sell_signal.trigger.to_string(),
+                                                                                sell_signal.pnl_percentage,
+                                                                                sell_signal.position.entry_price_sol_per_token,
+                                                                                sell_signal.current_price_sol_per_token,
+                                                                                pnl_sol,
+                                                                                &bundle_id,
+                                                                            ).await;
+                                                                            
+                                                                            info!("💰 P/L: {:.4} SOL ({:.2}%)", pnl_sol, sell_signal.pnl_percentage);
+                                                                        }
+                                                                        Err(e) => {
+                                                                            error!("Failed to send SELL transaction: {}", e);
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    error!("Failed to sign SELL transaction: {}", e);
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("Failed to build SELL instructions: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to send BUY transaction: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to sign BUY transaction: {}", e);
+                                    }
+                        }
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to build BUY instructions: {}", e);
+                    }
+                }
             }
         }
     }

@@ -75,6 +75,33 @@ pub struct ConfigData {
     pub max_concurrent_trades: String,
     pub max_open_positions: String,
     pub total_exposure_limit_sol: String,
+    
+    // Dip Strategy
+    pub dip_strategy_enabled: bool,
+    pub dip_entry_pct: String,
+    pub min_volume_usd_5m: String,
+    pub watchlist_timeout_seconds: String,
+    
+    // Enhanced Entry Validation
+    pub volume_trend_enabled: bool,
+    pub volume_samples_required: String,
+    pub volume_sample_interval_secs: String,
+    pub holder_stability_enabled: bool,
+    pub min_holder_retention_pct: String,
+    
+    // Trailing Stop Loss
+    pub trailing_stop_enabled: bool,
+    pub trailing_stop_distance_pct: String,
+    
+    // Partial Exits
+    pub partial_exit_enabled: bool,
+    pub partial_exit_target_pct: String,
+    pub partial_exit_amount_pct: String,
+    
+    // Dynamic Timeout
+    pub dynamic_timeout_enabled: bool,
+    pub timeout_extension_seconds: String,
+    pub max_timeout_extensions: String,
 }
 
 impl Default for ConfigData {
@@ -116,6 +143,27 @@ impl Default for ConfigData {
             max_concurrent_trades: "5".to_string(),
             max_open_positions: "10".to_string(),
             total_exposure_limit_sol: "10.0".to_string(),
+            dip_strategy_enabled: true,
+            dip_entry_pct: "30.0".to_string(),
+            min_volume_usd_5m: "1000.0".to_string(),
+            watchlist_timeout_seconds: "300".to_string(),
+            // Enhanced Entry Validation
+            volume_trend_enabled: true,
+            volume_samples_required: "3".to_string(),
+            volume_sample_interval_secs: "5".to_string(),
+            holder_stability_enabled: true,
+            min_holder_retention_pct: "90.0".to_string(),
+            // Trailing Stop Loss
+            trailing_stop_enabled: true,
+            trailing_stop_distance_pct: "15.0".to_string(),
+            // Partial Exits
+            partial_exit_enabled: true,
+            partial_exit_target_pct: "30.0".to_string(),
+            partial_exit_amount_pct: "50.0".to_string(),
+            // Dynamic Timeout
+            dynamic_timeout_enabled: true,
+            timeout_extension_seconds: "60".to_string(),
+            max_timeout_extensions: "2".to_string(),
         }
     }
 }
@@ -159,6 +207,27 @@ impl ConfigData {
             max_concurrent_trades: self.max_concurrent_trades.parse().map_err(|_| "Invalid max_concurrent_trades")?,
             max_open_positions: self.max_open_positions.parse().map_err(|_| "Invalid max_open_positions")?,
             total_exposure_limit_sol: self.total_exposure_limit_sol.parse().map_err(|_| "Invalid total_exposure_limit_sol")?,
+            dip_strategy_enabled: self.dip_strategy_enabled,
+            dip_entry_pct: self.dip_entry_pct.parse().map_err(|_| "Invalid dip_entry_pct")?,
+            min_volume_usd_5m: self.min_volume_usd_5m.parse().map_err(|_| "Invalid min_volume_usd_5m")?,
+            watchlist_timeout_seconds: self.watchlist_timeout_seconds.parse().map_err(|_| "Invalid watchlist_timeout_seconds")?,
+            // Enhanced Entry Validation
+            volume_trend_enabled: self.volume_trend_enabled,
+            volume_samples_required: self.volume_samples_required.parse().map_err(|_| "Invalid volume_samples_required")?,
+            volume_sample_interval_secs: self.volume_sample_interval_secs.parse().map_err(|_| "Invalid volume_sample_interval_secs")?,
+            holder_stability_enabled: self.holder_stability_enabled,
+            min_holder_retention_pct: self.min_holder_retention_pct.parse().map_err(|_| "Invalid min_holder_retention_pct")?,
+            // Trailing Stop Loss
+            trailing_stop_enabled: self.trailing_stop_enabled,
+            trailing_stop_distance_pct: self.trailing_stop_distance_pct.parse().map_err(|_| "Invalid trailing_stop_distance_pct")?,
+            // Partial Exits
+            partial_exit_enabled: self.partial_exit_enabled,
+            partial_exit_target_pct: self.partial_exit_target_pct.parse().map_err(|_| "Invalid partial_exit_target_pct")?,
+            partial_exit_amount_pct: self.partial_exit_amount_pct.parse().map_err(|_| "Invalid partial_exit_amount_pct")?,
+            // Dynamic Timeout
+            dynamic_timeout_enabled: self.dynamic_timeout_enabled,
+            timeout_extension_seconds: self.timeout_extension_seconds.parse().map_err(|_| "Invalid timeout_extension_seconds")?,
+            max_timeout_extensions: self.max_timeout_extensions.parse().map_err(|_| "Invalid max_timeout_extensions")?,
         })
     }
 }
@@ -317,6 +386,38 @@ impl InvictusGUI {
         writeln!(file, "MAX_CONCURRENT_TRADES={}", self.config.max_concurrent_trades)?;
         writeln!(file, "MAX_OPEN_POSITIONS={}", self.config.max_open_positions)?;
         writeln!(file, "TOTAL_EXPOSURE_LIMIT_SOL={}", self.config.total_exposure_limit_sol)?;
+        writeln!(file)?;
+        
+        writeln!(file, "# Dip Strategy")?;
+        writeln!(file, "DIP_STRATEGY_ENABLED={}", self.config.dip_strategy_enabled)?;
+        writeln!(file, "DIP_ENTRY_PCT={}", self.config.dip_entry_pct)?;
+        writeln!(file, "MIN_VOLUME_USD_5M={}", self.config.min_volume_usd_5m)?;
+        writeln!(file, "WATCHLIST_TIMEOUT_SECONDS={}", self.config.watchlist_timeout_seconds)?;
+        writeln!(file)?;
+        
+        writeln!(file, "# Enhanced Entry Validation")?;
+        writeln!(file, "VOLUME_TREND_ENABLED={}", self.config.volume_trend_enabled)?;
+        writeln!(file, "VOLUME_SAMPLES_REQUIRED={}", self.config.volume_samples_required)?;
+        writeln!(file, "VOLUME_SAMPLE_INTERVAL_SECS={}", self.config.volume_sample_interval_secs)?;
+        writeln!(file, "HOLDER_STABILITY_ENABLED={}", self.config.holder_stability_enabled)?;
+        writeln!(file, "MIN_HOLDER_RETENTION_PCT={}", self.config.min_holder_retention_pct)?;
+        writeln!(file)?;
+        
+        writeln!(file, "# Trailing Stop Loss")?;
+        writeln!(file, "TRAILING_STOP_ENABLED={}", self.config.trailing_stop_enabled)?;
+        writeln!(file, "TRAILING_STOP_DISTANCE_PCT={}", self.config.trailing_stop_distance_pct)?;
+        writeln!(file)?;
+        
+        writeln!(file, "# Partial Exits")?;
+        writeln!(file, "PARTIAL_EXIT_ENABLED={}", self.config.partial_exit_enabled)?;
+        writeln!(file, "PARTIAL_EXIT_TARGET_PCT={}", self.config.partial_exit_target_pct)?;
+        writeln!(file, "PARTIAL_EXIT_AMOUNT_PCT={}", self.config.partial_exit_amount_pct)?;
+        writeln!(file)?;
+        
+        writeln!(file, "# Dynamic Timeout")?;
+        writeln!(file, "DYNAMIC_TIMEOUT_ENABLED={}", self.config.dynamic_timeout_enabled)?;
+        writeln!(file, "TIMEOUT_EXTENSION_SECONDS={}", self.config.timeout_extension_seconds)?;
+        writeln!(file, "MAX_TIMEOUT_EXTENSIONS={}", self.config.max_timeout_extensions)?;
         
         Ok(())
     }
@@ -385,6 +486,28 @@ impl InvictusGUI {
         load_str(&mut self.config.max_concurrent_trades, "MAX_CONCURRENT_TRADES");
         load_str(&mut self.config.max_open_positions, "MAX_OPEN_POSITIONS");
         load_str(&mut self.config.total_exposure_limit_sol, "TOTAL_EXPOSURE_LIMIT_SOL");
+        
+        load_bool(&mut self.config.dip_strategy_enabled, "DIP_STRATEGY_ENABLED");
+        load_str(&mut self.config.dip_entry_pct, "DIP_ENTRY_PCT");
+        load_str(&mut self.config.min_volume_usd_5m, "MIN_VOLUME_USD_5M");
+        load_str(&mut self.config.watchlist_timeout_seconds, "WATCHLIST_TIMEOUT_SECONDS");
+        
+        load_bool(&mut self.config.volume_trend_enabled, "VOLUME_TREND_ENABLED");
+        load_str(&mut self.config.volume_samples_required, "VOLUME_SAMPLES_REQUIRED");
+        load_str(&mut self.config.volume_sample_interval_secs, "VOLUME_SAMPLE_INTERVAL_SECS");
+        load_bool(&mut self.config.holder_stability_enabled, "HOLDER_STABILITY_ENABLED");
+        load_str(&mut self.config.min_holder_retention_pct, "MIN_HOLDER_RETENTION_PCT");
+        
+        load_bool(&mut self.config.trailing_stop_enabled, "TRAILING_STOP_ENABLED");
+        load_str(&mut self.config.trailing_stop_distance_pct, "TRAILING_STOP_DISTANCE_PCT");
+        
+        load_bool(&mut self.config.partial_exit_enabled, "PARTIAL_EXIT_ENABLED");
+        load_str(&mut self.config.partial_exit_target_pct, "PARTIAL_EXIT_TARGET_PCT");
+        load_str(&mut self.config.partial_exit_amount_pct, "PARTIAL_EXIT_AMOUNT_PCT");
+        
+        load_bool(&mut self.config.dynamic_timeout_enabled, "DYNAMIC_TIMEOUT_ENABLED");
+        load_str(&mut self.config.timeout_extension_seconds, "TIMEOUT_EXTENSION_SECONDS");
+        load_str(&mut self.config.max_timeout_extensions, "MAX_TIMEOUT_EXTENSIONS");
     }
 }
 

@@ -48,6 +48,28 @@ pub struct Config {
     pub max_concurrent_trades: usize,
     pub max_open_positions: usize,
     pub total_exposure_limit_sol: f64,
+    // Dip Strategy - Basic
+    pub dip_strategy_enabled: bool,
+    pub dip_entry_pct: f64,        // e.g. 30.0 for -30% drop
+    pub min_volume_usd_5m: f64,    // e.g. 1000.0
+    pub watchlist_timeout_seconds: u64, // e.g. 300
+    // Dip Strategy - Entry Validation
+    pub volume_trend_enabled: bool,
+    pub volume_samples_required: usize,
+    pub volume_sample_interval_secs: u64,
+    pub holder_stability_enabled: bool,
+    pub min_holder_retention_pct: f64,
+    // Trailing Stop Loss
+    pub trailing_stop_enabled: bool,
+    pub trailing_stop_distance_pct: f64,
+    // Partial Exits
+    pub partial_exit_enabled: bool,
+    pub partial_exit_target_pct: f64,
+    pub partial_exit_amount_pct: f64,
+    // Dynamic Timeout
+    pub dynamic_timeout_enabled: bool,
+    pub timeout_extension_seconds: u64,
+    pub max_timeout_extensions: u32,
 }
 
 impl Config {
@@ -187,6 +209,79 @@ impl Config {
                 .unwrap_or("10.0".to_string())
                 .parse()
                 .expect("TOTAL_EXPOSURE_LIMIT_SOL must be a valid number"),
+            // Dip Strategy
+            dip_strategy_enabled: env::var("DIP_STRATEGY_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("DIP_STRATEGY_ENABLED must be true or false"),
+            dip_entry_pct: env::var("DIP_ENTRY_PCT")
+                .unwrap_or("30.0".to_string())
+                .parse()
+                .expect("DIP_ENTRY_PCT must be a valid number"),
+            min_volume_usd_5m: env::var("MIN_VOLUME_USD_5M")
+                .unwrap_or("1000.0".to_string())
+                .parse()
+                .expect("MIN_VOLUME_USD_5M must be a valid number"),
+            watchlist_timeout_seconds: env::var("WATCHLIST_TIMEOUT_SECONDS")
+                .unwrap_or("300".to_string())
+                .parse()
+                .expect("WATCHLIST_TIMEOUT_SECONDS must be a valid number"),
+            // Dip Strategy - Entry Validation
+            volume_trend_enabled: env::var("VOLUME_TREND_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("VOLUME_TREND_ENABLED must be true or false"),
+            volume_samples_required: env::var("VOLUME_SAMPLES_REQUIRED")
+                .unwrap_or("3".to_string())
+                .parse()
+                .expect("VOLUME_SAMPLES_REQUIRED must be a valid number"),
+            volume_sample_interval_secs: env::var("VOLUME_SAMPLE_INTERVAL_SECS")
+                .unwrap_or("5".to_string())
+                .parse()
+                .expect("VOLUME_SAMPLE_INTERVAL_SECS must be a valid number"),
+            holder_stability_enabled: env::var("HOLDER_STABILITY_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("HOLDER_STABILITY_ENABLED must be true or false"),
+            min_holder_retention_pct: env::var("MIN_HOLDER_RETENTION_PCT")
+                .unwrap_or("90.0".to_string())
+                .parse()
+                .expect("MIN_HOLDER_RETENTION_PCT must be a valid number"),
+            // Trailing Stop Loss
+            trailing_stop_enabled: env::var("TRAILING_STOP_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("TRAILING_STOP_ENABLED must be true or false"),
+            trailing_stop_distance_pct: env::var("TRAILING_STOP_DISTANCE_PCT")
+                .unwrap_or("15.0".to_string())
+                .parse()
+                .expect("TRAILING_STOP_DISTANCE_PCT must be a valid number"),
+            // Partial Exits
+            partial_exit_enabled: env::var("PARTIAL_EXIT_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("PARTIAL_EXIT_ENABLED must be true or false"),
+            partial_exit_target_pct: env::var("PARTIAL_EXIT_TARGET_PCT")
+                .unwrap_or("30.0".to_string())
+                .parse()
+                .expect("PARTIAL_EXIT_TARGET_PCT must be a valid number"),
+            partial_exit_amount_pct: env::var("PARTIAL_EXIT_AMOUNT_PCT")
+                .unwrap_or("50.0".to_string())
+                .parse()
+                .expect("PARTIAL_EXIT_AMOUNT_PCT must be a valid number"),
+            // Dynamic Timeout
+            dynamic_timeout_enabled: env::var("DYNAMIC_TIMEOUT_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .expect("DYNAMIC_TIMEOUT_ENABLED must be true or false"),
+            timeout_extension_seconds: env::var("TIMEOUT_EXTENSION_SECONDS")
+                .unwrap_or("60".to_string())
+                .parse()
+                .expect("TIMEOUT_EXTENSION_SECONDS must be a valid number"),
+            max_timeout_extensions: env::var("MAX_TIMEOUT_EXTENSIONS")
+                .unwrap_or("2".to_string())
+                .parse()
+                .expect("MAX_TIMEOUT_EXTENSIONS must be a valid number"),
         }
     }
 
