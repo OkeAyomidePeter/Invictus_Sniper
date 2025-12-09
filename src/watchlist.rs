@@ -69,8 +69,10 @@ impl Watchlist {
         // Get initial stats for validation
         // Note: volume_5m_usd and holder_count fields don't exist yet in EnrichedToken
         // Using fallbacks until enrichment is updated
-        let initial_volume = 0.0; // token.volume_5m_usd.unwrap_or(0.0);
-        let initial_holders = 0; // token.holder_count.unwrap_or(0);
+        let initial_volume = 0.0; // Volume not available in EnrichedToken yet
+        let initial_holders = token.holders.as_ref()
+            .and_then(|h| h.unique_holders)
+            .unwrap_or(0) as usize;
         
         info!("👀 Added to Watchlist: {} | Entry: {:.9} SOL | Target: {:.9} SOL (-{}%) | Vol: ${:.0} | Holders: {}", 
             token.mint, initial_price, target_price, self.config.dip_entry_pct, initial_volume, initial_holders);
@@ -268,9 +270,14 @@ fn validate_volume_with_trend(token: &WatchlistToken, current_volume: f64, confi
     }
     
     // All checks passed - volume is good and trending up (or stable)
+    let trend_pct = if first_half_avg > 0.0 {
+        ((second_half_avg - first_half_avg) / first_half_avg * 100.0)
+    } else {
+        0.0
+    };
+
     info!("✅ Volume validation passed for {}: ${:.0} (trend: {:.1}%)", 
-        token.mint, current_volume, 
-        ((second_half_avg - first_half_avg) / first_half_avg * 100.0));
+        token.mint, current_volume, trend_pct);
     
     true
 }

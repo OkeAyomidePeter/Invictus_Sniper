@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::sync::Arc;
+use crate::rate_limiter::RateLimiter;
+use reqwest::Client;
 
 /// Raw transaction event from Helius
 #[derive(Debug, Clone)]
@@ -189,13 +192,30 @@ pub async fn start(config: &Config) -> Result<mpsc::Receiver<ClassifiedEvent>> {
     info!("🔗 Connection Pool: {} WebSocket connections", WS_POOL_SIZE);
     info!("💓 Heartbeat: Ping every {}s to prevent disconnection", PING_INTERVAL_SECS);
 
+    // Initialize shared resources
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+        
+    let rate_limiter = if config.rate_limiting_enabled {
+        Some(Arc::new(RateLimiter::new(
+            config.helius_max_requests_per_second,
+            "HeliusListener",
+        )))
+    } else {
+        None
+    };
+
     // Start multiple websocket listeners (connection pool)
     for connection_id in 0..WS_POOL_SIZE {
         let api_key_clone = api_key.clone();
         let raw_tx_clone = raw_tx.clone();
+        let client_clone = client.clone();
+        let limiter_clone = rate_limiter.clone();
         
         tokio::spawn(async move {
-            listener_loop(connection_id, api_key_clone, raw_tx_clone).await;
+            listener_loop(connection_id, api_key_clone, raw_tx_clone, client_clone, limiter_clone).await;
         });
     }
 
@@ -209,7 +229,13 @@ pub async fn start(config: &Config) -> Result<mpsc::Receiver<ClassifiedEvent>> {
     Ok(classified_rx)
 }
 
-async fn listener_loop(connection_id: usize, api_key: String, tx: mpsc::Sender<RawTxEvent>) {
+async fn listener_loop(
+    connection_id: usize, 
+    api_key: String, 
+    tx: mpsc::Sender<RawTxEvent>,
+    client: Client,
+    rate_limiter: Option<Arc<RateLimiter>>,
+) {
     let mut backoff_seconds = 1;
     let max_backoff = 60;
 
@@ -218,7 +244,7 @@ async fn listener_loop(connection_id: usize, api_key: String, tx: mpsc::Sender<R
     loop {
         info!("[Connection #{}] Connecting to Helius WebSocket (mainnet)", connection_id);
 
-        match connect_and_listen(connection_id, &api_key, &tx).await {
+        match connect_and_listen(connection_id, &api_key, &tx, &client, &rate_limiter).await {
             Ok(()) => {
                 info!("[Connection #{}] WebSocket connection closed normally", connection_id);
                 backoff_seconds = 1;
@@ -239,6 +265,8 @@ async fn connect_and_listen(
     connection_id: usize,
     api_key: &str,
     tx: &mpsc::Sender<RawTxEvent>,
+    client: &Client,
+    rate_limiter: &Option<Arc<RateLimiter>>,
 ) -> Result<()> {
     let ws_url = format!("wss://mainnet.helius-rpc.com/?api-key={}", api_key);
 
@@ -327,7 +355,7 @@ async fn connect_and_listen(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_message(&text, api_key, tx).await {
+                        if let Err(e) = handle_message(&text, api_key, tx, client, rate_limiter).await {
                             warn!("[Connection #{}] Error handling message: {}", connection_id, e);
                         }
                     }
@@ -372,6 +400,8 @@ async fn handle_message(
     text: &str,
     api_key: &str,
     tx: &mpsc::Sender<RawTxEvent>,
+    client: &Client,
+    rate_limiter: &Option<Arc<RateLimiter>>,
 ) -> Result<()> {
     let msg: HeliusMessage =
         serde_json::from_str(text).context("Failed to parse Helius message")?;
@@ -412,10 +442,13 @@ async fn handle_message(
             info!("⚡ Pool creation detected: {}", signature);
 
             // Fetch full transaction details
-            let client = reqwest::Client::new();
+            if let Some(limiter) = rate_limiter {
+                limiter.acquire().await;
+            }
+            
             let rpc_url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
             
-            match fetch_transaction(&client, &rpc_url, &signature).await {
+            match fetch_transaction(client, &rpc_url, &signature).await {
                 Ok(tx_data) => {
                     let slot = tx_data.get("slot").and_then(|s| s.as_u64()).unwrap_or(slot);
                     let block_time = tx_data.get("blockTime").and_then(|t| t.as_i64());

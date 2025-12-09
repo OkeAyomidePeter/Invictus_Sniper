@@ -3,6 +3,26 @@ use log::{info, warn};
 
 /// Scorer for enriched tokens
 /// GRADUATED TOKENS ONLY (Pump.fun/Bonk.fun)
+const LIQUIDITY_HIGH_THRESHOLD: f64 = 60.0;
+const LIQUIDITY_MED_THRESHOLD: f64 = 30.0;
+const SCORE_LIQUIDITY_HIGH: f64 = 70.0;
+const SCORE_LIQUIDITY_MED: f64 = 40.0;
+
+const HOLDER_TOP_1_PENALTY_THRESHOLD: f64 = 30.0;
+const HOLDER_TOP_10_PENALTY_THRESHOLD: f64 = 70.0;
+const HOLDER_TOP_1_BONUS_THRESHOLD: f64 = 10.0;
+const SCORE_PENALTY_TOP_1: f64 = 50.0;
+const SCORE_PENALTY_TOP_10: f64 = 20.0;
+const SCORE_BONUS_TOP_1: f64 = 10.0;
+
+const UNIQUE_HOLDERS_HIGH: u64 = 100;
+const UNIQUE_HOLDERS_LOW: u64 = 20;
+const SCORE_BONUS_UNIQUE_HIGH: f64 = 10.0;
+const SCORE_PENALTY_UNIQUE_LOW: f64 = 20.0;
+
+const MIN_MARKET_CAP: f64 = 50_000.0;
+const SCORE_PENALTY_LOW_MC: f64 = 10.0;
+
 #[derive(Debug, Clone)]
 pub struct TokenScorer;
 
@@ -39,15 +59,15 @@ impl TokenScorer {
         // Pump.fun tokens usually graduate with ~70-80 SOL.
         // We want to ensure it's a "healthy" graduation.
         if let Some(liquidity_sol) = token.initial_liquidity_sol {
-            if liquidity_sol >= 60.0 {
-                score += 70.0; // Standard/Good Graduation (~$10k+)
-            } else if liquidity_sol >= 30.0 {
-                score += 40.0; // Low but acceptable
+            if liquidity_sol >= LIQUIDITY_HIGH_THRESHOLD {
+                score += SCORE_LIQUIDITY_HIGH; // Standard/Good Graduation (~$10k+)
+            } else if liquidity_sol >= LIQUIDITY_MED_THRESHOLD {
+                score += SCORE_LIQUIDITY_MED; // Low but acceptable
             } else {
                 // < 30 SOL is suspicious for a graduated token
                 // It might mean liquidity was pulled or it's a weird migration
                 score += 0.0; 
-                warn!("    - LOW LIQUIDITY: {:.1} SOL (Expected > 30)", liquidity_sol);
+                warn!("    - LOW LIQUIDITY: {:.1} SOL (Expected > {})", liquidity_sol, LIQUIDITY_MED_THRESHOLD);
             }
         }
 
@@ -79,29 +99,29 @@ impl TokenScorer {
         // =====================================================================
         if let Some(holders) = &token.holders {
             // Penalty: Top 1 holder > 30% (excluding pool)
-            if holders.top_1_pct > 30.0 {
-                score -= 50.0; // Huge penalty for whale dominance
+            if holders.top_1_pct > HOLDER_TOP_1_PENALTY_THRESHOLD {
+                score -= SCORE_PENALTY_TOP_1; // Huge penalty for whale dominance
                 warn!("    - PENALTY: Top 1 holder owns {:.1}%", holders.top_1_pct);
             }
             
             // Penalty: Top 10 holders > 70%
-            if holders.top_10_pct > 70.0 {
-                score -= 20.0;
+            if holders.top_10_pct > HOLDER_TOP_10_PENALTY_THRESHOLD {
+                score -= SCORE_PENALTY_TOP_10;
                 warn!("    - PENALTY: Top 10 holders own {:.1}%", holders.top_10_pct);
             }
 
             // Bonus: Good distribution (Top 1 < 10%)
-            if holders.top_1_pct < 10.0 {
-                score += 10.0;
+            if holders.top_1_pct < HOLDER_TOP_1_BONUS_THRESHOLD {
+                score += SCORE_BONUS_TOP_1;
             }
 
             // NEW: Unique Holder Count
             if let Some(unique) = holders.unique_holders {
-                if unique > 100 {
-                    score += 10.0; // Healthy community
+                if unique > UNIQUE_HOLDERS_HIGH {
+                    score += SCORE_BONUS_UNIQUE_HIGH; // Healthy community
                     info!("    + Community: {} unique holders", unique);
-                } else if unique < 20 {
-                    score -= 20.0; // Ghost town / Dev wallet farm
+                } else if unique < UNIQUE_HOLDERS_LOW {
+                    score -= SCORE_PENALTY_UNIQUE_LOW; // Ghost town / Dev wallet farm
                     warn!("    - PENALTY: Only {} unique holders", unique);
                 }
             }
@@ -111,9 +131,10 @@ impl TokenScorer {
         // 5. MARKET CAP CHECK (Penalty only)
         // =====================================================================
         // If MC is super low (<$50k), it means price dumped below graduation.
+        // If MC is super low (<$50k), it means price dumped below graduation.
         if let Some(mc) = token.market_cap {
-            if mc < 50_000.0 {
-                score -= 10.0;
+            if mc < MIN_MARKET_CAP {
+                score -= SCORE_PENALTY_LOW_MC;
                 warn!("    - PENALTY: Low Market Cap (${:.0})", mc);
             }
         }

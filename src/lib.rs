@@ -18,3 +18,6 @@ pub mod tele;
 pub mod tx;
 pub mod wallet_monitor;
 pub mod watchlist;
+pub mod trade_engine;
+pub mod trade_logger;
+pub mod health;

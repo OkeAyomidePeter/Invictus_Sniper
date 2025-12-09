@@ -151,7 +151,7 @@ struct ParsedAccountData {
 #[derive(Debug, Deserialize)]
 struct AccountInfo {
     data: ParsedAccountData,
-    owner: Option<String>,
+    _owner: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

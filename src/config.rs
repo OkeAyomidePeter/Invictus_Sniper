@@ -352,6 +352,18 @@ mod tests {
         env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
         env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
 
+        // Clear optional vars to ensure defaults
+        env::remove_var("MIN_LIQUIDITY_SOL");
+        env::remove_var("MIN_HOLDERS");
+        env::remove_var("MAX_TRADE_SIZE_SOL");
+        env::remove_var("AUTO_SELL_ENABLED");
+        env::remove_var("AUTO_SELL_PROFIT_TARGET_PCT");
+        env::remove_var("AUTO_SELL_STOP_LOSS_PCT");
+        env::remove_var("JITO_BASE_TIP_LAMPORTS");
+        env::remove_var("TX_RETRY_MAX_ATTEMPTS");
+        env::remove_var("RATE_LIMITING_ENABLED");
+        env::remove_var("MAX_CONCURRENT_TRADES");
+
         let config = Config::load();
 
         // Test defaults

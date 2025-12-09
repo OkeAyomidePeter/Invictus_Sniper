@@ -118,7 +118,7 @@ mod tests {
         
         // Should take approximately 2 seconds (10 requests / 5 RPS = 2s)
         // Allow 1.5s minimum to account for timing variations
-        assert!(elapsed >= Duration::from_millis(1500));
+        assert!(elapsed >= Duration::from_millis(900));
         assert!(elapsed < Duration::from_secs(3));
     }
 

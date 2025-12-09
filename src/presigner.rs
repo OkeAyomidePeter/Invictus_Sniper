@@ -15,10 +15,40 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use std::str::FromStr;
+use reqwest::Client; // For Jito Bundle API
+
+const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+
+/// Bundle confirmation status from Jito
+#[derive(Debug, Clone, PartialEq)]
+pub enum BundleStatus {
+    /// Bundle is still being processed
+    Pending,
+    /// Bundle landed on-chain successfully
+    Landed,
+    /// Bundle failed to land
+    Failed(String),
+    /// Bundle was invalid (signature issues, etc.)
+    Invalid(String),
+    /// Bundle not found (may not have been received yet)
+    NotFound,
+}
+
+impl BundleStatus {
+    pub fn is_success(&self) -> bool {
+        matches!(self, BundleStatus::Landed)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, BundleStatus::Landed | BundleStatus::Failed(_) | BundleStatus::Invalid(_))
+    }
+}
+
 
 /// Manages blockhash updates and rapid transaction signing
 pub struct Presigner {
     rpc_client: Arc<RpcClient>,
+    http_client: Client, // For Jito
     keypair: Arc<Keypair>,
     blockhash: Arc<RwLock<Hash>>,
     _update_handle: JoinHandle<()>,
@@ -89,6 +119,7 @@ impl Presigner {
 
         Self {
             rpc_client,
+            http_client: Client::new(),
             keypair,
             blockhash,
             _update_handle: update_handle,
@@ -181,6 +212,160 @@ impl Presigner {
         }
         Ok(())
     }
+
+    /// Send a Jito Bundle (Swap Tx + Tip Tx)
+    pub async fn send_jito_bundle(&self, transactions: Vec<VersionedTransaction>) -> Result<String> {
+        if transactions.is_empty() {
+            return Err(anyhow::anyhow!("Cannot send empty bundle"));
+        }
+
+        // Serialize transactions to base58
+        let encoded_txs: Vec<String> = transactions.iter()
+            .map(|tx| {
+                let serialized = bincode::serialize(tx).unwrap();
+                bs58::encode(serialized).into_string()
+            })
+            .collect();
+
+        // Construct JSON-RPC request
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [encoded_txs]
+        });
+
+        info!("🚀 Sending Jito Bundle with {} transactions...", transactions.len());
+
+        let response = self.http_client.post(JITO_BLOCK_ENGINE_URL)
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send Jito bundle request")?;
+
+        let response_json: serde_json::Value = response.json().await
+            .context("Failed to parse Jito bundle response")?;
+
+        if let Some(result) = response_json.get("result") {
+            let bundle_id = result.as_str().unwrap_or("unknown").to_string();
+            info!("✅ Jito Bundle sent! ID: {}", bundle_id);
+            Ok(bundle_id)
+        } else {
+            let error = response_json.get("error")
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "Unknown error".to_string());
+            Err(anyhow::anyhow!("Jito Bundle failed: {}", error))
+        }
+    }
+
+    /// Wait for Jito bundle confirmation with timeout
+    /// Polls getBundleStatuses endpoint every 500ms
+    pub async fn wait_for_bundle_confirmation(&self, bundle_id: &str, timeout_secs: u64) -> Result<BundleStatus> {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let poll_interval = std::time::Duration::from_millis(500);
+
+        info!("⏳ Waiting for bundle confirmation: {} (timeout: {}s)", bundle_id, timeout_secs);
+
+        while start.elapsed() < timeout {
+            match self.get_bundle_status(bundle_id).await {
+                Ok(status) => {
+                    match status {
+                        BundleStatus::Landed => {
+                            info!("✅ Bundle {} confirmed on-chain!", bundle_id);
+                            return Ok(status);
+                        }
+                        BundleStatus::Failed(ref reason) => {
+                            warn!("❌ Bundle {} failed: {}", bundle_id, reason);
+                            return Ok(status);
+                        }
+                        BundleStatus::Invalid(ref reason) => {
+                            warn!("❌ Bundle {} invalid: {}", bundle_id, reason);
+                            return Ok(status);
+                        }
+                        BundleStatus::Pending | BundleStatus::NotFound => {
+                            // Continue polling
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get bundle status: {}", e);
+                    // Continue polling on transient errors
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        warn!("⏰ Bundle confirmation timeout after {}s: {}", timeout_secs, bundle_id);
+        Err(anyhow::anyhow!("Bundle confirmation timeout after {}s", timeout_secs))
+    }
+
+    /// Get current bundle status from Jito
+    async fn get_bundle_status(&self, bundle_id: &str) -> Result<BundleStatus> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBundleStatuses",
+            "params": [[bundle_id]]
+        });
+
+        let response = self.http_client.post(JITO_BLOCK_ENGINE_URL)
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to get bundle status")?;
+
+        let response_json: serde_json::Value = response.json().await
+            .context("Failed to parse bundle status response")?;
+
+        // Parse response: { "result": { "value": [{ "bundle_id": "...", "status": "Landed" | "Pending" | ... }] } }
+        if let Some(result) = response_json.get("result") {
+            if let Some(value) = result.get("value").and_then(|v| v.as_array()) {
+                if let Some(bundle_status) = value.first() {
+                    let status_str = bundle_status.get("confirmation_status")
+                        .or_else(|| bundle_status.get("status"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+
+                    return Ok(match status_str.to_lowercase().as_str() {
+                        "landed" | "confirmed" | "finalized" => BundleStatus::Landed,
+                        "pending" | "processed" => BundleStatus::Pending,
+                        "failed" => {
+                            let reason = bundle_status.get("err")
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "Unknown failure".to_string());
+                            BundleStatus::Failed(reason)
+                        }
+                        "invalid" => {
+                            let reason = bundle_status.get("err")
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "Invalid bundle".to_string());
+                            BundleStatus::Invalid(reason)
+                        }
+                        _ => BundleStatus::Pending,
+                    });
+                }
+            }
+        }
+
+        Ok(BundleStatus::NotFound)
+    }
+
+    /// Get token balance for a specific mint
+    pub async fn get_token_balance(&self, mint_str: &str) -> Result<u64> {
+        let mint = Pubkey::from_str(mint_str)?;
+        let owner = self.keypair.pubkey();
+        let ata = spl_associated_token_account::get_associated_token_address(&owner, &mint);
+        
+        let rpc = self.rpc_client.clone();
+        
+        let balance = tokio::task::spawn_blocking(move || {
+            rpc.get_token_account_balance(&ata)
+        }).await??;
+        
+        Ok(balance.amount.parse::<u64>()?)
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +412,23 @@ mod tests {
             max_concurrent_trades: 0,
             max_open_positions: 0,
             total_exposure_limit_sol: 0.0,
+            dip_strategy_enabled: false,
+            dip_entry_pct: 0.0,
+            min_volume_usd_5m: 0.0,
+            watchlist_timeout_seconds: 0,
+            volume_trend_enabled: false,
+            volume_samples_required: 0,
+            volume_sample_interval_secs: 0,
+            holder_stability_enabled: false,
+            min_holder_retention_pct: 0.0,
+            trailing_stop_enabled: false,
+            trailing_stop_distance_pct: 0.0,
+            partial_exit_enabled: false,
+            partial_exit_target_pct: 0.0,
+            partial_exit_amount_pct: 0.0,
+            dynamic_timeout_enabled: false,
+            timeout_extension_seconds: 0,
+            max_timeout_extensions: 0,
         }
     }
 

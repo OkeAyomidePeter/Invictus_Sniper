@@ -37,7 +37,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS tokens (
                 mint TEXT PRIMARY KEY,
                 decimals INTEGER,
-                supply INTEGER,
+                supply TEXT,
                 initial_liquidity_sol REAL,
                 score REAL,
                 platform TEXT,
@@ -55,7 +55,7 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 mint TEXT,
                 action TEXT,
-                amount_token INTEGER,
+                amount_token TEXT,
                 amount_sol INTEGER,
                 price_sol REAL,
                 signature TEXT,
@@ -65,12 +65,24 @@ impl Database {
                 exit_price REAL,
                 pnl_sol REAL,
                 sell_trigger TEXT,
+                exit_signature TEXT,
+                highest_price_reached REAL,
+                timeout_extensions INTEGER DEFAULT 0,
+                partial_exit_executed INTEGER DEFAULT 0,
+                remaining_amount_pct REAL DEFAULT 100.0,
                 FOREIGN KEY(mint) REFERENCES tokens(mint)
             );
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        // Run migrations for existing databases (add new columns if they don't exist)
+        // SQLite doesn't support IF NOT EXISTS for columns, so we ignore errors
+        let _ = sqlx::query("ALTER TABLE trades ADD COLUMN partial_exit_executed INTEGER DEFAULT 0")
+            .execute(&self.pool).await;
+        let _ = sqlx::query("ALTER TABLE trades ADD COLUMN remaining_amount_pct REAL DEFAULT 100.0")
+            .execute(&self.pool).await;
 
         info!("✅ Database schema initialized");
         Ok(())
@@ -85,7 +97,7 @@ impl Database {
         )
         .bind(&token.mint)
         .bind(token.decimals as i64)
-        .bind(token.supply.map(|s| s as i64))
+        .bind(token.supply.map(|s| s.to_string()))
         .bind(token.initial_liquidity_sol)
         .bind(score)
         .bind(format!("{:?}", token.platform))
@@ -120,7 +132,7 @@ impl Database {
         )
         .bind(mint)
         .bind(action)
-        .bind(amount_token as i64)
+        .bind(amount_token.to_string())
         .bind(amount_sol as i64)
         .bind(price_sol)
         .bind(signature)
@@ -134,6 +146,42 @@ impl Database {
         Ok(())
     }
 
+    /// Update position snapshot (highest price, extensions)
+    pub async fn update_position_snapshot(
+        &self,
+        mint: &str,
+        highest_price: f64,
+        timeout_extensions: u32,
+    ) -> Result<()> {
+        let trade_id: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT id FROM trades 
+            WHERE mint = ? AND action = 'BUY' AND exit_price IS NULL 
+            ORDER BY timestamp DESC LIMIT 1
+            "#
+        )
+        .bind(mint)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((id,)) = trade_id {
+            sqlx::query(
+                r#"
+                UPDATE trades 
+                SET highest_price_reached = ?, timeout_extensions = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(highest_price)
+            .bind(timeout_extensions)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
     /// Update a trade with exit information (for SELL orders)
     pub async fn update_trade_exit(
         &self,
@@ -141,6 +189,7 @@ impl Database {
         exit_price: f64,
         pnl_sol: f64,
         sell_trigger: &str, // "PROFIT_TARGET", "STOP_LOSS", "TIMEOUT", "MANUAL"
+        exit_signature: &str,
     ) -> Result<()> {
         // Find the most recent BUY trade for this mint that hasn't been closed
         let trade_id: Option<(i64,)> = sqlx::query_as(
@@ -158,13 +207,14 @@ impl Database {
             sqlx::query(
                 r#"
                 UPDATE trades 
-                SET exit_price = ?, pnl_sol = ?, sell_trigger = ?
+                SET exit_price = ?, pnl_sol = ?, sell_trigger = ?, exit_signature = ?
                 WHERE id = ?
                 "#,
             )
             .bind(exit_price)
             .bind(pnl_sol)
             .bind(sell_trigger)
+            .bind(exit_signature)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -180,7 +230,7 @@ impl Database {
     /// Get the most recent BUY trade for a mint (for entry price lookup)
     pub async fn get_trade_by_mint(&self, mint: &str) -> Result<Option<(f64, u64)>> {
         // Returns (entry_price, amount_token)
-        let row: Option<(f64, i64)> = sqlx::query_as(
+        let row: Option<(f64, String)> = sqlx::query_as(
             r#"
             SELECT entry_price, amount_token FROM trades 
             WHERE mint = ? AND action = 'BUY' 
@@ -191,7 +241,10 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|(price, amt)| (price, amt as u64)))
+        Ok(row.map(|(price, amt_str)| {
+            let amt = amt_str.parse::<u64>().unwrap_or(0);
+            (price, amt)
+        }))
     }
 
     // ========== STATS QUERIES ==========
@@ -233,9 +286,9 @@ impl Database {
     }
 
     /// Get all active positions (BUY trades without exit_price)
-    pub async fn get_active_positions(&self) -> Result<Vec<(String, f64, i64, i64)>> {
+    pub async fn get_active_positions(&self) -> Result<Vec<(String, f64, u64, i64)>> {
         // Returns (mint, entry_price, amount_token, timestamp)
-        let rows: Vec<(String, f64, i64, i64)> = sqlx::query_as(
+        let rows: Vec<(String, f64, String, i64)> = sqlx::query_as(
             r#"
             SELECT mint, entry_price, amount_token, timestamp 
             FROM trades 
@@ -245,7 +298,87 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+        
+        // Convert string amount back to u64
+        let result = rows.into_iter().map(|(mint, price, amt_str, ts)| {
+            let amt = amt_str.parse::<u64>().unwrap_or(0);
+            (mint, price, amt, ts)
+        }).collect();
+        
+        Ok(result)
+    }
+
+    /// Get full active positions with state for restoration
+    /// Returns (mint, entry_price, amount_token, timestamp, highest_price, extensions, amount_sol, partial_exit_executed, remaining_amount_pct)
+    pub async fn get_open_positions_state(&self) -> Result<Vec<(String, f64, u64, i64, f64, u32, u64, bool, f64)>> {
+        let rows: Vec<(String, f64, String, i64, Option<f64>, Option<i32>, i64, Option<i32>, Option<f64>)> = sqlx::query_as(
+            r#"
+            SELECT mint, entry_price, amount_token, timestamp, highest_price_reached, timeout_extensions, amount_sol, partial_exit_executed, remaining_amount_pct
+            FROM trades 
+            WHERE action = 'BUY' AND exit_price IS NULL
+            ORDER BY timestamp DESC
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        
+        let result = rows.into_iter().map(|(mint, price, amt_str, ts, high, ext, sol, partial_exit, remaining)| {
+            let amt = amt_str.parse::<u64>().unwrap_or(0);
+            (
+                mint, 
+                price, 
+                amt, 
+                ts, 
+                high.unwrap_or(price), 
+                ext.unwrap_or(0) as u32,
+                sol as u64,
+                partial_exit.unwrap_or(0) != 0,  // Convert to bool
+                remaining.unwrap_or(100.0)
+            )
+        }).collect();
+        
+        Ok(result)
+    }
+
+    /// Update position partial exit state
+    pub async fn update_position_partial_exit(
+        &self,
+        mint: &str,
+        partial_exit_executed: bool,
+        remaining_amount_pct: f64,
+    ) -> Result<()> {
+        let trade_id: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT id FROM trades 
+            WHERE mint = ? AND action = 'BUY' AND exit_price IS NULL 
+            ORDER BY timestamp DESC LIMIT 1
+            "#
+        )
+        .bind(mint)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((id,)) = trade_id {
+            sqlx::query(
+                r#"
+                UPDATE trades 
+                SET partial_exit_executed = ?, remaining_amount_pct = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(if partial_exit_executed { 1 } else { 0 })
+            .bind(remaining_amount_pct)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+            info!("💾 Position partial exit state updated for {}: executed={}, remaining={:.1}%", 
+                mint, partial_exit_executed, remaining_amount_pct);
+        } else {
+            warn!("No open BUY trade found for {} to update partial exit state", mint);
+        }
+
+        Ok(())
     }
 
     /// Get detailed trade statistics including P/L

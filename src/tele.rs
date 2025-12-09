@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::db::Database;
+use crate::retry::{retry_with_backoff, RetryConfig, is_network_error};
 use crate::wallet_monitor::WalletMonitor;
-use log::{info, warn};
+use log::{info, warn, error};
 use std::sync::Arc;
 use teloxide::{
     dispatching::UpdateHandler,
@@ -100,6 +101,34 @@ impl TelegramInterface {
 
     pub async fn run(self) {
         info!("🤖 Starting Telegram Bot...");
+
+        // Verify connection with retry logic
+        let bot_clone = self.bot.clone();
+        let verify_conn = || async {
+            bot_clone.get_me().send().await.map_err(|e| anyhow::anyhow!(e))
+        };
+
+        let retry_config = RetryConfig {
+            max_attempts: 5,
+            initial_delay_ms: 1000,
+            max_delay_ms: 10000,
+            backoff_multiplier: 2.0,
+        };
+
+        match retry_with_backoff(
+            "Telegram Connection",
+            verify_conn,
+            &retry_config,
+            is_network_error
+        ).await {
+            Ok(me) => info!("✅ Connected to Telegram as @{}", me.username.clone().unwrap_or_default()),
+            Err(e) => {
+                error!("❌ Failed to connect to Telegram after retries: {}", e);
+                // Continue anyway? Or return? 
+                // If we can't connect, the dispatcher might fail too. 
+                // But let's try to run dispatcher anyway as it might recover.
+            }
+        }
 
         let command_handler = Update::filter_message()
             .filter_command::<Command>()

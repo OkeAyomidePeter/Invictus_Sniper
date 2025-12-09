@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use log::{error, info, warn};
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -12,12 +12,11 @@ const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 #[derive(Debug, Clone)]
 pub enum WalletAlert {
     LowBalance { current_sol: f64, threshold_sol: f64 },
-    InsufficientForTrade { required_sol: f64, available_sol: f64 },
 }
 
 /// Monitors wallet SOL balance and sends alerts
 pub struct WalletMonitor {
-    rpc_url: String,
+    rpc_client: Arc<RpcClient>,
     pubkey: Pubkey,
     low_balance_threshold_lamports: u64,
     reserve_for_fees_lamports: u64,
@@ -33,7 +32,7 @@ impl WalletMonitor {
         check_interval_secs: u64,
     ) -> Self {
         Self {
-            rpc_url,
+            rpc_client: Arc::new(RpcClient::new(rpc_url)),
             pubkey,
             low_balance_threshold_lamports: (low_balance_threshold_sol * LAMPORTS_PER_SOL as f64) as u64,
             reserve_for_fees_lamports: (reserve_for_fees_sol * LAMPORTS_PER_SOL as f64) as u64,
@@ -95,15 +94,10 @@ impl WalletMonitor {
 
     /// Get current SOL balance
     pub async fn get_balance(&self) -> Result<u64> {
-        let client = RpcClient::new(self.rpc_url.clone());
-        let pubkey = self.pubkey;
-        let balance = tokio::task::spawn_blocking(move || {
-            client.get_balance(&pubkey)
-        })
-        .await?
-        .context("Failed to get wallet balance")?;
-        
-        Ok(balance)
+        self.rpc_client
+            .get_balance(&self.pubkey)
+            .await
+            .context("Failed to get wallet balance")
     }
 
     /// Check if wallet has sufficient balance for a trade
