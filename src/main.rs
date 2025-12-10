@@ -18,7 +18,7 @@ mod health;
 
 use trade_logger::{
     log_startup, log_shutdown, log_discovery, log_buy, log_buy_failed,
-    log_watchlist_add, log_error, log_risk_rejected
+    log_watchlist_add, log_error, log_risk_rejected, log_token_rejected
 };
 use trade_engine::TradeEngine;
 
@@ -217,6 +217,7 @@ async fn main() -> Result<()> {
                     if active_positions.len() >= config.max_open_positions {
                         warn!("⚠️ Skipping BUY for {}: Max open positions reached ({}/{})", 
                             enriched_token.mint, active_positions.len(), config.max_open_positions);
+                        log_risk_rejected(&enriched_token.mint, "Max open positions reached");
                         continue;
                     }
 
@@ -225,12 +226,14 @@ async fn main() -> Result<()> {
                     if current_exposure + config.max_trade_size_sol > config.total_exposure_limit_sol {
                         warn!("⚠️ Skipping BUY for {}: Total exposure limit reached ({:.2}/{:.2} SOL)", 
                             enriched_token.mint, current_exposure, config.total_exposure_limit_sol);
+                        log_risk_rejected(&enriched_token.mint, "Total exposure limit reached");
                         continue;
                     }
 
                     // RISK CHECK: Duplicate Token Protection
                     if active_positions.iter().any(|p| p.mint == enriched_token.mint) {
                         warn!("⚠️ Skipping BUY for {}: Already have active position in this token", enriched_token.mint);
+                        log_risk_rejected(&enriched_token.mint, "Already have active position");
                         continue;
                     }
 
@@ -256,6 +259,7 @@ async fn main() -> Result<()> {
                     watchlist.add_token(enriched_token).await;
                 } else {
                     info!("💤 Low Score {:.1} - Ignoring: {}", score, enriched_token.mint);
+                    log_token_rejected(&enriched_token.mint, score, "Score below threshold");
                 }
             }
             Some(buy_signal) = buy_rx.recv() => {

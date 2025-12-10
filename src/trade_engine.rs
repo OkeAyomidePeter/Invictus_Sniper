@@ -45,6 +45,7 @@ impl TradeEngine {
     /// Execute a buy and start monitoring the position
     pub async fn execute_buy(&self, token: &EnrichedToken, amount_sol: f64, is_watchlist: bool) -> Result<()> {
         info!("🤖 TradeEngine: Initiating BUY for {} (Amount: {:.4} SOL)", token.mint, amount_sol);
+        log_buy_attempt(&token.mint, amount_sol, is_watchlist);
 
         let amount_lamports = (amount_sol * 1_000_000_000.0) as u64;
         let slippage_bps = 200; // Default 2%
@@ -153,6 +154,7 @@ impl TradeEngine {
         let bundle_id = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
         
         info!("🚀 Sell Bundle Sent! ID: {}", bundle_id);
+        log_bundle_sent(&bundle_id, 2);
         Ok(bundle_id)
     }
 
@@ -259,13 +261,23 @@ impl TradeEngine {
                             signal.current_price_sol_per_token,
                             pnl_sol,
                             &signal.trigger.to_string(),
-                            &bundle_id
+                            &bundle_id.clone()
                         ).await {
                             error!("Failed to record trade exit: {}", e);
                         }
+                        
+                        // Log successful sell
+                        log_sell(
+                            &signal.position.mint, 
+                            pnl_sol, 
+                            signal.pnl_percentage, 
+                            &signal.trigger.to_string(), 
+                            &bundle_id
+                        );
                     },
                     Err(e) => {
                         error!("❌ Failed to execute SELL for {}: {}", signal.position.mint, e);
+                        log_sell_failed(&signal.position.mint, &signal.trigger.to_string(), &e.to_string());
                     }
                 }
                 
@@ -320,13 +332,23 @@ impl TradeEngine {
                                 signal.current_price_sol_per_token,
                                 pnl_sol, 
                                 &signal.trigger.to_string(),
-                                &bundle_id
+                                &bundle_id.clone()
                             ).await {
                                 error!("Failed to record trade exit: {}", e);
                             }
+
+                            // Log successful sell (Resumed)
+                            log_sell(
+                                &signal.position.mint, 
+                                pnl_sol, 
+                                0.0, // P/L pct unknown for resumed positions without entry price tracking
+                                &signal.trigger.to_string(), 
+                                &bundle_id
+                            );
                         },
                         Err(e) => {
                              error!("❌ Failed to execute SELL (Resumed) for {}: {}", signal.position.mint, e);
+                             log_sell_failed(&signal.position.mint, &signal.trigger.to_string(), &e.to_string());
                         }
                     }
 

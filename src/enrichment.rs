@@ -11,6 +11,7 @@ use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::collections::HashMap;
+use crate::trade_logger::TradeLogger;
 
 // ========== NEW STRUCTS ==========
 
@@ -216,7 +217,7 @@ async fn enrichment_loop(
             ClassifiedEvent::PoolCreation(pool_event) => {
                 info!("🔍 Enriching token: {}", pool_event.token_mint);
                 
-                match enrich_token(&client, &api_key, pool_event).await {
+                match enrich_token(&client, &api_key, pool_event.clone()).await {
                     Ok(enriched) => {
                         let duration = start_time.elapsed().as_millis();
                         info!("✅ Enrichment complete: {} (took {}ms)", enriched.mint, duration);
@@ -229,6 +230,13 @@ async fn enrichment_loop(
                             enriched.has_mint_authority
                         );
                         
+                        TradeLogger::log(&format!(
+                            "✨ ENRICHMENT SUCCESS: {} | Liq: {:.2} SOL | Platform: {:?}",
+                            enriched.mint,
+                            enriched.initial_liquidity_sol.unwrap_or(0.0),
+                            enriched.platform
+                        ));
+                        
                         if enriched_tx.send(enriched).await.is_err() {
                             warn!("Failed to send enriched token (receiver dropped)");
                             break;
@@ -236,6 +244,7 @@ async fn enrichment_loop(
                     }
                     Err(e) => {
                         error!("Failed to enrich token: {}", e);
+                        TradeLogger::log(&format!("❌ ENRICHMENT FAILED: {} | Error: {}", pool_event.token_mint, e));
                         // Don't stop the pipeline - continue processing
                     }
                 }
@@ -258,6 +267,7 @@ async fn enrich_token(
     // but this is a safety net
     if is_well_known_token(&pool_event.token_mint) {
         warn!("🚫 BLOCKED: Attempted to enrich well-known token: {}", pool_event.token_mint);
+        TradeLogger::log(&format!("🚫 BLOCKED: Well-known token {} rejected", pool_event.token_mint));
         return Err(anyhow::anyhow!("Cannot enrich well-known token: {}", pool_event.token_mint));
     }
 

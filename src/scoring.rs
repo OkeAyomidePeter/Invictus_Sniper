@@ -1,5 +1,6 @@
 use crate::enrichment::EnrichedToken;
 use log::{info, warn};
+use crate::trade_logger::TradeLogger;
 
 /// Scorer for enriched tokens
 /// GRADUATED TOKENS ONLY (Pump.fun/Bonk.fun)
@@ -44,12 +45,14 @@ impl TokenScorer {
         // FREEZE AUTHORITY: Instant Fail
         if token.has_freeze_authority {
             warn!("💀 SCORING: {} has freeze authority -> SCORE 0", token.mint);
+            TradeLogger::log(&format!("💀 SCORING REJECTED: {} has freeze authority", token.mint));
             return 0.0;
         }
 
         // MINT AUTHORITY: Instant Fail
         if token.has_mint_authority {
             warn!("💀 SCORING: {} has mint authority -> SCORE 0", token.mint);
+            TradeLogger::log(&format!("💀 SCORING REJECTED: {} has mint authority", token.mint));
             return 0.0;
         }
 
@@ -154,6 +157,11 @@ impl TokenScorer {
             score, 
             token.initial_liquidity_sol.unwrap_or(0.0)
         );
+
+        TradeLogger::log(&format!(
+            "📊 SCORE: {} -> {:.1}/100 | Liq: {:.1} SOL", 
+            token.mint, score, token.initial_liquidity_sol.unwrap_or(0.0)
+        ));
 
         score
     }

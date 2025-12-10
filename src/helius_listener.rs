@@ -12,6 +12,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use std::sync::Arc;
 use crate::rate_limiter::RateLimiter;
 use reqwest::Client;
+use crate::trade_logger::TradeLogger;
 
 /// Raw transaction event from Helius
 #[derive(Debug, Clone)]
@@ -522,12 +523,14 @@ async fn process_event_batch(
         if let Some(pool_event) = detect_pool_creation_event(&event) {
             // Log graduated tokens prominently
             if pool_event.is_graduated {
-                info!(
+                let log_msg = format!(
                     "🎓 GRADUATED TOKEN DETECTED: {} (platform: {:?}, dex: {})",
                     pool_event.token_mint,
                     pool_event.token_platform,
                     pool_event.dex
                 );
+                info!("{}", log_msg);
+                TradeLogger::log(&log_msg);
             }
 
             info!("🏊 POOL CREATION: {:#?}", pool_event);
@@ -604,14 +607,6 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     // Detect DEX
     let dex = detect_dex_from_logs(logs_array)?;
 
-    // ========== CRITICAL FIX: IGNORE PUMP.FUN BONDING CURVE EVENTS ==========
-    // We only want GRADUATED tokens that have moved to Raydium or PumpSwap.
-    // "Pump.fun" DEX means it's still on the bonding curve (fresh mint).
-    if dex == "Pump.fun" {
-        // Optional: Log at debug level if needed, but for now silent rejection or warn
-        // warn!("🚫 REJECTED: Token {} is still on Pump.fun bonding curve (not graduated)", token_mint);
-        return None;
-    }
 
     // ========== GRADUATION VERIFICATION (BONK.FUN & LAUNCHLAB) ==========
     // Ensure these tokens are actually on a valid AMM (Raydium or PumpSwap)
@@ -688,9 +683,6 @@ fn detect_token_platform(
             }
             
             // Check for other program IDs
-            if log_str.contains(PUMP_FUN_PROGRAM_ID) {
-                return TokenPlatform::PumpFun;
-            }
             if log_str.contains(BONK_FUN_PROGRAM_ID) {
                 return TokenPlatform::BonkFun;
             }
@@ -714,26 +706,30 @@ fn detect_token_platform(
 
 /// Detect DEX from logs (RAYDIUM ONLY - where graduated tokens migrate)
 fn detect_dex_from_logs(logs: &[serde_json::Value]) -> Option<String> {
+    let mut found_dex = None;
+
     for log in logs {
         if let Some(log_str) = log.as_str() {
+            // Priority 1: Raydium AMM v4 (Most common for graduated tokens)
             if log_str.contains(RAYDIUM_AMM_V4_PROGRAM_ID) {
                 return Some("Raydium AMM v4".to_string());
             }
+            // Priority 2: Raydium CPMM
             if log_str.contains(RAYDIUM_CPMM_PROGRAM_ID) {
                 return Some("Raydium CPMM".to_string());
             }
-            if log_str.contains(PUMP_FUN_PROGRAM_ID) {
-                return Some("Pump.fun".to_string()); 
-            }
-            if log_str.contains(RAYDIUM_LAUNCHLAB_PROGRAM_ID) {
-                return Some("Raydium LaunchLab".to_string());
-            }
+            // Priority 3: PumpSwap (Pump.fun AMM)
             if log_str.contains(PUMP_FUN_AMM_PROGRAM_ID) {
                 return Some("PumpSwap".to_string());
             }
+            // Priority 4: Raydium LaunchLab
+            if log_str.contains(RAYDIUM_LAUNCHLAB_PROGRAM_ID) {
+                found_dex = Some("Raydium LaunchLab".to_string());
+            }
         }
     }
-    Some("Unknown DEX".to_string())
+    
+    found_dex.or_else(|| Some("Unknown DEX".to_string()))
 }
 
 /// Extract pool address
@@ -941,7 +937,7 @@ fn is_valid_new_token_pair(token_a: &str, token_b: &str) -> bool {
     }
 
     // Determine which is the new token and which is the pair
-    let (new_token, pair_token) = if token_a == WSOL_MINT || token_a == USDC_MINT || token_a == USDT_MINT {
+    let (new_token, _pair_token) = if token_a == WSOL_MINT || token_a == USDC_MINT || token_a == USDT_MINT {
         (token_b, token_a)
     } else {
         (token_a, token_b)
