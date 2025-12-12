@@ -432,6 +432,25 @@ fn assemble_enriched_token(
         enrichment_duration_ms: start_time.elapsed().as_millis(),
     };
 
+    // LOGGING: Detailed enrichment data
+    let top_10_pct = enriched.holders.as_ref().map(|h| h.top_10_pct).unwrap_or(0.0);
+    let unique_holders = enriched.holders.as_ref().and_then(|h| h.unique_holders);
+    let socials_count = enriched.metadata.as_ref().and_then(|m| m.socials.as_ref()).map(|s| {
+        let mut count = 0;
+        if s.twitter.is_some() { count += 1; }
+        if s.telegram.is_some() { count += 1; }
+        if s.website.is_some() { count += 1; }
+        count
+    }).unwrap_or(0);
+
+    TradeLogger::log_enrichment_data(
+        &enriched.mint,
+        enriched.initial_liquidity_sol.unwrap_or(0.0),
+        top_10_pct,
+        unique_holders,
+        socials_count
+    );
+
     Ok(enriched)
 }
 

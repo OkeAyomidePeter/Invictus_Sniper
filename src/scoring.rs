@@ -81,13 +81,14 @@ impl TokenScorer {
         if score > 70.0 {
             score = 70.0;
         }
+        let liquidity_score = score;
 
         // =====================================================================
         // 3. METADATA SCORING (Max 20 points)
         // =====================================================================
+        let mut social_score = 0.0;
         if let Some(metadata) = &token.metadata {
             if let Some(socials) = &metadata.socials {
-                let mut social_score = 0.0;
                 if socials.twitter.is_some() { social_score += 10.0; }
                 if socials.telegram.is_some() { social_score += 5.0; }
                 if socials.website.is_some() { social_score += 5.0; }
@@ -100,34 +101,36 @@ impl TokenScorer {
         // =====================================================================
         // 4. HOLDER SCORING (Max 10 points + Penalties)
         // =====================================================================
+        let mut holder_score = 0.0;
         if let Some(holders) = &token.holders {
             // Penalty: Top 1 holder > 30% (excluding pool)
             if holders.top_1_pct > HOLDER_TOP_1_PENALTY_THRESHOLD {
-                score -= SCORE_PENALTY_TOP_1; // Huge penalty for whale dominance
+                holder_score -= SCORE_PENALTY_TOP_1; // Huge penalty for whale dominance
                 warn!("    - PENALTY: Top 1 holder owns {:.1}%", holders.top_1_pct);
             }
             
             // Penalty: Top 10 holders > 70%
             if holders.top_10_pct > HOLDER_TOP_10_PENALTY_THRESHOLD {
-                score -= SCORE_PENALTY_TOP_10;
+                holder_score -= SCORE_PENALTY_TOP_10;
                 warn!("    - PENALTY: Top 10 holders own {:.1}%", holders.top_10_pct);
             }
 
             // Bonus: Good distribution (Top 1 < 10%)
             if holders.top_1_pct < HOLDER_TOP_1_BONUS_THRESHOLD {
-                score += SCORE_BONUS_TOP_1;
+                holder_score += SCORE_BONUS_TOP_1;
             }
 
             // NEW: Unique Holder Count
             if let Some(unique) = holders.unique_holders {
                 if unique > UNIQUE_HOLDERS_HIGH {
-                    score += SCORE_BONUS_UNIQUE_HIGH; // Healthy community
+                    holder_score += SCORE_BONUS_UNIQUE_HIGH; // Healthy community
                     info!("    + Community: {} unique holders", unique);
                 } else if unique < UNIQUE_HOLDERS_LOW {
-                    score -= SCORE_PENALTY_UNIQUE_LOW; // Ghost town / Dev wallet farm
+                    holder_score -= SCORE_PENALTY_UNIQUE_LOW; // Ghost town / Dev wallet farm
                     warn!("    - PENALTY: Only {} unique holders", unique);
                 }
             }
+            score += holder_score;
         }
 
         // =====================================================================
@@ -158,10 +161,13 @@ impl TokenScorer {
             token.initial_liquidity_sol.unwrap_or(0.0)
         );
 
-        TradeLogger::log(&format!(
-            "📊 SCORE: {} -> {:.1}/100 | Liq: {:.1} SOL", 
-            token.mint, score, token.initial_liquidity_sol.unwrap_or(0.0)
-        ));
+        TradeLogger::log_scoring_breakdown(
+            &token.mint,
+            liquidity_score,
+            holder_score,
+            social_score,
+            score
+        );
 
         score
     }

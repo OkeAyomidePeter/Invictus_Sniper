@@ -41,6 +41,35 @@ impl TradeLogger {
         writeln!(file, "[{}] {}", timestamp, message)?;
         Ok(())
     }
+
+    /// Log detailed enrichment data
+    pub fn log_enrichment_data(
+        mint: &str, 
+        liquidity_sol: f64, 
+        top_10_pct: f64, 
+        unique_holders: Option<u64>, 
+        socials_count: usize
+    ) {
+        let holders_str = unique_holders.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string());
+        TradeLogger::log(&format!(
+            "🔍 ENRICHMENT: {} | Liq: {:.2} SOL | Top10: {:.1}% | Holders: {} | Socials: {}", 
+            &mint[..12.min(mint.len())], liquidity_sol, top_10_pct, holders_str, socials_count
+        ));
+    }
+
+    /// Log scoring breakdown
+    pub fn log_scoring_breakdown(
+        mint: &str, 
+        liquidity_score: f64, 
+        holder_score: f64, 
+        social_score: f64, 
+        final_score: f64
+    ) {
+        TradeLogger::log(&format!(
+            "🧮 SCORING: {} | Liq: {:.1} | Holders: {:.1} | Socials: {:.1} -> Final: {:.1}", 
+            &mint[..12.min(mint.len())], liquidity_score, holder_score, social_score, final_score
+        ));
+    }
 }
 
 // ============================================================================
@@ -103,6 +132,8 @@ pub fn log_token_rejected(mint: &str, score: f64, reason: &str) {
         &mint[..12.min(mint.len())], score, reason
     ));
 }
+
+
 
 // ============================================================================
 // TRADE EXECUTION
