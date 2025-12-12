@@ -154,6 +154,10 @@ impl Watchlist {
                                     info!("🚀 DIP BUY TRIGGERED: {} | Price: {:.9} | Vol: ${:.0}", 
                                         token.mint, price_sol, volume_5m);
                                     
+                                    // LOGGING: Dip Trigger
+                                    let dip_pct = (token.graduation_price - price_sol) / token.graduation_price * 100.0;
+                                    crate::trade_logger::log_dip_trigger(&token.mint, dip_pct, volume_5m);
+
                                     // Send Buy Signal
                                     let signal = BuySignal {
                                         token: token.initial_data.clone(),
@@ -175,6 +179,7 @@ impl Watchlist {
                                     } else {
                                         warn!("📉 Dip hit for {} but volume validation failed (Vol: ${:.0})", 
                                             token.mint, volume_5m);
+                                        crate::trade_logger::log_token_rejected(&token.mint, 0.0, "Dip hit but volume too low");
                                     }
                                 }
                             }

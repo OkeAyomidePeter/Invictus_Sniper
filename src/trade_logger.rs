@@ -72,6 +72,23 @@ impl TradeLogger {
     }
 }
 
+/// Log a specific step in the trade pipeline with timing
+pub fn log_pipeline_step(mint: &str, step: &str, duration_ms: u128, success: bool) {
+    let emoji = if success { "✅" } else { "❌" };
+    TradeLogger::log(&format!(
+        "⏱️ STEP: {} | {} | {}ms | {}", 
+        &mint[..12.min(mint.len())], step, duration_ms, emoji
+    ));
+}
+
+/// Log a detailed error for a specific pipeline step
+pub fn log_error_detailed(mint: &str, step: &str, error: &str) {
+    TradeLogger::log(&format!(
+        "❌ ERROR: {} | Step: {} | Reason: {}", 
+        &mint[..12.min(mint.len())], step, error
+    ));
+}
+
 // ============================================================================
 // STARTUP / SHUTDOWN
 // ============================================================================

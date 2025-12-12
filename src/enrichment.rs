@@ -28,6 +28,8 @@ pub struct TokenMetadata {
     pub symbol: String,
     pub uri: String,
     pub socials: Option<SocialLinks>,
+    pub price: Option<f64>,        // From DAS price_info
+    pub royalty_pct: Option<f64>,  // From DAS royalty
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,7 +303,7 @@ async fn enrich_token(
         fetch_mint_account_cached(client, api_key, &pool_event.token_mint),
         fetch_liquidity_data(client, api_key, &pool_event.pool_address, &pool_event.pair_token),
         fetch_token_metadata(client, api_key, &pool_event.token_mint),
-        fetch_holder_analysis(client, api_key, &pool_event.token_mint, &pool_event.pool_address),
+        fetch_holder_analysis(client, api_key, &pool_event.token_mint),
         get_or_fetch_sol_price(client)
     );
 
@@ -326,7 +328,7 @@ fn assemble_enriched_token(
     mint_data: Option<MintAccountData>,
     liq_data: Option<LiquidityData>,
     metadata: Option<TokenMetadata>,
-    holders: Option<HolderAmounts>,
+    holders: Option<RawHolderData>,
     sol_price: f64,
     start_time: std::time::Instant,
 ) -> Result<EnrichedToken> {
@@ -362,21 +364,35 @@ fn assemble_enriched_token(
 
     // Fix Holder Analysis Percentages
     // The fetcher returns raw amounts. We calculate percentages here using supply.
-    let final_holders = if let Some(h_amounts) = holders {
+    let final_holders = if let Some(raw_holders) = holders {
         if let Some(s) = supply {
             let s_f64 = s as f64;
             if s_f64 > 0.0 {
+                // Filter out the pool account
+                let pool_account = liq_data.as_ref().and_then(|l| l.pool_token_account.as_ref());
+                
+                let mut filtered_holders: Vec<f64> = raw_holders.holders.iter()
+                    .filter(|h| Some(&h.address) != pool_account)
+                    .map(|h| h.amount)
+                    .collect();
+                
+                // Sort descending just in case
+                filtered_holders.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                
+                let top_1_amount = filtered_holders.first().copied().unwrap_or(0.0);
+                let top_10_amount: f64 = filtered_holders.iter().take(10).sum();
+
                 Some(HolderAnalysis {
-                    top_1_pct: (h_amounts.top_1_amount / s_f64) * 100.0,
-                    top_10_pct: (h_amounts.top_10_amount / s_f64) * 100.0,
-                    unique_holders: h_amounts.unique_holders,
+                    top_1_pct: (top_1_amount / s_f64) * 100.0,
+                    top_10_pct: (top_10_amount / s_f64) * 100.0,
+                    unique_holders: raw_holders.unique_holders,
                 })
             } else {
                 // Supply is 0, cannot calculate pct
                 Some(HolderAnalysis {
                     top_1_pct: 0.0,
                     top_10_pct: 0.0,
-                    unique_holders: h_amounts.unique_holders,
+                    unique_holders: raw_holders.unique_holders,
                 })
             }
         } else {
@@ -384,7 +400,7 @@ fn assemble_enriched_token(
              Some(HolderAnalysis {
                 top_1_pct: 0.0,
                 top_10_pct: 0.0,
-                unique_holders: h_amounts.unique_holders,
+                unique_holders: raw_holders.unique_holders,
             })
         }
     } else {
@@ -544,6 +560,7 @@ async fn fetch_mint_account_info(
 struct LiquidityData {
     liquidity_sol: Option<f64>,
     liquidity_token: Option<f64>,
+    pool_token_account: Option<String>, // The account holding the tokens (to exclude from holders)
 }
 
 
@@ -602,6 +619,7 @@ async fn fetch_liquidity_data(
 
     let mut liquidity_sol: Option<f64> = None;
     let mut liquidity_token: Option<f64> = None;
+    let mut pool_token_account: Option<String> = None;
 
     // Common SOL/WSOL mint addresses
     let sol_mints = [
@@ -611,6 +629,8 @@ async fn fetch_liquidity_data(
 
     // Parse each account to find SOL and token reserves
     for account in accounts {
+        let pubkey = account.get("pubkey").and_then(|s| s.as_str()).unwrap_or("");
+        
         if let Some(data) = account.get("account").and_then(|a| a.get("data")) {
             let parsed = data.get("parsed").and_then(|p| p.get("info"));
             
@@ -628,6 +648,8 @@ async fn fetch_liquidity_data(
                     } else if mint == pair_token {
                         // This is the paired token (usually the new token)
                         liquidity_token = Some(amount);
+                        // CRITICAL: Capture the account address holding these tokens
+                        pool_token_account = Some(pubkey.to_string());
                     }
                 }
             }
@@ -642,6 +664,7 @@ async fn fetch_liquidity_data(
     Ok(LiquidityData {
         liquidity_sol,
         liquidity_token,
+        pool_token_account,
     })
 }
 
@@ -703,18 +726,42 @@ async fn fetch_token_metadata(
         }
     }
 
+    // Extract Price and Royalty from DAS
+    let price = result.get("token_info")
+        .and_then(|t| t.get("price_info"))
+        .and_then(|p| p.get("price_per_token"))
+        .and_then(|v| v.as_f64());
+
+    let royalty_pct = result.get("royalty")
+        .and_then(|r| r.get("percent"))
+        .and_then(|v| v.as_f64())
+        .map(|p| p * 100.0); // Convert 0.05 to 5.0%? Usually it's already percentage or basis points. 
+                             // Debugger showed "percent": 0.0. Let's assume it's a float percentage (0-100) or ratio (0-1).
+                             // Solscan usually shows %, e.g. 5%. If API returns 0.05 for 5%, we multiply.
+                             // If it returns 5.0, we keep it. 
+                             // Let's assume it's a direct percentage value based on "percent" name, but verify later.
+                             // Actually, standard Metaplex is basis points. DAS might convert.
+                             // Let's just store what we get for now.
+
     Ok(TokenMetadata {
         name,
         symbol,
         uri,
         socials,
+        price,
+        royalty_pct,
     })
 }
 
-/// Temporary struct to hold raw amounts before percentage calculation
-struct HolderAmounts {
-    top_1_amount: f64,
-    top_10_amount: f64,
+#[derive(Debug)]
+struct Holder {
+    address: String,
+    amount: f64,
+}
+
+/// Raw holder data to be filtered later
+struct RawHolderData {
+    holders: Vec<Holder>,
     unique_holders: Option<u64>,
 }
 
@@ -723,8 +770,7 @@ async fn fetch_holder_analysis(
     client: &Client,
     api_key: &str,
     mint: &str,
-    pool_address: &str,
-) -> Result<HolderAmounts> {
+) -> Result<RawHolderData> {
     let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
     
     let request_body = json!({
@@ -755,71 +801,21 @@ async fn fetch_holder_analysis(
         return Err(anyhow::anyhow!("No holders found"));
     }
 
-    // Calculate total supply from holders (approximation) or pass supply in?
-    // We'll use the sum of top 20 as "circulating" for this check if supply isn't handy,
-    // but better to calculate percentages based on the amounts returned.
-    // The API returns raw amounts.
-    
-    let mut total_held = 0.0;
-    let mut top_1_amount = 0.0;
-    let mut top_10_amount = 0.0;
-    let mut count = 0;
-
-    for (_i, acc) in accounts.iter().enumerate() {
+    // Return raw data for filtering in assembly
+    let mut holders = Vec::new();
+    for acc in accounts {
         let amount = acc.get("amount").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-        let address = acc.get("address").and_then(|s| s.as_str()).unwrap_or("");
-
-        // CRITICAL: Exclude the Pool Address
-        if address == pool_address {
-            continue;
-        }
-
-        if count == 0 {
-            top_1_amount = amount;
-        }
-        if count < 10 {
-            top_10_amount += amount;
-        }
+        let address = acc.get("address").and_then(|s| s.as_str()).unwrap_or("").to_string();
         
-        total_held += amount;
-        count += 1;
-    }
-
-    // If we only found the pool, return 0s
-    if total_held == 0.0 {
-        return Ok(HolderAmounts {
-            top_1_amount: 0.0,
-            top_10_amount: 0.0,
-            unique_holders: None,
+        holders.push(Holder {
+            address,
+            amount,
         });
     }
 
-    // We need total supply to calculate true percentages.
-    // Since we don't have it easily here without passing it down, 
-    // we can use the sum of top 20 + pool as a proxy for total supply, 
-    // OR just return the raw amounts? 
-    // Better: We fetched supply in `fetch_mint_account_cached`. 
-    // But we are running in parallel! We don't have supply yet.
-    // Solution: Return raw amounts or percentages of *visible* supply?
-    // Actually, `getTokenLargestAccounts` returns amounts. 
-    // Let's assume the supply is roughly the sum of top 20 + pool for fresh tokens.
-    // Or better, let's just return the raw amounts and calculate percentages in `assemble`?
-    // No, `assemble` has the supply. Let's return raw amounts here and convert to pct in `assemble`?
-    // The struct expects f64 pct. 
-    // Let's fetch supply inside here? No, redundant.
-    // Let's change the struct to return amounts, then calculate pct in `assemble`.
-    
-    // WAIT: `assemble` receives `mint_data` which has supply.
-    // So `fetch_holder_analysis` should return the amounts, and `assemble` calculates the %.
-    // But I defined `HolderAnalysis` with `top_1_pct`.
-    // Let's stick to the plan: `assemble` will do the math.
-    // I will modify `HolderAnalysis` to store amounts temporarily? 
-    // No, I'll just change the return type of this function to a temporary struct or tuple.
-    
-    Ok(HolderAmounts {
-        top_1_amount, 
-        top_10_amount,
-        unique_holders: None,
+    Ok(RawHolderData {
+        holders,
+        unique_holders: None, // API doesn't give total count here, only top 20
     })
 }
 

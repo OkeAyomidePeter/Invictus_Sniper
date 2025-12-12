@@ -201,14 +201,14 @@ async fn main() -> Result<()> {
                 let score = scorer.score(&enriched_token);
 
                 info!(
-                    "✨ ENRICHED: {} | Liq: ${} | Score: {:.1}/70",
+                    "✨ ENRICHED: {} | Liq: ${} | Score: {:.1}/120",
                     enriched_token.mint,
                     enriched_token.initial_liquidity_sol.unwrap_or(0.0),
                     score
                 );
                 
                 // Thresholds
-                let buy_threshold = 70.0;
+                let buy_threshold = 80.0;
                 let watchlist_threshold = 50.0;
 
                 if score >= buy_threshold {

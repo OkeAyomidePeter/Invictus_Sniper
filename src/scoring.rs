@@ -24,6 +24,14 @@ const SCORE_PENALTY_UNIQUE_LOW: f64 = 20.0;
 const MIN_MARKET_CAP: f64 = 50_000.0;
 const SCORE_PENALTY_LOW_MC: f64 = 10.0;
 
+const ROYALTY_MAX_THRESHOLD: f64 = 10.0;
+const SCORE_PENALTY_HIGH_ROYALTY: f64 = 10.0;
+
+const HOLDER_TOP_10_BONUS_THRESHOLD: f64 = 20.0;
+const SCORE_BONUS_TOP_10: f64 = 10.0;
+const UNIQUE_HOLDERS_CRITICAL_LOW: u64 = 10;
+const SCORE_PENALTY_UNIQUE_CRITICAL: f64 = 100.0; // Force fail
+
 #[derive(Debug, Clone)]
 pub struct TokenScorer;
 
@@ -84,10 +92,11 @@ impl TokenScorer {
         let liquidity_score = score;
 
         // =====================================================================
-        // 3. METADATA SCORING (Max 20 points)
+        // 3. METADATA & ROYALTY SCORING (Max 20 points - Penalties)
         // =====================================================================
         let mut social_score = 0.0;
         if let Some(metadata) = &token.metadata {
+            // Socials
             if let Some(socials) = &metadata.socials {
                 if socials.twitter.is_some() { social_score += 10.0; }
                 if socials.telegram.is_some() { social_score += 5.0; }
@@ -95,6 +104,14 @@ impl TokenScorer {
                 
                 score += social_score;
                 info!("    + Socials: {:.1} points", social_score);
+            }
+
+            // Royalty Check
+            if let Some(royalty) = metadata.royalty_pct {
+                if royalty > ROYALTY_MAX_THRESHOLD {
+                    score -= SCORE_PENALTY_HIGH_ROYALTY;
+                    warn!("    - PENALTY: High Royalty ({:.1}%)", royalty);
+                }
             }
         }
 
@@ -109,10 +126,16 @@ impl TokenScorer {
                 warn!("    - PENALTY: Top 1 holder owns {:.1}%", holders.top_1_pct);
             }
             
-            // Penalty: Top 10 holders > 70%
-            if holders.top_10_pct > HOLDER_TOP_10_PENALTY_THRESHOLD {
+            // Penalty: Top 10 holders > 50% (Stricter now)
+            if holders.top_10_pct > 50.0 {
                 holder_score -= SCORE_PENALTY_TOP_10;
                 warn!("    - PENALTY: Top 10 holders own {:.1}%", holders.top_10_pct);
+            }
+
+            // Bonus: Good distribution (Top 10 < 20%)
+            if holders.top_10_pct < HOLDER_TOP_10_BONUS_THRESHOLD {
+                holder_score += SCORE_BONUS_TOP_10;
+                info!("    + Good Distribution: Top 10 own only {:.1}%", holders.top_10_pct);
             }
 
             // Bonus: Good distribution (Top 1 < 10%)
@@ -125,6 +148,9 @@ impl TokenScorer {
                 if unique > UNIQUE_HOLDERS_HIGH {
                     holder_score += SCORE_BONUS_UNIQUE_HIGH; // Healthy community
                     info!("    + Community: {} unique holders", unique);
+                } else if unique < UNIQUE_HOLDERS_CRITICAL_LOW {
+                    holder_score -= SCORE_PENALTY_UNIQUE_CRITICAL; // Instant Fail
+                    warn!("    - CRITICAL: Only {} unique holders", unique);
                 } else if unique < UNIQUE_HOLDERS_LOW {
                     holder_score -= SCORE_PENALTY_UNIQUE_LOW; // Ghost town / Dev wallet farm
                     warn!("    - PENALTY: Only {} unique holders", unique);

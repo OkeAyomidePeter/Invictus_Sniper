@@ -6,7 +6,8 @@ use crate::presigner::{BundleStatus, Presigner};
 use crate::tx::{DexRouter, TransactionManager};
 use crate::trade_logger::{
     log_buy_attempt, log_buy, log_buy_failed, log_sell, log_sell_failed,
-    log_bundle_sent, log_bundle_confirmed, log_position_started
+    log_bundle_sent, log_bundle_confirmed, log_position_started,
+    log_pipeline_step, log_error_detailed
 };
 use anyhow::{Context, Result};
 use log::{error, info, warn};
@@ -47,54 +48,110 @@ impl TradeEngine {
         info!("🤖 TradeEngine: Initiating BUY for {} (Amount: {:.4} SOL)", token.mint, amount_sol);
         log_buy_attempt(&token.mint, amount_sol, is_watchlist);
 
+        let start_total = Instant::now();
         let amount_lamports = (amount_sol * 1_000_000_000.0) as u64;
         let slippage_bps = 200; // Default 2%
+        
+        // STEP 1: Calculate Tip
+        let start_step = Instant::now();
         let tip_lamports = self.tx_manager.calculate_tip(true); // High priority for buys
+        log_pipeline_step(&token.mint, "Calculate Tip", start_step.elapsed().as_millis(), true);
 
-        // 1. Build Buy Transaction (Versioned)
-        let mut buy_tx = self.tx_manager.build_buy_transaction(
+        // STEP 2: Build Buy Transaction
+        let start_step = Instant::now();
+        let mut buy_tx = match self.tx_manager.build_buy_transaction(
             &token.mint,
             amount_lamports,
             slippage_bps,
             DexRouter::Jupiter, // Default to Jupiter for now
             tip_lamports,
-        ).await?;
+        ).await {
+            Ok(tx) => {
+                log_pipeline_step(&token.mint, "Build Buy Tx", start_step.elapsed().as_millis(), true);
+                tx
+            },
+            Err(e) => {
+                log_pipeline_step(&token.mint, "Build Buy Tx", start_step.elapsed().as_millis(), false);
+                log_error_detailed(&token.mint, "Build Buy Tx", &e.to_string());
+                return Err(e);
+            }
+        };
 
-        // 2. Build Tip Transaction (Versioned)
+        // STEP 3: Build Tip Transaction
+        let start_step = Instant::now();
         let recent_blockhash = self.presigner.get_blockhash();
-        let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
+        let mut tip_tx = match self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash) {
+            Ok(tx) => {
+                log_pipeline_step(&token.mint, "Build Tip Tx", start_step.elapsed().as_millis(), true);
+                tx
+            },
+            Err(e) => {
+                log_pipeline_step(&token.mint, "Build Tip Tx", start_step.elapsed().as_millis(), false);
+                log_error_detailed(&token.mint, "Build Tip Tx", &e.to_string());
+                return Err(e);
+            }
+        };
 
-        // 3. Sign Transactions
+        // STEP 4: Sign Transactions
+        let start_step = Instant::now();
         // Update blockhash for buy tx to match tip tx (critical for bundles)
         buy_tx.message.set_recent_blockhash(recent_blockhash);
         
-        self.presigner.sign_versioned_tx(&mut buy_tx)?;
-        self.presigner.sign_versioned_tx(&mut tip_tx)?;
+        if let Err(e) = self.presigner.sign_versioned_tx(&mut buy_tx) {
+             log_pipeline_step(&token.mint, "Sign Buy Tx", start_step.elapsed().as_millis(), false);
+             log_error_detailed(&token.mint, "Sign Buy Tx", &e.to_string());
+             return Err(e);
+        }
+        if let Err(e) = self.presigner.sign_versioned_tx(&mut tip_tx) {
+             log_pipeline_step(&token.mint, "Sign Tip Tx", start_step.elapsed().as_millis(), false);
+             log_error_detailed(&token.mint, "Sign Tip Tx", &e.to_string());
+             return Err(e);
+        }
+        log_pipeline_step(&token.mint, "Sign Txs", start_step.elapsed().as_millis(), true);
 
-        // 4. Send Jito Bundle
-        let bundle_id = self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await?;
+        // STEP 5: Send Jito Bundle
+        let start_step = Instant::now();
+        let bundle_id = match self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await {
+            Ok(id) => {
+                log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), true);
+                id
+            },
+            Err(e) => {
+                log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), false);
+                log_error_detailed(&token.mint, "Send Bundle", &e.to_string());
+                return Err(e);
+            }
+        };
         
         info!("🚀 Buy Bundle Sent! ID: {}", bundle_id);
         log_bundle_sent(&bundle_id, 2);
 
-        // 5. Wait for Bundle Confirmation (with timeout)
+        // STEP 6: Wait for Bundle Confirmation
+        let start_step = Instant::now();
         let bundle_status = self.presigner.wait_for_bundle_confirmation(&bundle_id, 30).await?;
         
         if bundle_status.is_success() {
+            log_pipeline_step(&token.mint, "Confirm Bundle", start_step.elapsed().as_millis(), true);
             log_bundle_confirmed(&bundle_id, "Landed");
         } else {
+            log_pipeline_step(&token.mint, "Confirm Bundle", start_step.elapsed().as_millis(), false);
+            log_error_detailed(&token.mint, "Confirm Bundle", &format!("{:?}", bundle_status));
             log_bundle_confirmed(&bundle_id, &format!("{:?}", bundle_status));
             return Err(anyhow::anyhow!("Bundle failed to land: {:?}", bundle_status));
         }
 
-        // 6. Verify Position & Record to DB
+        // STEP 7: Verify Position & Record to DB
+        let start_step = Instant::now();
         // Fetch actual token balance - MUST succeed to confirm trade executed
         let token_amount = self.presigner.get_token_balance(&token.mint).await
             .context(format!("Failed to verify token balance after buy for {}. Transaction may have failed.", token.mint))?;
         
         if token_amount == 0 {
+            log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), false);
+            log_error_detailed(&token.mint, "Verify Balance", "Balance is 0 after confirmed bundle");
             return Err(anyhow::anyhow!("Token balance is 0 after confirmed bundle - transaction may have failed"));
         }
+        log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), true);
         
         // Record Trade
         self.db.record_trade(
@@ -109,6 +166,7 @@ impl TradeEngine {
 
         // Log successful buy
         log_buy(&token.mint, amount_sol, &bundle_id);
+        log_pipeline_step(&token.mint, "Total Buy Flow", start_total.elapsed().as_millis(), true);
 
         // 7. Start Monitoring (if auto-sell enabled)
         if self.config.auto_sell_enabled {
