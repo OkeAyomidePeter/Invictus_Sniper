@@ -11,6 +11,7 @@ pub struct Config {
     pub private_key: String,
     pub telegram_token: String,
     pub telegram_chat_id: String,
+    pub alternate_telegram_chat_id: Option<String>,
     pub database_url: String,
     pub min_liquidity_sol: f64,
     pub min_holders: u32,
@@ -82,6 +83,7 @@ impl Config {
             private_key: env::var("SOLANA_PRIVATE_KEY").expect("SOLANA_PRIVATE_KEY must be set"),
             telegram_token: env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set"),
             telegram_chat_id: env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID must be set"),
+            alternate_telegram_chat_id: env::var("ALTERNATE_TELEGRAM_CHAT_ID").ok().filter(|s| !s.is_empty()),
             database_url: env::var("DATABASE_URL").unwrap_or("sqlite://invictus.db".to_string()),
             min_liquidity_sol: env::var("MIN_LIQUIDITY_SOL")
                 .unwrap_or("10.0".to_string())

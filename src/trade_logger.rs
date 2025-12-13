@@ -93,7 +93,7 @@ pub fn log_error_detailed(mint: &str, step: &str, error: &str) {
 pub fn log_enrichment_debug(mint: &str, pool_address: &str, liquidity_sol: f64, attempt: u8) {
     TradeLogger::log(&format!(
         "🔎 DEBUG: {} | Pool: {} | Liq: {:.2} SOL | Attempt: {}", 
-        &mint[..12.min(mint.len())], &pool_address[..20.min(pool_address.len())], liquidity_sol, attempt
+        &mint[..12.min(mint.len())], pool_address, liquidity_sol, attempt
     ));
 }
 

@@ -16,7 +16,16 @@ use tokio::sync::mpsc::Sender;
 type ResponseResult<T> = Result<T, RequestError>;
 
 #[derive(Clone)]
-struct AllowedChatId(i64);
+struct AllowedChatId {
+    primary: i64,
+    alternate: Option<i64>,
+}
+
+impl AllowedChatId {
+    fn is_allowed(&self, chat_id: i64) -> bool {
+        self.primary == chat_id || self.alternate.map_or(false, |alt| alt == chat_id)
+    }
+}
 
 #[derive(BotCommands, Clone, Debug)]
 #[command(rename = "lowercase")]
@@ -33,6 +42,7 @@ pub struct TelegramInterface {
     db: Arc<Database>,
     shutdown_tx: Sender<()>,
     allowed_chat_id: i64,
+    alternate_chat_id: Option<i64>,
     wallet_monitor: Option<Arc<WalletMonitor>>,
 }
 
@@ -40,12 +50,20 @@ impl TelegramInterface {
     pub fn new(config: &Config, db: Arc<Database>, shutdown_tx: Sender<()>, wallet_monitor: Option<Arc<WalletMonitor>>) -> Self {
         let bot = Arc::new(Bot::new(&config.telegram_token));
         let allowed_chat_id = config.telegram_chat_id.parse::<i64>().unwrap_or(0);
+        let alternate_chat_id = config.alternate_telegram_chat_id
+            .as_ref()
+            .and_then(|s| s.parse::<i64>().ok());
+        
+        if let Some(alt_id) = alternate_chat_id {
+            info!("📱 Alternate Telegram chat ID configured: {}", alt_id);
+        }
         
         Self {
             bot,
             db,
             shutdown_tx,
             allowed_chat_id,
+            alternate_chat_id,
             wallet_monitor,
         }
     }
@@ -88,14 +106,28 @@ impl TelegramInterface {
             &bundle_id[..20.min(bundle_id.len())]
         );
 
+        // Send to primary chat
         if let Err(e) = self
             .bot
-            .send_message(ChatId(self.allowed_chat_id), message)
+            .send_message(ChatId(self.allowed_chat_id), &message)
             .parse_mode(ParseMode::Html)
             .send()
             .await
         {
-            warn!("Failed to send auto-sell notification: {}", e);
+            warn!("Failed to send auto-sell notification to primary chat: {}", e);
+        }
+        
+        // Send to alternate chat if configured
+        if let Some(alt_chat_id) = self.alternate_chat_id {
+            if let Err(e) = self
+                .bot
+                .send_message(ChatId(alt_chat_id), &message)
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await
+            {
+                warn!("Failed to send auto-sell notification to alternate chat: {}", e);
+            }
         }
     }
 
@@ -145,7 +177,7 @@ impl TelegramInterface {
         .dependencies(teloxide::dptree::deps![
             self.db,
             self.shutdown_tx,
-            AllowedChatId(self.allowed_chat_id),
+            AllowedChatId { primary: self.allowed_chat_id, alternate: self.alternate_chat_id },
             self.wallet_monitor
         ])
         .build()
@@ -164,7 +196,7 @@ async fn command_handler(
 ) -> ResponseResult<()> {
     info!("📨 Received command: {:?} from chat ID: {}", cmd, msg.chat.id);
     
-    if msg.chat.id.0 != allowed_chat_id.0 {
+    if !allowed_chat_id.is_allowed(msg.chat.id.0) {
         warn!("⚠️ Unauthorized access from chat ID: {}", msg.chat.id);
         return Ok(());
     }
@@ -265,7 +297,7 @@ async fn message_handler(
 ) -> ResponseResult<()> {
     info!("📨 Received message from chat ID: {}",msg.chat.id);
     
-    if msg.chat.id.0 != allowed_chat_id.0 {
+    if !allowed_chat_id.is_allowed(msg.chat.id.0) {
         warn!("⚠️ Unauthorized access from chat ID: {}", msg.chat.id);
         return Ok(());
     }

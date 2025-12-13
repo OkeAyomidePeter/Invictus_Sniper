@@ -176,6 +176,7 @@ impl ConfigData {
             private_key: self.solana_private_key.clone(),
             telegram_token: self.telegram_bot_token.clone(),
             telegram_chat_id: self.telegram_chat_id.clone(),
+            alternate_telegram_chat_id: None, // Loaded from env
             database_url: self.database_url.clone(),
             min_liquidity_sol: self.min_liquidity_sol.parse().map_err(|_| "Invalid min_liquidity_sol")?,
             min_holders: self.min_holders.parse().map_err(|_| "Invalid min_holders")?,

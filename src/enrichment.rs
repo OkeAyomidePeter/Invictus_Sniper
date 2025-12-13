@@ -212,11 +212,34 @@ async fn enrichment_loop(
         .timeout(Duration::from_secs(5))
         .build()?;
 
+    // Deduplication: Track recently processed mints to avoid duplicates
+    let mut seen_mints: HashMap<String, std::time::Instant> = HashMap::new();
+    let dedup_window = Duration::from_secs(60); // Skip mints seen in last 60s
+
     while let Some(event) = classified_rx.recv().await {
         let start_time = std::time::Instant::now();
         
         match event {
             ClassifiedEvent::PoolCreation(pool_event) => {
+                // ====== DEDUPLICATION CHECK ======
+                let now = std::time::Instant::now();
+                
+                // Clean up old entries (older than dedup_window)
+                seen_mints.retain(|_, seen_at| now.duration_since(*seen_at) < dedup_window);
+                
+                // Check if we've seen this mint recently
+                if seen_mints.contains_key(&pool_event.token_mint) {
+                    info!("⏭️ Skipping duplicate mint (seen in last 60s): {}", pool_event.token_mint);
+                    TradeLogger::log(&format!(
+                        "⏭️ DEDUP: {} skipped (seen recently)", 
+                        &pool_event.token_mint[..12.min(pool_event.token_mint.len())]
+                    ));
+                    continue;
+                }
+                
+                // Mark as seen
+                seen_mints.insert(pool_event.token_mint.clone(), now);
+
                 info!("🔍 Enriching token: {}", pool_event.token_mint);
                 
                 // ====== GRADUATION DELAY ======

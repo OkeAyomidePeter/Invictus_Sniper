@@ -732,42 +732,132 @@ fn detect_dex_from_logs(logs: &[serde_json::Value]) -> Option<String> {
     found_dex.or_else(|| Some("Unknown DEX".to_string()))
 }
 
-/// Extract pool address
+/// Extract pool address from transaction
+/// Priority: 1. Parse inner instructions for AMM program accounts
+///           2. Parse logs for "pool: <address>" pattern
+///           3. Fallback to finding accounts invoked by known AMM programs
 fn extract_pool_address(
     transaction: &serde_json::Value,
-    _meta: Option<&serde_json::Value>,
+    meta: Option<&serde_json::Value>,
     logs: &[serde_json::Value],
 ) -> Option<String> {
-    // Try to parse from logs
-    for log in logs {
-        if let Some(log_str) = log.as_str() {
-            if let Some(addr_start) = log_str.find("pool: ") {
-                let addr = &log_str[addr_start + 6..]; 
-                if let Some(space_idx) = addr.find(' ') {
-                    return Some(addr[..space_idx].to_string());
+    // Known AMM program IDs
+    let amm_programs = [
+        PUMP_FUN_AMM_PROGRAM_ID,     // PumpSwap
+        RAYDIUM_AMM_V4_PROGRAM_ID,   // Raydium v4
+        RAYDIUM_CPMM_PROGRAM_ID,     // Raydium CPMM
+    ];
+
+    // STRATEGY 1: Parse innerInstructions for accounts invoked by AMM programs
+    // The pool is typically the first account in an inner instruction from the AMM
+    if let Some(meta) = meta {
+        if let Some(inner_instructions) = meta.get("innerInstructions").and_then(|i| i.as_array()) {
+            let message = transaction.get("message");
+            let account_keys = message
+                .and_then(|m| m.get("accountKeys"))
+                .and_then(|k| k.as_array());
+
+            if let Some(keys) = account_keys {
+                for inner in inner_instructions {
+                    if let Some(instructions) = inner.get("instructions").and_then(|i| i.as_array()) {
+                        for ix in instructions {
+                            // Get program ID for this instruction
+                            let program_id_index = ix.get("programIdIndex").and_then(|i| i.as_u64());
+                            
+                            if let Some(idx) = program_id_index {
+                                let program_id = get_pubkey_at_index(keys, idx as usize);
+                                
+                                // Check if this instruction is from an AMM program
+                                if let Some(pid) = &program_id {
+                                    if amm_programs.contains(&pid.as_str()) {
+                                        // Get the accounts used by this instruction
+                                        if let Some(accounts) = ix.get("accounts").and_then(|a| a.as_array()) {
+                                            // The pool is typically at index 0 or 1 in AMM instructions
+                                            for &account_idx in &[0usize, 1, 2] {
+                                                if account_idx < accounts.len() {
+                                                    if let Some(acc_idx) = accounts[account_idx].as_u64() {
+                                                        if let Some(pool) = get_pubkey_at_index(keys, acc_idx as usize) {
+                                                            // Validate: not a program, not token mint, not well-known
+                                                            if !is_program_id(&pool) 
+                                                                && pool.len() == 44 
+                                                                && !is_well_known_token(&pool) 
+                                                            {
+                                                                info!("🎯 Pool extracted from AMM inner instruction: {}", pool);
+                                                                return Some(pool);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Fallback: get from account keys
-    let message = transaction.get("message")?;
-    let account_keys = message.get("accountKeys")?.as_array()?;
-
-    // Return first writable non-program account
-    for key in account_keys {
-        if let Some(pubkey) = key.get("pubkey").and_then(|p| p.as_str()) {
-            if !is_program_id(pubkey) && !is_token_mint(pubkey) {
-                return Some(pubkey.to_string());
-            }
-        } else if let Some(pubkey_str) = key.as_str() {
-            if !is_program_id(pubkey_str) && !is_token_mint(pubkey_str) {
-                return Some(pubkey_str.to_string());
+    // STRATEGY 2: Parse logs for explicit "pool: <address>" pattern
+    for log in logs {
+        if let Some(log_str) = log.as_str() {
+            if let Some(addr_start) = log_str.find("pool: ") {
+                let addr = &log_str[addr_start + 6..]; 
+                // Extract until space or end
+                let end_idx = addr.find(|c: char| c.is_whitespace()).unwrap_or(addr.len());
+                let pool_addr = &addr[..end_idx];
+                if pool_addr.len() == 44 && !is_program_id(pool_addr) {
+                    info!("🎯 Pool extracted from logs: {}", pool_addr);
+                    return Some(pool_addr.to_string());
+                }
             }
         }
     }
 
+    // STRATEGY 3: Find account that is owned by AMM program in postTokenBalances
+    // This is less reliable but can work for identifying pool vaults
+    if let Some(meta) = meta {
+        if let Some(post_balances) = meta.get("postTokenBalances").and_then(|b| b.as_array()) {
+            for balance in post_balances {
+                if let Some(owner) = balance.get("owner").and_then(|o| o.as_str()) {
+                    // If the owner is an AMM program, this might be the pool
+                    if amm_programs.contains(&owner) {
+                        // Get the account index
+                        if let Some(account_index) = balance.get("accountIndex").and_then(|i| i.as_u64()) {
+                            let message = transaction.get("message");
+                            let account_keys = message
+                                .and_then(|m| m.get("accountKeys"))
+                                .and_then(|k| k.as_array());
+                            
+                            if let Some(keys) = account_keys {
+                                if let Some(pool) = get_pubkey_at_index(keys, account_index as usize) {
+                                    info!("🎯 Pool extracted from token balance owner: {}", pool);
+                                    return Some(pool);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    warn!("⚠️ Could not extract pool address from transaction");
     None
+}
+
+/// Helper: Get pubkey at index from account keys array
+fn get_pubkey_at_index(keys: &[serde_json::Value], index: usize) -> Option<String> {
+    keys.get(index).and_then(|key| {
+        // Handle both object format {"pubkey": "..."} and string format
+        if let Some(obj) = key.as_object() {
+            obj.get("pubkey").and_then(|p| p.as_str()).map(|s| s.to_string())
+        } else {
+            key.as_str().map(|s| s.to_string())
+        }
+    })
 }
 
 /// Extract token pair from pool
