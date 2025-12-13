@@ -11,7 +11,7 @@ use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::collections::HashMap;
-use crate::trade_logger::TradeLogger;
+use crate::trade_logger::{TradeLogger, log_enrichment_debug};
 
 // ========== NEW STRUCTS ==========
 
@@ -219,10 +219,57 @@ async fn enrichment_loop(
             ClassifiedEvent::PoolCreation(pool_event) => {
                 info!("🔍 Enriching token: {}", pool_event.token_mint);
                 
-                match enrich_token(&client, &api_key, pool_event.clone()).await {
+                // ====== GRADUATION DELAY ======
+                // Wait 2 seconds for pool liquidity to settle after graduation event
+                info!("⏳ Waiting 2s for pool to settle: {}", pool_event.pool_address);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                
+                // ====== RETRY LOGIC WITH BACKOFF ======
+                let max_retries: u8 = 3;
+                let mut attempt: u8 = 1;
+                let mut last_result: Result<EnrichedToken> = Err(anyhow::anyhow!("No attempts made"));
+                
+                while attempt <= max_retries {
+                    match enrich_token(&client, &api_key, pool_event.clone()).await {
+                        Ok(enriched) => {
+                            let liq = enriched.initial_liquidity_sol.unwrap_or(0.0);
+                            
+                            // Log debug info for every attempt
+                            log_enrichment_debug(
+                                &enriched.mint,
+                                &enriched.pool_address,
+                                liq,
+                                attempt
+                            );
+                            
+                            // Check if liquidity is valid
+                            if liq > 0.1 || attempt == max_retries {
+                                // Success or final attempt - proceed
+                                last_result = Ok(enriched);
+                                break;
+                            } else {
+                                // Zero liquidity - retry with backoff
+                                warn!("⚠️ Zero liquidity on attempt {}/{}, retrying...", attempt, max_retries);
+                                let backoff = Duration::from_secs(attempt as u64 * 2);
+                                tokio::time::sleep(backoff).await;
+                                attempt += 1;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("⚠️ Enrichment attempt {}/{} failed: {}", attempt, max_retries, e);
+                            last_result = Err(e);
+                            let backoff = Duration::from_secs(attempt as u64 * 2);
+                            tokio::time::sleep(backoff).await;
+                            attempt += 1;
+                        }
+                    }
+                }
+                
+                // Process final result
+                match last_result {
                     Ok(enriched) => {
                         let duration = start_time.elapsed().as_millis();
-                        info!("✅ Enrichment complete: {} (took {}ms)", enriched.mint, duration);
+                        info!("✅ Enrichment complete: {} (took {}ms, {} attempts)", enriched.mint, duration, attempt);
     
                         // Simplified logging - only show key fields
                         info!("📊 Token: {} | Liq: {} SOL | Auth: freeze={}, mint={} | Platform: Graduated",
@@ -245,8 +292,8 @@ async fn enrichment_loop(
                         }
                     }
                     Err(e) => {
-                        error!("Failed to enrich token: {}", e);
-                        TradeLogger::log(&format!("❌ ENRICHMENT FAILED: {} | Error: {}", pool_event.token_mint, e));
+                        error!("Failed to enrich token after {} attempts: {}", max_retries, e);
+                        TradeLogger::log(&format!("❌ ENRICHMENT FAILED: {} | Error: {} | Attempts: {}", pool_event.token_mint, e, max_retries));
                         // Don't stop the pipeline - continue processing
                     }
                 }
