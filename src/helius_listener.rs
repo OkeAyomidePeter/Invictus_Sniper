@@ -441,6 +441,9 @@ async fn handle_message(
             }
 
             info!("⚡ Pool creation detected: {}", signature);
+            
+            // Phase 4: Structured logging
+            // crate::trade_logger::log_pipeline_event("UNKNOWN", "POOL_DETECTED", &format!("Signature: {}", signature));
 
             // Fetch full transaction details
             if let Some(limiter) = rate_limiter {
@@ -551,21 +554,36 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     let logs_array = logs.as_array()?;
 
     // Extract token mints first
-    let (token_mint, pair_token) = extract_pool_tokens(transaction, meta)?;
+    let (token_mint, pair_token) = match extract_pool_tokens(transaction, meta) {
+        Some(tokens) => {
+            crate::trade_logger::log_pipeline_event(&tokens.0, "TOKENS_EXTRACTED", &format!("Pair: {}", tokens.1));
+            tokens
+        },
+        None => {
+            crate::trade_logger::log_error_detailed(&event.signature, "EXTRACT_TOKENS", "Failed to extract token pair");
+            return None;
+        }
+    };
 
     // CRITICAL: Filter out established tokens and invalid pairs
     if !is_valid_new_token_pair(&token_mint, &pair_token) {
+        crate::trade_logger::log_token_rejected(&token_mint, 0.0, "Invalid or established token pair");
         return None;
     }
 
     // Detect platform from transaction account keys (SECURE)
     let token_platform = detect_token_platform(transaction, logs_array);
     let is_graduated = token_platform.is_graduated();
+    
+    crate::trade_logger::log_pipeline_event(&token_mint, "PLATFORM_DETECTED", &format!("{:?}", token_platform));
 
     // ========== SNIPER BOT: GRADUATED TOKENS ONLY ==========
     // CRITICAL: Reject ALL non-graduated tokens
     // Only process Pump.fun and Bonk.fun graduated tokens
     if !is_graduated {
+        let msg = format!("Non-graduated token (platform: {:?})", token_platform);
+        warn!("🚫 REJECTED: {} | {}", token_mint, msg);
+        crate::trade_logger::log_token_rejected(&token_mint, 0.0, &msg);
         return None; // Silent rejection for non-graduated tokens
     }
 
@@ -580,10 +598,9 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
         let token_age = current_time - timestamp;
         
         if token_age > MAX_TOKEN_AGE_SECONDS {
-            warn!(
-                "🚫 REJECTED (AGE): Token is {} seconds old (max: {}s) - {} (platform: {:?})",
-                token_age, MAX_TOKEN_AGE_SECONDS, token_mint, token_platform
-            );
+            let msg = format!("Token is {} seconds old (max: {}s)", token_age, MAX_TOKEN_AGE_SECONDS);
+            warn!("🚫 REJECTED (AGE): {} - {}", token_mint, msg);
+            crate::trade_logger::log_token_rejected(&token_mint, 0.0, &msg);
             return None;
         }
         
@@ -606,6 +623,7 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
 
     // Detect DEX
     let dex = detect_dex_from_logs(logs_array)?;
+    crate::trade_logger::log_pipeline_event(&token_mint, "DEX_DETECTED", &dex);
 
 
     // ========== GRADUATION VERIFICATION (BONK.FUN & LAUNCHLAB) ==========
@@ -613,16 +631,24 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     if token_platform == TokenPlatform::BonkFun || token_platform == TokenPlatform::RaydiumLaunchLab {
         let is_valid_dex = dex.starts_with("Raydium") || dex == "PumpSwap";
         if !is_valid_dex {
-            warn!(
-                "🚫 REJECTED: Token {} (platform: {:?}) detected on invalid DEX '{}' - waiting for graduation to Raydium/PumpSwap",
-                token_mint, token_platform, dex
-            );
+            let msg = format!("Invalid DEX '{}' for graduated token", dex);
+            warn!("🚫 REJECTED: {} - {}", token_mint, msg);
+            crate::trade_logger::log_token_rejected(&token_mint, 0.0, &msg);
             return None;
         }
     }
 
     // Extract pool address
-    let pool_address = extract_pool_address(transaction, meta, logs_array)?;
+    let pool_address = match extract_pool_address(transaction, meta, logs_array) {
+        Some(addr) => {
+            crate::trade_logger::log_pipeline_event(&token_mint, "POOL_EXTRACTED", &addr);
+            addr
+        },
+        None => {
+            crate::trade_logger::log_error_detailed(&token_mint, "EXTRACT_POOL", "Could not extract pool address from transaction");
+            return None;
+        }
+    };
 
     Some(PoolCreationEvent {
         pool_address,

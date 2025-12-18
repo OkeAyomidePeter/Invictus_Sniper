@@ -79,6 +79,8 @@ impl Database {
 
         // Run migrations for existing databases (add new columns if they don't exist)
         // SQLite doesn't support IF NOT EXISTS for columns, so we ignore errors
+        let _ = sqlx::query("ALTER TABLE trades ADD COLUMN entry_price REAL DEFAULT 0.0")
+            .execute(&self.pool).await;
         let _ = sqlx::query("ALTER TABLE trades ADD COLUMN partial_exit_executed INTEGER DEFAULT 0")
             .execute(&self.pool).await;
         let _ = sqlx::query("ALTER TABLE trades ADD COLUMN remaining_amount_pct REAL DEFAULT 100.0")

@@ -97,6 +97,14 @@ pub fn log_enrichment_debug(mint: &str, pool_address: &str, liquidity_sol: f64, 
     ));
 }
 
+/// Log a significant pipeline event
+pub fn log_pipeline_event(mint: &str, event: &str, details: &str) {
+    TradeLogger::log(&format!(
+        "⚡ PIPELINE: {} | {} | {}", 
+        &mint[..12.min(mint.len())], event, details
+    ));
+}
+
 // ============================================================================
 // STARTUP / SHUTDOWN
 // ============================================================================
