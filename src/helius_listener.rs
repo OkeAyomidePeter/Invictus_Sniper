@@ -285,6 +285,10 @@ async fn connect_and_listen(
 
     let (mut write, mut read) = ws_stream.split();
 
+    // ========== DEDUPLICATION: Track seen signatures ==========
+    let seen_signatures: Arc<std::sync::Mutex<HashSet<String>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let seen_signatures_clone = Arc::clone(&seen_signatures);
+
     // ========== CRITICAL: PUMP.FUN MIGRATION MONITORING ==========
     // This catches tokens graduating from bonding curve to Raydium
     let pumpfun_migration_sub = json!({
@@ -311,8 +315,7 @@ async fn connect_and_listen(
         (10, RAYDIUM_AMM_V4_PROGRAM_ID, "Raydium AMM v4"),
         (11, RAYDIUM_CPMM_PROGRAM_ID, "Raydium CPMM"),
         (12, RAYDIUM_LAUNCHLAB_PROGRAM_ID, "Raydium LaunchLab"),
-        // (13, PUMP_FUN_PROGRAM_ID, "Pump.fun"), // REMOVED: We don't want bonding curve events
-        (14, PUMP_FUN_AMM_PROGRAM_ID, "PumpSwap"), // Pump.fun AMM
+        (14, PUMP_FUN_AMM_PROGRAM_ID, "PumpSwap"),
     ];
 
     for (id, program_id, name) in dex_programs {
@@ -337,14 +340,13 @@ async fn connect_and_listen(
     }
 
     // ========== HEARTBEAT/PING TASK ==========
-    // Spawn a task to send periodic pings to keep connection alive
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
         loop {
             interval.tick().await;
             if ping_tx.send(()).await.is_err() {
-                break; // Connection closed
+                break;
             }
         }
     });
@@ -352,11 +354,10 @@ async fn connect_and_listen(
     // Listen for messages and handle pings
     loop {
         tokio::select! {
-            // Handle incoming messages
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_message(&text, api_key, tx, client, rate_limiter).await {
+                        if let Err(e) = handle_message(&text, api_key, tx, client, rate_limiter, &seen_signatures_clone).await {
                             warn!("[Connection #{}] Error handling message: {}", connection_id, e);
                         }
                     }
@@ -370,9 +371,7 @@ async fn connect_and_listen(
                             break;
                         }
                     }
-                    Some(Ok(Message::Pong(_))) => {
-                        // Received pong response - connection is alive
-                    }
+                    Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         return Err(anyhow::anyhow!("[Connection #{}] WebSocket error: {}", connection_id, e));
@@ -383,7 +382,6 @@ async fn connect_and_listen(
                     }
                 }
             }
-            // Send periodic pings
             Some(_) = ping_rx.recv() => {
                 if let Err(e) = write.send(Message::Ping(vec![])).await {
                     error!("[Connection #{}] Failed to send ping: {}", connection_id, e);
@@ -403,6 +401,7 @@ async fn handle_message(
     tx: &mpsc::Sender<RawTxEvent>,
     client: &Client,
     rate_limiter: &Option<Arc<RateLimiter>>,
+    seen_signatures: &Arc<std::sync::Mutex<HashSet<String>>>,
 ) -> Result<()> {
     let msg: HeliusMessage =
         serde_json::from_str(text).context("Failed to parse Helius message")?;
@@ -426,23 +425,32 @@ async fn handle_message(
             let logs = params.result.value.logs;
             let slot = params.result.context.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
 
-            // CRITICAL: Robust filter for pool creation / graduation instructions
-            let is_pool_creation = logs.iter().any(|log| {
-                // Raydium AMM / CPMM initialization
-                log.contains("Program log: initialize2: InitializeInstruction2") || 
-                log.contains("Program log: Instruction: Initialize") ||
-                log.contains("Program log: Instruction: InitializePool") ||
-                // Pump.fun graduation
+            // ========== DEDUPLICATION: Skip already-seen signatures ==========
+            {
+                let mut seen = seen_signatures.lock().unwrap();
+                if seen.contains(&signature) {
+                    return Ok(()); // Already processed
+                }
+                seen.insert(signature.clone());
+                // Limit set size to prevent memory bloat
+                if seen.len() > 5000 {
+                    seen.clear();
+                }
+            }
+
+            // ========== STRICTER FILTER: Only true graduation events ==========
+            let is_graduation = logs.iter().any(|log| {
+                // Pump.fun graduation (Migrate instruction)
                 log.contains("Program log: Instruction: Migrate") ||
-                // General graduation actor
-                log.contains(PUMPFUN_MIGRATION_ACCOUNT)
+                // Raydium AMM v4 pool creation (initialize2)
+                log.contains("Program log: initialize2: InitializeInstruction2")
             });
 
-            if !is_pool_creation {
+            if !is_graduation {
                 return Ok(());
             }
 
-            info!("⚡ Pool creation detected: {}", signature);
+            info!("⚡ Graduation event detected: {}", signature);
             
             // Phase 4: Structured logging
             // crate::trade_logger::log_pipeline_event("UNKNOWN", "POOL_DETECTED", &format!("Signature: {}", signature));
@@ -611,10 +619,10 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
             token_age, MAX_TOKEN_AGE_SECONDS, token_mint, token_platform
         );
     } else {
-        warn!(
-            "⚠️ No timestamp available for token {} - cannot verify age, proceeding with caution",
-            token_mint
-        );
+        let msg = "No timestamp available - cannot verify freshness";
+        warn!("🚫 REJECTED (NO TIMESTAMP): {} - {}", token_mint, msg);
+        crate::trade_logger::log_token_rejected(&token_mint, 0.0, msg);
+        return None;
     }
 
     // ========== ALL VALIDATIONS PASSED ==========
