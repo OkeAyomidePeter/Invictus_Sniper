@@ -426,14 +426,16 @@ async fn handle_message(
             let logs = params.result.value.logs;
             let slot = params.result.context.get("slot").and_then(|s| s.as_u64()).unwrap_or(0);
 
-            // CRITICAL: Quick filter for pool creation keywords
+            // CRITICAL: Robust filter for pool creation / graduation instructions
             let is_pool_creation = logs.iter().any(|log| {
-                log.contains("initialize") ||
-                log.contains("Initialize2") ||
-                log.contains("InitializePool") ||
-                log.contains("create") ||
-                log.contains("CreatePool") ||
-                log.contains(PUMPFUN_MIGRATION_ACCOUNT) // Graduation event!
+                // Raydium AMM / CPMM initialization
+                log.contains("Program log: initialize2: InitializeInstruction2") || 
+                log.contains("Program log: Instruction: Initialize") ||
+                log.contains("Program log: Instruction: InitializePool") ||
+                // Pump.fun graduation
+                log.contains("Program log: Instruction: Migrate") ||
+                // General graduation actor
+                log.contains(PUMPFUN_MIGRATION_ACCOUNT)
             });
 
             if !is_pool_creation {
@@ -494,7 +496,7 @@ async fn event_pipeline(
 ) -> Result<()> {
     let mut event_buffer: HashMap<String, RawTxEvent> = HashMap::new();
     let mut last_process_time = Instant::now();
-    let debounce_duration = Duration::from_millis(100); // Reduced for speed
+    let debounce_duration = Duration::from_millis(20); // Further reduced for lower latency
 
     info!("🎯 Event pipeline started (POOL CREATION ONLY - OPTIMIZED FOR SPEED)");
 
@@ -572,7 +574,7 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     }
 
     // Detect platform from transaction account keys (SECURE)
-    let token_platform = detect_token_platform(transaction, logs_array);
+    let token_platform = detect_token_platform(transaction, logs_array, &token_mint);
     let is_graduated = token_platform.is_graduated();
     
     crate::trade_logger::log_pipeline_event(&token_mint, "PLATFORM_DETECTED", &format!("{:?}", token_platform));
@@ -638,13 +640,14 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
         }
     }
 
-    // Extract pool address
+    // Extract pool address (Priority: Inner Instructions -> Known Account Indices -> Writable Fallback)
     let pool_address = match extract_pool_address(transaction, meta, logs_array) {
         Some(addr) => {
             crate::trade_logger::log_pipeline_event(&token_mint, "POOL_EXTRACTED", &addr);
             addr
         },
         None => {
+            // Log rejection if we really can't find it
             crate::trade_logger::log_error_detailed(&token_mint, "EXTRACT_POOL", "Could not extract pool address from transaction");
             return None;
         }
@@ -667,7 +670,8 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
 /// SECURITY: Uses cryptographic proof via account keys, NOT mint suffix
 fn detect_token_platform(
     transaction: &serde_json::Value,
-    logs: &[serde_json::Value]
+    logs: &[serde_json::Value],
+    token_mint: &str,
 ) -> TokenPlatform {
     // LAYER 1: Check account keys (MOST SECURE - cryptographic proof)
     // This cannot be faked by scammers creating tokens ending in "pump" or "bonk"
@@ -681,8 +685,8 @@ fn detect_token_platform(
                     key.as_str().unwrap_or("")
                 };
                 
-                // Check for Pump.fun migration account (graduated tokens)
-                if pubkey == PUMPFUN_MIGRATION_ACCOUNT {
+                // Check for Pump.fun actors
+                if pubkey == PUMPFUN_MIGRATION_ACCOUNT || pubkey == PUMP_FUN_PROGRAM_ID || pubkey == PUMP_FUN_AMM_PROGRAM_ID {
                     return TokenPlatform::PumpFun;
                 }
                 
@@ -700,27 +704,15 @@ fn detect_token_platform(
     }
 
     // LAYER 2: Check logs for program IDs (FALLBACK)
-    // Less secure than account keys but still validates program interaction
     for log in logs {
         if let Some(log_str) = log.as_str() {
-            // Check for Pump.fun migration account (CRITICAL for graduated tokens)
-            if log_str.contains(PUMPFUN_MIGRATION_ACCOUNT) {
+            if log_str.contains(PUMPFUN_MIGRATION_ACCOUNT) || log_str.contains(PUMP_FUN_PROGRAM_ID) || log_str.contains(PUMP_FUN_AMM_PROGRAM_ID) {
                 return TokenPlatform::PumpFun;
             }
-            
-            // Check for other program IDs
             if log_str.contains(BONK_FUN_PROGRAM_ID) {
                 return TokenPlatform::BonkFun;
             }
-            
-            // Check for Raydium LaunchLab
             if log_str.contains(RAYDIUM_LAUNCHLAB_PROGRAM_ID) {
-                // Check for specific graduation instructions if possible, or assume presence means interaction
-                // Launchlab graduation often involves "migrate_to_amm"
-                if log_str.contains("migrate_to_amm") || log_str.contains("migrate_to_cpswap") {
-                     return TokenPlatform::RaydiumLaunchLab;
-                }
-                // Fallback: if we see the program ID, it's likely a LaunchLab token
                 return TokenPlatform::RaydiumLaunchLab;
             }
         }
@@ -826,7 +818,34 @@ fn extract_pool_address(
         }
     }
 
-    // STRATEGY 2: Parse logs for explicit "pool: <address>" pattern
+    // STRATEGY 2: Pattern-based extraction (Indices from provided scripts)
+    // Raydium AMM v4: Pool address is typically at index 2
+    // PumpSwap: Pool address is typically at index 3
+    if let Some(msg) = transaction.get("message") {
+        if let Some(account_keys) = msg.get("accountKeys").and_then(|k| k.as_array()) {
+            // Check logs to determine which index to trust
+            let is_raydium = logs.iter().any(|l| l.as_str().map_or(false, |s| s.contains("initialize2")));
+            let is_pumpswap = logs.iter().any(|l| l.as_str().map_or(false, |s| s.contains("Migrate")));
+
+            if is_raydium && account_keys.len() > 2 {
+                if let Some(pubkey) = get_pubkey_at_index(account_keys, 2) {
+                    if pubkey.len() == 44 && !is_program_id(&pubkey) {
+                        return Some(pubkey);
+                    }
+                }
+            }
+
+            if is_pumpswap && account_keys.len() > 3 {
+                if let Some(pubkey) = get_pubkey_at_index(account_keys, 3) {
+                    if pubkey.len() == 44 && !is_program_id(&pubkey) {
+                        return Some(pubkey);
+                    }
+                }
+            }
+        }
+    }
+
+    // STRATEGY 3: Parse logs for explicit "pool: <address>" pattern
     for log in logs {
         if let Some(log_str) = log.as_str() {
             if let Some(addr_start) = log_str.find("pool: ") {
