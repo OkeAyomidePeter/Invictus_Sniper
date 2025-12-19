@@ -640,8 +640,8 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
         }
     }
 
-    // Extract pool address (Priority: Inner Instructions -> Known Account Indices -> Writable Fallback)
-    let pool_address = match extract_pool_address(transaction, meta, logs_array) {
+    // Extract pool address (Priority: Exhaustive Instruction Scan -> Known Account Indices -> Writable Fallback)
+    let pool_address = match extract_pool_address(transaction, meta, logs_array, &token_mint) {
         Some(addr) => {
             crate::trade_logger::log_pipeline_event(&token_mint, "POOL_EXTRACTED", &addr);
             addr
@@ -758,6 +758,7 @@ fn extract_pool_address(
     transaction: &serde_json::Value,
     meta: Option<&serde_json::Value>,
     logs: &[serde_json::Value],
+    token_mint: &str,
 ) -> Option<String> {
     // Known AMM program IDs
     let amm_programs = [
@@ -766,51 +767,38 @@ fn extract_pool_address(
         RAYDIUM_CPMM_PROGRAM_ID,     // Raydium CPMM
     ];
 
-    // STRATEGY 1: Parse innerInstructions for accounts invoked by AMM programs
-    // The pool is typically the first account in an inner instruction from the AMM
+    let message = transaction.get("message");
+    let account_keys = message
+        .and_then(|m| m.get("accountKeys"))
+        .and_then(|k| k.as_array());
+
+    let keys = match account_keys {
+        Some(k) => k,
+        None => return None,
+    };
+
+    // STRATEGY 1: Exhaustive Instruction Scanning (Primary)
+    // Scan BOTH top-level and inner instructions for any call to an AMM program.
+    
+    // Check top-level instructions first
+    if let Some(instructions) = message.and_then(|m| m.get("instructions")).and_then(|i| i.as_array()) {
+        for ix in instructions {
+            if let Some(pool) = find_pool_in_instruction(ix, keys, &amm_programs, token_mint) {
+                crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Top-level: {}", pool));
+                return Some(pool);
+            }
+        }
+    }
+
+    // Check inner instructions
     if let Some(meta) = meta {
         if let Some(inner_instructions) = meta.get("innerInstructions").and_then(|i| i.as_array()) {
-            let message = transaction.get("message");
-            let account_keys = message
-                .and_then(|m| m.get("accountKeys"))
-                .and_then(|k| k.as_array());
-
-            if let Some(keys) = account_keys {
-                for inner in inner_instructions {
-                    if let Some(instructions) = inner.get("instructions").and_then(|i| i.as_array()) {
-                        for ix in instructions {
-                            // Get program ID for this instruction
-                            let program_id_index = ix.get("programIdIndex").and_then(|i| i.as_u64());
-                            
-                            if let Some(idx) = program_id_index {
-                                let program_id = get_pubkey_at_index(keys, idx as usize);
-                                
-                                // Check if this instruction is from an AMM program
-                                if let Some(pid) = &program_id {
-                                    if amm_programs.contains(&pid.as_str()) {
-                                        // Get the accounts used by this instruction
-                                        if let Some(accounts) = ix.get("accounts").and_then(|a| a.as_array()) {
-                                            // The pool is typically at index 0 or 1 in AMM instructions
-                                            for &account_idx in &[0usize, 1, 2] {
-                                                if account_idx < accounts.len() {
-                                                    if let Some(acc_idx) = accounts[account_idx].as_u64() {
-                                                        if let Some(pool) = get_pubkey_at_index(keys, acc_idx as usize) {
-                                                            // Validate: not a program, not token mint, not well-known
-                                                            if !is_program_id(&pool) 
-                                                                && pool.len() == 44 
-                                                                && !is_well_known_token(&pool) 
-                                                            {
-                                                                info!("🎯 Pool extracted from AMM inner instruction: {}", pool);
-                                                                return Some(pool);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+            for inner in inner_instructions {
+                if let Some(instructions) = inner.get("instructions").and_then(|i| i.as_array()) {
+                    for ix in instructions {
+                        if let Some(pool) = find_pool_in_instruction(ix, keys, &amm_programs, token_mint) {
+                            crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Inner: {}", pool));
+                            return Some(pool);
                         }
                     }
                 }
@@ -821,26 +809,22 @@ fn extract_pool_address(
     // STRATEGY 2: Pattern-based extraction (Indices from provided scripts)
     // Raydium AMM v4: Pool address is typically at index 2
     // PumpSwap: Pool address is typically at index 3
-    if let Some(msg) = transaction.get("message") {
-        if let Some(account_keys) = msg.get("accountKeys").and_then(|k| k.as_array()) {
-            // Check logs to determine which index to trust
-            let is_raydium = logs.iter().any(|l| l.as_str().map_or(false, |s| s.contains("initialize2")));
-            let is_pumpswap = logs.iter().any(|l| l.as_str().map_or(false, |s| s.contains("Migrate")));
+    // Check logs to determine which index to trust
+    let is_raydium = logs.iter().any(|l| l.as_str().map_or(false, |s| s.contains("initialize2")));
+    let is_pumpswap = logs.iter().any(|l| l.as_str().map_or(false, |s| s.contains("Migrate")));
 
-            if is_raydium && account_keys.len() > 2 {
-                if let Some(pubkey) = get_pubkey_at_index(account_keys, 2) {
-                    if pubkey.len() == 44 && !is_program_id(&pubkey) {
-                        return Some(pubkey);
-                    }
-                }
+    if is_raydium && keys.len() > 2 {
+        if let Some(pubkey) = get_pubkey_at_index(keys, 2) {
+            if pubkey.len() == 44 && !is_program_id(&pubkey) && pubkey != token_mint && !is_well_known_token(&pubkey) {
+                return Some(pubkey);
             }
+        }
+    }
 
-            if is_pumpswap && account_keys.len() > 3 {
-                if let Some(pubkey) = get_pubkey_at_index(account_keys, 3) {
-                    if pubkey.len() == 44 && !is_program_id(&pubkey) {
-                        return Some(pubkey);
-                    }
-                }
+    if is_pumpswap && keys.len() > 3 {
+        if let Some(pubkey) = get_pubkey_at_index(keys, 3) {
+            if pubkey.len() == 44 && !is_program_id(&pubkey) && pubkey != token_mint && !is_well_known_token(&pubkey) {
+                return Some(pubkey);
             }
         }
     }
@@ -850,47 +834,84 @@ fn extract_pool_address(
         if let Some(log_str) = log.as_str() {
             if let Some(addr_start) = log_str.find("pool: ") {
                 let addr = &log_str[addr_start + 6..]; 
-                // Extract until space or end
                 let end_idx = addr.find(|c: char| c.is_whitespace()).unwrap_or(addr.len());
                 let pool_addr = &addr[..end_idx];
                 if pool_addr.len() == 44 && !is_program_id(pool_addr) {
-                    info!("🎯 Pool extracted from logs: {}", pool_addr);
+                    crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Logs: {}", pool_addr));
                     return Some(pool_addr.to_string());
                 }
             }
         }
     }
 
-    // STRATEGY 3: Find account that is owned by AMM program in postTokenBalances
-    // This is less reliable but can work for identifying pool vaults
-    if let Some(meta) = meta {
-        if let Some(post_balances) = meta.get("postTokenBalances").and_then(|b| b.as_array()) {
-            for balance in post_balances {
-                if let Some(owner) = balance.get("owner").and_then(|o| o.as_str()) {
-                    // If the owner is an AMM program, this might be the pool
-                    if amm_programs.contains(&owner) {
-                        // Get the account index
-                        if let Some(account_index) = balance.get("accountIndex").and_then(|i| i.as_u64()) {
-                            let message = transaction.get("message");
-                            let account_keys = message
-                                .and_then(|m| m.get("accountKeys"))
-                                .and_then(|k| k.as_array());
-                            
-                            if let Some(keys) = account_keys {
-                                if let Some(pool) = get_pubkey_at_index(keys, account_index as usize) {
-                                    info!("🎯 Pool extracted from token balance owner: {}", pool);
-                                    return Some(pool);
-                                }
-                            }
-                        }
+    // DIAGNOSTIC: Log account keys if extraction failed
+    log_diagnostic_accounts(keys, token_mint);
+
+    warn!("⚠️ Could not extract pool address from transaction for {}", token_mint);
+    None
+}
+
+/// Helper to scan an instruction for the pool address among its accounts
+fn find_pool_in_instruction(
+    ix: &serde_json::Value,
+    keys: &[serde_json::Value],
+    amm_programs: &[&str],
+    token_mint: &str
+) -> Option<String> {
+    // 1. Get Program ID (Check "programId" string first, then fallback to "programIdIndex")
+    let program_id = if let Some(pid) = ix.get("programId").and_then(|p| p.as_str()) {
+        pid.to_string()
+    } else if let Some(idx) = ix.get("programIdIndex").and_then(|i| i.as_u64()) {
+        get_pubkey_at_index(keys, idx as usize)?
+    } else {
+        return None;
+    };
+    
+    if amm_programs.contains(&program_id.as_str()) {
+        if let Some(accounts) = ix.get("accounts").and_then(|a| a.as_array()) {
+            // Check all accounts in the instruction
+            for account_val in accounts {
+                // Handle both string pubkeys (jsonParsed) and index u64 (raw)
+                let pool = if let Some(s) = account_val.as_str() {
+                    Some(s.to_string())
+                } else if let Some(idx) = account_val.as_u64() {
+                    get_pubkey_at_index(keys, idx as usize)
+                } else {
+                    None
+                };
+
+                if let Some(pool) = pool {
+                    // VALIDATION FILTER:
+                    // 1. Must be 44 chars (Solana address)
+                    // 2. Must NOT be a known program ID
+                    // 3. Must NOT be a well-known token (SOL/USDC/USDT)
+                    // 4. Must NOT be the new token mint
+                    if pool.len() == 44 
+                        && !is_program_id(&pool) 
+                        && !is_well_known_token(&pool) 
+                        && pool != token_mint 
+                    {
+                        return Some(pool);
                     }
                 }
             }
         }
     }
-
-    warn!("⚠️ Could not extract pool address from transaction");
     None
+}
+
+/// Log the first 15 account keys for debugging when extraction fails
+fn log_diagnostic_accounts(keys: &[serde_json::Value], mint: &str) {
+    let mut account_dump = String::new();
+    for (i, key) in keys.iter().take(20).enumerate() {
+        let pubkey = if let Some(obj) = key.as_object() {
+            obj.get("pubkey").and_then(|p| p.as_str()).unwrap_or("?")
+        } else {
+            key.as_str().unwrap_or("?")
+        };
+        account_dump.push_str(&format!("{}:{} ", i, &pubkey[..8.min(pubkey.len())]));
+    }
+    crate::trade_logger::log_warning("EXTRACT_POOL", &format!("DIAGNOSTIC for {}: accounts: {}", mint, account_dump));
 }
 
 /// Helper: Get pubkey at index from account keys array
