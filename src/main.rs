@@ -18,7 +18,8 @@ mod health;
 
 use trade_logger::{
     log_startup, log_shutdown, log_discovery, log_buy, log_buy_failed,
-    log_watchlist_add, log_error, log_risk_rejected, log_token_rejected
+    log_watchlist_add, log_error, log_risk_rejected, log_token_rejected,
+    TradeLogger 
 };
 use trade_engine::TradeEngine;
 
@@ -206,6 +207,8 @@ async fn main() -> Result<()> {
                     enriched_token.initial_liquidity_sol.unwrap_or(0.0),
                     score
                 );
+                TradeLogger::log(&format!("✨ ENRICHED: {} | Score: {:.1}/120", 
+                    &enriched_token.mint[..12.min(enriched_token.mint.len())], score));
                 
                 // Thresholds
                 let buy_threshold = 80.0;
@@ -232,13 +235,14 @@ async fn main() -> Result<()> {
 
                     // RISK CHECK: Duplicate Token Protection
                     if active_positions.iter().any(|p| p.mint == enriched_token.mint) {
-                        warn!("⚠️ Skipping BUY for {}: Already have active position in this token", enriched_token.mint);
-                        log_risk_rejected(&enriched_token.mint, "Already have active position");
+                        let reason = "Already have active position";
+                        warn!("⚠️ Skipping BUY for {}: {}", enriched_token.mint, reason);
+                        log_risk_rejected(&enriched_token.mint, reason);
                         continue;
                     }
 
                     // Direct Buy
-                    info!("🚀 HIGH SCORE DETECTED: {} (Score: {:.1}/70) - EXECUTING IMMEDIATE BUY", enriched_token.mint, score);
+                    info!("🚀 HIGH SCORE DETECTED: {} (Score: {:.1}/120) - EXECUTING IMMEDIATE BUY", enriched_token.mint, score);
                     log_discovery(&enriched_token.mint, score, enriched_token.initial_liquidity_sol.unwrap_or(0.0));
                     
                     // Store in DB
@@ -265,8 +269,10 @@ async fn main() -> Result<()> {
             Some(buy_signal) = buy_rx.recv() => {
                 // Handle Buy Signal from Watchlist
                 let token = buy_signal.token;
-                info!("🚀 WATCHLIST BUY TRIGGERED: {} | Price: {:.9} | Vol: ${:.0}", 
+                let msg = format!("🚀 WATCHLIST BUY TRIGGERED: {} | Price: {:.9} | Vol: ${:.0}", 
                     token.mint, buy_signal.current_price, buy_signal.volume_5m);
+                info!("{}", msg);
+                TradeLogger::log(&msg);
 
                 // Execute BUY via TradeEngine
                 if let Err(e) = trade_engine.execute_buy(&token, config.max_trade_size_sol, true).await {

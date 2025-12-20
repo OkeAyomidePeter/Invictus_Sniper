@@ -101,30 +101,7 @@ lazy_static! {
 
 const MINT_CACHE_TTL_SECONDS: i64 = 240; // 4 minutes
 
-// Well-known token constants for defensive check
-const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-const BONK_MINT: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
-const JITOSOL_MINT: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
-const MSOL_MINT: &str = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So";
-const PYTH_MINT: &str = "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3";
-const RAY_MINT: &str = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
-const ORCA_MINT: &str = "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE";
-const JUP_MINT: &str = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
-const WIF_MINT: &str = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm";
-const POPCAT_MINT: &str = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr";
-
-/// Check if a mint is a well-known token (defensive check)
-fn is_well_known_token(mint: &str) -> bool {
-    matches!(
-        mint,
-        WSOL_MINT | USDC_MINT | USDT_MINT | BONK_MINT
-            | JITOSOL_MINT | MSOL_MINT | PYTH_MINT
-            | RAY_MINT | ORCA_MINT | JUP_MINT
-            | WIF_MINT | POPCAT_MINT
-    )
-}
+// ========== HELIUS API RESPONSES ==========
 
 // ========== HELIUS API RESPONSES ==========
 
@@ -272,14 +249,18 @@ async fn enrichment_loop(
                                 break;
                             } else {
                                 // Zero liquidity - retry with backoff
-                                warn!("⚠️ Zero liquidity on attempt {}/{}, retrying...", attempt, max_retries);
+                                let msg = format!("⚠️ Zero liquidity on attempt {}/{}, retrying...", attempt, max_retries);
+                                warn!("{}", msg);
+                                TradeLogger::log(&format!("🔎 ENRICH_RETRY: {} | {}", pool_event.token_mint, msg));
                                 let backoff = Duration::from_secs(attempt as u64 * 2);
                                 tokio::time::sleep(backoff).await;
                                 attempt += 1;
                             }
                         }
                         Err(e) => {
-                            warn!("⚠️ Enrichment attempt {}/{} failed: {}", attempt, max_retries, e);
+                            let msg = format!("⚠️ Enrichment attempt {}/{} failed: {}", attempt, max_retries, e);
+                            warn!("{}", msg);
+                            TradeLogger::log(&format!("🔎 ENRICH_RETRY: {} | {}", pool_event.token_mint, msg));
                             last_result = Err(e);
                             let backoff = Duration::from_secs(attempt as u64 * 2);
                             tokio::time::sleep(backoff).await;
@@ -334,26 +315,7 @@ async fn enrich_token(
     api_key: &str,
     pool_event: PoolCreationEvent,
 ) -> Result<EnrichedToken> {
-    // DEFENSIVE CHECK: Never enrich well-known tokens
-    // This should never happen if extract_pool_tokens() works correctly,
-    // but this is a safety net
-    if is_well_known_token(&pool_event.token_mint) {
-        warn!("🚫 BLOCKED: Attempted to enrich well-known token: {}", pool_event.token_mint);
-        TradeLogger::log(&format!("🚫 BLOCKED: Well-known token {} rejected", pool_event.token_mint));
-        return Err(anyhow::anyhow!("Cannot enrich well-known token: {}", pool_event.token_mint));
-    }
-
-    // SNIPER BOT: GRADUATED TOKENS ONLY (Pump.fun/Bonk.fun/LaunchLab)
-    // Reject ALL non-graduated tokens - too risky for sniper bot
-    if !pool_event.is_graduated {
-        warn!("🚫 REJECTED: Non-graduated token - GRADUATED ONLY MODE");
-        return Err(anyhow::anyhow!("Rejected non-graduated token: {}", pool_event.token_mint));
-    }
-    
     let start_time = std::time::Instant::now();
-    // GRADUATED TOKENS ONLY - Single enrichment path
-    // All tokens reaching this point are graduated (Pump.fun/Bonk.fun)
-    // No need for tiered logic or tax simulation
     
     info!("⚡ Enriching graduated token: {} ({:?})", 
         pool_event.token_mint,
@@ -362,7 +324,6 @@ async fn enrich_token(
     
     // ========== PARALLEL RPC CALLS ==========
     // Fetch all required data concurrently for maximum speed
-    // "Scatter-Gather" pattern: Fire all requests, wait for slowest
     let (
         mint_account_data,
         liquidity_data,
@@ -371,7 +332,7 @@ async fn enrich_token(
         sol_price_data
     ) = tokio::join!(
         fetch_mint_account_cached(client, api_key, &pool_event.token_mint),
-        fetch_liquidity_data(client, api_key, &pool_event.pool_address, &pool_event.pair_token),
+        fetch_liquidity_data(client, api_key, &pool_event.pool_address, &pool_event.token_mint, &pool_event.pair_token),
         fetch_token_metadata(client, api_key, &pool_event.token_mint),
         fetch_holder_analysis(client, api_key, &pool_event.token_mint),
         get_or_fetch_sol_price(client)
@@ -495,8 +456,8 @@ fn assemble_enriched_token(
         dex: pool_event.dex.clone(),
         
         // Price data
-        price_sol,
-        price_usd,
+        price_sol: price_sol.or(metadata.as_ref().and_then(|m| m.price).map(|p| p / sol_price)),
+        price_usd: price_usd.or(metadata.as_ref().and_then(|m| m.price)),
         initial_liquidity_sol: liq_data.and_then(|l| l.liquidity_sol),
         fdv,
         market_cap,
@@ -651,41 +612,48 @@ async fn fetch_liquidity_data(
     client: &Client,
     api_key: &str,
     pool_address: &str,
+    token_mint: &str,
     pair_token: &str,
 ) -> Result<LiquidityData> {
     let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
     
-    // Fetch all token accounts owned by the pool
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTokenAccountsByOwner",
-        "params": [
-            pool_address,
-            {
-                "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-            },
-            {
-                "encoding": "jsonParsed"
+    // Program IDs for SPL Token and Token-2022
+    let token_programs = [
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
+    ];
+
+    let mut all_accounts = Vec::new();
+
+    // Fetch accounts from both programs
+    for program_id in token_programs {
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                pool_address,
+                {
+                    "programId": program_id
+                },
+                {
+                    "encoding": "jsonParsed"
+                }
+            ]
+        });
+
+        if let Ok(response) = client.post(&url).json(&request_body).send().await {
+            if let Ok(response_json) = response.json::<serde_json::Value>().await {
+                if let Some(accounts) = response_json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_array()) {
+                    all_accounts.extend(accounts.clone());
+                }
             }
-        ]
-    });
+        }
+    }
 
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await
-        .context("Failed to fetch pool token accounts")?;
-
-    let response_json: serde_json::Value = response.json().await?;
-
-    // Extract token accounts array
-    let accounts = response_json
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .and_then(|v| v.as_array())
-        .context("No token accounts found for pool")?;
+    if all_accounts.is_empty() {
+        return Err(anyhow::anyhow!("No token accounts found for pool {}", pool_address));
+    }
 
     let mut liquidity_sol: Option<f64> = None;
     let mut liquidity_token: Option<f64> = None;
@@ -698,7 +666,7 @@ async fn fetch_liquidity_data(
     ];
 
     // Parse each account to find SOL and token reserves
-    for account in accounts {
+    for account in all_accounts {
         let pubkey = account.get("pubkey").and_then(|s| s.as_str()).unwrap_or("");
         
         if let Some(data) = account.get("account").and_then(|a| a.get("data")) {
@@ -712,13 +680,12 @@ async fn fetch_liquidity_data(
                     .and_then(|u| u.as_f64());
 
                 if let Some(amount) = ui_amount {
-                    // Check if this is SOL/WSOL
-                    if sol_mints.contains(&mint) {
+                    // Check if this is SOL/WSOL (from SOL side)
+                    if sol_mints.contains(&mint) || mint == pair_token {
                         liquidity_sol = Some(amount);
-                    } else if mint == pair_token {
-                        // This is the paired token (usually the new token)
+                    } else if mint == token_mint {
+                        // This is the new token side
                         liquidity_token = Some(amount);
-                        // CRITICAL: Capture the account address holding these tokens
                         pool_token_account = Some(pubkey.to_string());
                     }
                 }
@@ -726,9 +693,9 @@ async fn fetch_liquidity_data(
         }
     }
 
-    // Validate we found at least SOL liquidity
-    if liquidity_sol.is_none() {
-        warn!("No SOL liquidity found for pool {}", pool_address);
+    // Validate we found at least some liquidity
+    if liquidity_sol.is_none() && liquidity_token.is_none() {
+        warn!("No liquidity found for pool {} (mint: {})", pool_address, token_mint);
     }
 
     Ok(LiquidityData {
