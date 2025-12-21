@@ -329,12 +329,14 @@ async fn enrich_token(
         liquidity_data,
         metadata_data,
         holder_data,
+        total_holders,
         sol_price_data
     ) = tokio::join!(
         fetch_mint_account_cached(client, api_key, &pool_event.token_mint),
         fetch_liquidity_data(client, api_key, &pool_event.pool_address, &pool_event.token_mint, &pool_event.pair_token),
         fetch_token_metadata(client, api_key, &pool_event.token_mint),
         fetch_holder_analysis(client, api_key, &pool_event.token_mint),
+        fetch_total_holders(client, api_key, &pool_event.token_mint),
         get_or_fetch_sol_price(client)
     );
 
@@ -347,6 +349,7 @@ async fn enrich_token(
         liquidity_data.ok(),
         metadata_data.ok(),
         holder_data.ok(),
+        total_holders.ok(),
         sol_price,
         start_time,
     )
@@ -360,6 +363,7 @@ fn assemble_enriched_token(
     liq_data: Option<LiquidityData>,
     metadata: Option<TokenMetadata>,
     holders: Option<RawHolderData>,
+    total_holders: Option<u64>,
     sol_price: f64,
     start_time: std::time::Instant,
 ) -> Result<EnrichedToken> {
@@ -394,45 +398,41 @@ fn assemble_enriched_token(
     );
 
     // Fix Holder Analysis Percentages
-    // The fetcher returns raw amounts. We calculate percentages here using supply.
     let final_holders = if let Some(raw_holders) = holders {
         if let Some(s) = supply {
             let s_f64 = s as f64;
             if s_f64 > 0.0 {
-                // Filter out the pool account
-                let pool_account = liq_data.as_ref().and_then(|l| l.pool_token_account.as_ref());
+                // EXCLUDE POOL VAULTS: Remove the vault from concentration risk
+                let vault_addr = liq_data.as_ref().and_then(|l| l.pool_token_account.as_ref());
                 
                 let mut filtered_holders: Vec<f64> = raw_holders.holders.iter()
-                    .filter(|h| Some(&h.address) != pool_account)
+                    .filter(|h| {
+                        // Exclude identified vault
+                        if let Some(v) = vault_addr {
+                            if &h.address == v { return false; }
+                        }
+                        // Also exclude the pool state account itself
+                        if h.address == pool_event.pool_address { return false; }
+                        true
+                    })
                     .map(|h| h.amount)
                     .collect();
                 
-                // Sort descending just in case
                 filtered_holders.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 
-                let top_1_amount = filtered_holders.first().copied().unwrap_or(0.0);
+                let top_1_amount = filtered_holders.get(0).copied().unwrap_or(0.0);
                 let top_10_amount: f64 = filtered_holders.iter().take(10).sum();
 
                 Some(HolderAnalysis {
                     top_1_pct: (top_1_amount / s_f64) * 100.0,
                     top_10_pct: (top_10_amount / s_f64) * 100.0,
-                    unique_holders: raw_holders.unique_holders,
+                    unique_holders: total_holders.or(raw_holders.unique_holders),
                 })
             } else {
-                // Supply is 0, cannot calculate pct
-                Some(HolderAnalysis {
-                    top_1_pct: 0.0,
-                    top_10_pct: 0.0,
-                    unique_holders: raw_holders.unique_holders,
-                })
+                Some(HolderAnalysis { top_1_pct: 0.0, top_10_pct: 0.0, unique_holders: total_holders })
             }
         } else {
-            // No supply info, return 0s
-             Some(HolderAnalysis {
-                top_1_pct: 0.0,
-                top_10_pct: 0.0,
-                unique_holders: raw_holders.unique_holders,
-            })
+             Some(HolderAnalysis { top_1_pct: 0.0, top_10_pct: 0.0, unique_holders: total_holders })
         }
     } else {
         None
@@ -623,9 +623,13 @@ async fn fetch_liquidity_data(
         "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
     ];
 
-    let mut all_accounts = Vec::new();
+    let mut liquidity_sol: Option<f64> = None;
+    let mut liquidity_token: Option<f64> = None;
+    let mut pool_token_account: Option<String> = None;
 
-    // Fetch accounts from both programs
+    // STEP 1: Direct Ownership Check
+    // This works if the pool PDA directly owns the token accounts (e.g. Pump.fun migration target)
+    let mut all_accounts = Vec::new();
     for program_id in token_programs {
         let request_body = json!({
             "jsonrpc": "2.0",
@@ -633,12 +637,8 @@ async fn fetch_liquidity_data(
             "method": "getTokenAccountsByOwner",
             "params": [
                 pool_address,
-                {
-                    "programId": program_id
-                },
-                {
-                    "encoding": "jsonParsed"
-                }
+                { "programId": program_id },
+                { "encoding": "jsonParsed" }
             ]
         });
 
@@ -651,51 +651,63 @@ async fn fetch_liquidity_data(
         }
     }
 
-    if all_accounts.is_empty() {
-        return Err(anyhow::anyhow!("No token accounts found for pool {}", pool_address));
-    }
-
-    let mut liquidity_sol: Option<f64> = None;
-    let mut liquidity_token: Option<f64> = None;
-    let mut pool_token_account: Option<String> = None;
-
     // Common SOL/WSOL mint addresses
     let sol_mints = [
         "So11111111111111111111111111111111111111112", // WSOL
         "11111111111111111111111111111111",           // Native SOL
     ];
 
-    // Parse each account to find SOL and token reserves
+    // Parse accounts if found
     for account in all_accounts {
         let pubkey = account.get("pubkey").and_then(|s| s.as_str()).unwrap_or("");
-        
-        if let Some(data) = account.get("account").and_then(|a| a.get("data")) {
-            let parsed = data.get("parsed").and_then(|p| p.get("info"));
+        if let Some(data) = account.get("account").and_then(|a| a.get("data")).and_then(|d| d.get("parsed")).and_then(|p| p.get("info")) {
+            let mint = data.get("mint").and_then(|m| m.as_str()).unwrap_or("");
+            let ui_amount = data.get("tokenAmount").and_then(|t| t.get("uiAmount")).and_then(|u| u.as_f64());
             
-            if let Some(info) = parsed {
-                let mint = info.get("mint").and_then(|m| m.as_str()).unwrap_or("");
-                let ui_amount = info
-                    .get("tokenAmount")
-                    .and_then(|t| t.get("uiAmount"))
-                    .and_then(|u| u.as_f64());
-
-                if let Some(amount) = ui_amount {
-                    // Check if this is SOL/WSOL (from SOL side)
-                    if sol_mints.contains(&mint) || mint == pair_token {
-                        liquidity_sol = Some(amount);
-                    } else if mint == token_mint {
-                        // This is the new token side
-                        liquidity_token = Some(amount);
-                        pool_token_account = Some(pubkey.to_string());
-                    }
+            if let Some(amount) = ui_amount {
+                if sol_mints.contains(&mint) || mint == pair_token {
+                    liquidity_sol = Some(amount);
+                } else if mint == token_mint {
+                    liquidity_token = Some(amount);
+                    pool_token_account = Some(pubkey.to_string());
                 }
             }
         }
     }
 
-    // Validate we found at least some liquidity
-    if liquidity_sol.is_none() && liquidity_token.is_none() {
-        warn!("No liquidity found for pool {} (mint: {})", pool_address, token_mint);
+    // STEP 2: Vault Discovery Fallback (for Raydium etc.)
+    // If we still have 0 liquidity, fetch the largest holders of the token.
+    // The #1 holder is almost always the pool vault.
+    if liquidity_token.is_none() || liquidity_token.unwrap_or(0.0) < 0.1 {
+        let largest_req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_mint]
+        });
+        if let Ok(resp) = client.post(&url).json(&largest_req).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(top_acc) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_array()).and_then(|a| a.get(0)) {
+                    let vault_addr = top_acc.get("address").and_then(|s| s.as_str()).unwrap_or("");
+                    let amount = top_acc.get("uiAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    
+                    if amount > 0.0 {
+                        liquidity_token = Some(amount);
+                        pool_token_account = Some(vault_addr.to_string());
+                        
+                        // Now we need the SOL side. For Raydium, we could fetch the corresponding vault, 
+                        // but a reliable fallback for fresh pools is to check the SOL balance of the POOL address.
+                        let sol_req = json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pool_address]
+                        });
+                        if let Ok(sol_resp) = client.post(&url).json(&sol_req).send().await {
+                            if let Ok(sol_json) = sol_resp.json::<serde_json::Value>().await {
+                                if let Some(lamports) = sol_json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_u64()) {
+                                    liquidity_sol = Some(lamports as f64 / 1_000_000_000.0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(LiquidityData {
@@ -852,8 +864,46 @@ async fn fetch_holder_analysis(
 
     Ok(RawHolderData {
         holders,
-        unique_holders: None, // API doesn't give total count here, only top 20
+        unique_holders: None, 
     })
+}
+
+/// Fetch total unique holders using Helius DAS getTokenAccounts
+async fn fetch_total_holders(
+    client: &Client,
+    api_key: &str,
+    mint: &str,
+) -> Result<u64> {
+    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
+    
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": "holders",
+        "method": "getTokenAccounts",
+        "params": {
+            "page": 1,
+            "limit": 1,
+            "displayOptions": {},
+            "mint": mint
+        }
+    });
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .context("Failed to fetch total holders")?;
+
+    let json: serde_json::Value = response.json().await?;
+    
+    // Result contains "total"
+    let total = json.get("result")
+        .and_then(|r| r.get("total"))
+        .and_then(|v| v.as_u64())
+        .context("No total holders found in DAS response")?;
+
+    Ok(total)
 }
 
 // ========== HELPER FUNCTIONS ==========
