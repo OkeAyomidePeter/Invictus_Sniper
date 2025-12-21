@@ -627,57 +627,58 @@ async fn fetch_liquidity_data(
     let mut liquidity_token: Option<f64> = None;
     let mut pool_token_account: Option<String> = None;
 
-    // STEP 1: Direct Ownership Check
-    // This works if the pool PDA directly owns the token accounts (e.g. Pump.fun migration target)
-    let mut all_accounts = Vec::new();
-    for program_id in token_programs {
-        let request_body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                pool_address,
-                { "programId": program_id },
-                { "encoding": "jsonParsed" }
-            ]
+    // STEP 1: DAS-based reserve discovery (More robust than direct RPC)
+    let das_req = json!({
+        "jsonrpc": "2.0",
+        "id": "pool-reserves",
+        "method": "getTokenAccounts",
+        "params": {
+            "owner": pool_address,
+            "page": 1,
+            "limit": 100
+        }
+    });
+
+    if let Ok(response) = client.post(&url).json(&das_req).send().await {
+        if let Ok(json) = response.json::<serde_json::Value>().await {
+            if let Some(accounts) = json.get("result").and_then(|r| r.get("token_accounts")).and_then(|a| a.as_array()) {
+                for account in accounts {
+                    let mint = account.get("mint").and_then(|m| m.as_str()).unwrap_or("");
+                    let amount = account.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.0);
+                    let decimals = account.get("decimals").and_then(|d| d.as_u64()).unwrap_or(6) as u32;
+                    let ui_amount = amount / 10f64.powi(decimals as i32);
+                    let pubkey = account.get("address").and_then(|s| s.as_str()).unwrap_or("");
+
+                    if sol_mints.contains(&mint) || mint == pair_token {
+                        liquidity_sol = Some(ui_amount);
+                    } else if mint == token_mint {
+                        liquidity_token = Some(ui_amount);
+                        pool_token_account = Some(pubkey.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // STEP 2: Native SOL Fallback
+    // Some pools use native SOL instead of WSOL (mostly bonding curves or unusual AMMs)
+    if liquidity_sol.is_none() || liquidity_sol.unwrap_or(0.0) < 0.001 {
+        let sol_req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pool_address]
         });
-
-        if let Ok(response) = client.post(&url).json(&request_body).send().await {
-            if let Ok(response_json) = response.json::<serde_json::Value>().await {
-                if let Some(accounts) = response_json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_array()) {
-                    all_accounts.extend(accounts.clone());
+        if let Ok(resp) = client.post(&url).json(&sol_req).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(lamports) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_u64()) {
+                    let balance = lamports as f64 / 1_000_000_000.0;
+                    if balance > 0.001 {
+                        liquidity_sol = Some(balance);
+                    }
                 }
             }
         }
     }
 
-    // Common SOL/WSOL mint addresses
-    let sol_mints = [
-        "So11111111111111111111111111111111111111112", // WSOL
-        "11111111111111111111111111111111",           // Native SOL
-    ];
-
-    // Parse accounts if found
-    for account in all_accounts {
-        let pubkey = account.get("pubkey").and_then(|s| s.as_str()).unwrap_or("");
-        if let Some(data) = account.get("account").and_then(|a| a.get("data")).and_then(|d| d.get("parsed")).and_then(|p| p.get("info")) {
-            let mint = data.get("mint").and_then(|m| m.as_str()).unwrap_or("");
-            let ui_amount = data.get("tokenAmount").and_then(|t| t.get("uiAmount")).and_then(|u| u.as_f64());
-            
-            if let Some(amount) = ui_amount {
-                if sol_mints.contains(&mint) || mint == pair_token {
-                    liquidity_sol = Some(amount);
-                } else if mint == token_mint {
-                    liquidity_token = Some(amount);
-                    pool_token_account = Some(pubkey.to_string());
-                }
-            }
-        }
-    }
-
-    // STEP 2: Vault Discovery Fallback (for Raydium etc.)
-    // If we still have 0 liquidity, fetch the largest holders of the token.
-    // The #1 holder is almost always the pool vault.
+    // STEP 3: Vault Discovery Fallback (for Raydium etc. where tokens are in separate vaults)
     if liquidity_token.is_none() || liquidity_token.unwrap_or(0.0) < 0.1 {
         let largest_req = json!({
             "jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_mint]
@@ -691,19 +692,8 @@ async fn fetch_liquidity_data(
                     if amount > 0.0 {
                         liquidity_token = Some(amount);
                         pool_token_account = Some(vault_addr.to_string());
-                        
-                        // Now we need the SOL side. For Raydium, we could fetch the corresponding vault, 
-                        // but a reliable fallback for fresh pools is to check the SOL balance of the POOL address.
-                        let sol_req = json!({
-                            "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pool_address]
-                        });
-                        if let Ok(sol_resp) = client.post(&url).json(&sol_req).send().await {
-                            if let Ok(sol_json) = sol_resp.json::<serde_json::Value>().await {
-                                if let Some(lamports) = sol_json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_u64()) {
-                                    liquidity_sol = Some(lamports as f64 / 1_000_000_000.0);
-                                }
-                            }
-                        }
+                        // If we found the token vault but still have no SOL, 
+                        // it's likely a complex Raydium pool where we'd need to parse the pool state for the SOL vault.
                     }
                 }
             }
@@ -901,7 +891,26 @@ async fn fetch_total_holders(
     let total = json.get("result")
         .and_then(|r| r.get("total"))
         .and_then(|v| v.as_u64())
-        .context("No total holders found in DAS response")?;
+        .unwrap_or(0);
+
+    // CRITICAL: Helius DAS indexing can lag significantly for brand new tokens.
+    // If it returns 1 (just the pool) but the token is graduated/active, 
+    // we fallback to the count of largest accounts we already fetched to avoid false "Ghost Town" penalties.
+    if total <= 1 {
+        // Fetch largest accounts list to get a better lower bound
+        let largest_req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]
+        });
+        if let Ok(resp) = client.post(&url).json(&largest_req).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(count) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_array()).map(|a| a.len() as u64) {
+                    if count > total {
+                        return Ok(count);
+                    }
+                }
+            }
+        }
+    }
 
     Ok(total)
 }
