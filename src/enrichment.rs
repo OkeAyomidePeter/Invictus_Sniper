@@ -627,6 +627,12 @@ async fn fetch_liquidity_data(
     let mut liquidity_token: Option<f64> = None;
     let mut pool_token_account: Option<String> = None;
 
+    // Common SOL/WSOL mint addresses
+    let sol_mints = [
+        "So11111111111111111111111111111111111111112", // WSOL
+        "11111111111111111111111111111111",           // Native SOL
+    ];
+
     // STEP 1: DAS-based reserve discovery (More robust than direct RPC)
     let das_req = json!({
         "jsonrpc": "2.0",
