@@ -139,6 +139,43 @@ pub fn show(ui: &mut egui::Ui, app: &mut InvictusGUI, colors: &ThemeColors) {
         
         ui.add_space(15.0);
         
+        // Transaction Settings
+        config_section(ui, colors, "📡 Transaction Settings", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Transaction Mode:").size(14.0).color(colors.text_primary));
+                ui.radio_value(&mut app.config.transaction_mode, crate::config::TransactionMode::Standard, "Standard (RPC/Helius)");
+                ui.radio_value(&mut app.config.transaction_mode, crate::config::TransactionMode::Jito, "Jito Bundles");
+            });
+
+            ui.add_space(10.0);
+
+            if app.config.transaction_mode == crate::config::TransactionMode::Standard {
+                ui.horizontal(|ui| {
+                    config_field_inline(ui, colors, "Priority Fee (lamports):", &mut app.config.priority_fee_lamports, 120.0);
+                    
+                    if let Ok(lamports) = app.config.priority_fee_lamports.parse::<f64>() {
+                        ui.label(
+                            egui::RichText::new(format!("≈ {:.6} SOL", lamports / 1_000_000_000.0))
+                                .size(13.0)
+                                .color(colors.text_secondary)
+                        );
+                    }
+                });
+                
+                ui.add_space(10.0);
+                config_field_inline(ui, colors, "Compute Unit Limit:", &mut app.config.compute_unit_limit, 100.0);
+                
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new("💡 Standard mode uses priority fees for RPC inclusion via Helius/Default RPC.")
+                    .size(12.0).color(colors.text_secondary).italics());
+            } else {
+                ui.label(egui::RichText::new("💡 Jito mode uses bundles and tips for MEV protection.")
+                    .size(12.0).color(colors.text_secondary).italics());
+            }
+        });
+
+        ui.add_space(15.0);
+        
         // Jito Tips
         config_section(ui, colors, "⚡ Jito MEV Protection", |ui| {
             ui.checkbox(&mut app.config.jito_dynamic_tips_enabled, 

@@ -41,6 +41,11 @@ pub struct ConfigData {
     pub honeypot_check_enabled: bool,
     pub jupiter_api_timeout_ms: String,
     
+    // Transaction Mode
+    pub transaction_mode: crate::config::TransactionMode,
+    pub priority_fee_lamports: String,
+    pub compute_unit_limit: String,
+    
     // Auto-Sell Configuration
     pub auto_sell_enabled: bool,
     pub auto_sell_profit_target_pct: String,
@@ -120,6 +125,9 @@ impl Default for ConfigData {
             max_creator_ownership_percentage: "50.0".to_string(),
             honeypot_check_enabled: true,
             jupiter_api_timeout_ms: "5000".to_string(),
+            transaction_mode: crate::config::TransactionMode::Standard,
+            priority_fee_lamports: "100000".to_string(),
+            compute_unit_limit: "200000".to_string(),
             auto_sell_enabled: true,
             auto_sell_profit_target_pct: "50.0".to_string(),
             auto_sell_stop_loss_pct: "20.0".to_string(),
@@ -185,6 +193,9 @@ impl ConfigData {
             max_creator_ownership_percentage: self.max_creator_ownership_percentage.parse().map_err(|_| "Invalid max_creator_ownership_percentage")?,
             honeypot_check_enabled: self.honeypot_check_enabled,
             jupiter_api_timeout_ms: self.jupiter_api_timeout_ms.parse().map_err(|_| "Invalid jupiter_api_timeout_ms")?,
+            transaction_mode: self.transaction_mode,
+            priority_fee_lamports: self.priority_fee_lamports.parse().map_err(|_| "Invalid priority_fee_lamports")?,
+            compute_unit_limit: self.compute_unit_limit.parse().map_err(|_| "Invalid compute_unit_limit")?,
             auto_sell_enabled: self.auto_sell_enabled,
             auto_sell_profit_target_pct: self.auto_sell_profit_target_pct.parse().map_err(|_| "Invalid auto_sell_profit_target_pct")?,
             auto_sell_stop_loss_pct: self.auto_sell_stop_loss_pct.parse().map_err(|_| "Invalid auto_sell_stop_loss_pct")?,
@@ -346,6 +357,9 @@ impl InvictusGUI {
         writeln!(file, "MAX_CREATOR_OWNERSHIP_PERCENTAGE={}", self.config.max_creator_ownership_percentage)?;
         writeln!(file, "HONEYPOT_CHECK_ENABLED={}", self.config.honeypot_check_enabled)?;
         writeln!(file, "JUPITER_API_TIMEOUT_MS={}", self.config.jupiter_api_timeout_ms)?;
+        writeln!(file, "TRANSACTION_MODE={:?}", self.config.transaction_mode)?;
+        writeln!(file, "PRIORITY_FEE_LAMPORTS={}", self.config.priority_fee_lamports)?;
+        writeln!(file, "COMPUTE_UNIT_LIMIT={}", self.config.compute_unit_limit)?;
         writeln!(file)?;
         
         writeln!(file, "# Auto-Sell Configuration")?;
@@ -458,6 +472,14 @@ impl InvictusGUI {
         
         load_bool(&mut self.config.honeypot_check_enabled, "HONEYPOT_CHECK_ENABLED");
         load_str(&mut self.config.jupiter_api_timeout_ms, "JUPITER_API_TIMEOUT_MS");
+        
+        if let Ok(val) = std::env::var("TRANSACTION_MODE") {
+            if let Ok(m) = val.parse() {
+                self.config.transaction_mode = m;
+            }
+        }
+        load_str(&mut self.config.priority_fee_lamports, "PRIORITY_FEE_LAMPORTS");
+        load_str(&mut self.config.compute_unit_limit, "COMPUTE_UNIT_LIMIT");
         
         load_bool(&mut self.config.auto_sell_enabled, "AUTO_SELL_ENABLED");
         load_str(&mut self.config.auto_sell_profit_target_pct, "AUTO_SELL_PROFIT_TARGET_PCT");

@@ -97,6 +97,9 @@ pub struct TransactionManager {
     client: Client,
     payer_pubkey: Pubkey,
     jupiter_limiter: Option<Arc<RateLimiter>>,
+    transaction_mode: crate::config::TransactionMode,
+    priority_fee_lamports: u64,
+    compute_unit_limit: u32,
     base_tip_lamports: u64,
     min_tip_lamports: u64,
     max_tip_lamports: u64,
@@ -123,6 +126,9 @@ impl TransactionManager {
             client,
             payer_pubkey: presigner.pubkey(),
             jupiter_limiter,
+            transaction_mode: config.transaction_mode,
+            priority_fee_lamports: config.priority_fee_lamports,
+            compute_unit_limit: config.compute_unit_limit,
             base_tip_lamports: config.jito_base_tip_lamports,
             min_tip_lamports: config.jito_min_tip_lamports,
             max_tip_lamports: config.jito_max_tip_lamports,
@@ -228,12 +234,19 @@ impl TransactionManager {
         let quote = self.get_jupiter_quote(input_mint, output_mint, amount, slippage_bps).await?;
 
         // 2. Get swap transaction  
-        let request = json!({
+        let mut request = json!({
             "quoteResponse": quote,
             "userPublicKey": self.payer_pubkey.to_string(),
             "wrapAndUnwrapSol": true,
             // "asLegacyTransaction": true // REMOVED: We want Versioned Tx
         });
+
+        // If in Standard mode, we can ask Jupiter to bake in the priority fee
+        if self.transaction_mode == crate::config::TransactionMode::Standard {
+            request["prioritizationFeeLamports"] = json!(self.priority_fee_lamports);
+            // Optionally set compute unit limit if needed, though Jupiter usually tunes this well
+            // request["computeUnitLimit"] = json!(self.compute_unit_limit);
+        }
 
         let response: serde_json::Value = self.client.post(JUPITER_SWAP_API)
             .json(&request)
@@ -298,5 +311,9 @@ impl TransactionManager {
         let multiplier = if high_priority { 2.0 } else { 1.0 };
         let tip = (self.base_tip_lamports as f64 * multiplier) as u64;
         tip.clamp(self.min_tip_lamports, self.max_tip_lamports)
+    }
+
+    pub fn transaction_mode(&self) -> crate::config::TransactionMode {
+        self.transaction_mode
     }
 }

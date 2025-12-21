@@ -188,6 +188,13 @@ impl Presigner {
             .map(|s| s.to_string())
     }
 
+    /// Send a VersionedTransaction immediately
+    pub fn send_versioned_transaction(&self, tx: &VersionedTransaction) -> Result<String> {
+        let signature = self.rpc_client.send_and_confirm_transaction(tx)
+            .context("Failed to send versioned transaction")?;
+        Ok(signature.to_string())
+    }
+
     /// Sign an existing VersionedTransaction with the loaded keypair
     pub fn sign_versioned_tx(&self, tx: &mut VersionedTransaction) -> Result<()> {
         // Verify we are the payer (first account in static keys)
