@@ -7,6 +7,8 @@ use std::io::Read;
 #[derive(Clone)]
 pub struct Config {
     pub helius_api_key: String,
+    pub birdeye_api_key: String,
+    pub jupiter_api_key: String,
     pub rpc_url: String,
     pub private_key: String,
     pub telegram_token: String,
@@ -79,6 +81,8 @@ impl Config {
 
         Self {
             helius_api_key: env::var("HELIUS_API_KEY").expect("HELIUS_API_KEY must be set"),
+            birdeye_api_key: env::var("BIRDEYE_API_KEY").expect("BIRDEYE_API_KEY must be set"),
+            jupiter_api_key: env::var("JUPITER_API_KEY").expect("JUPITER_API_KEY must be set"),
             rpc_url: env::var("SOLANA_RPC_URL").unwrap_or("https://api.mainnet-beta.solana.com".to_string()),
             private_key: env::var("SOLANA_PRIVATE_KEY").expect("SOLANA_PRIVATE_KEY must be set"),
             telegram_token: env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN must be set"),
@@ -322,8 +326,10 @@ impl Config {
         };
 
         format!(
-            "Config loaded: helius_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
+            "Config loaded: helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
             Self::mask_secret(&self.helius_api_key),
+            Self::mask_secret(&self.birdeye_api_key),
+            Self::mask_secret(&self.jupiter_api_key),
             self.rpc_url,
             private_key_display,
             if self.telegram_token.is_empty() { "not_set".to_string() } else { Self::mask_secret(&self.telegram_token) },

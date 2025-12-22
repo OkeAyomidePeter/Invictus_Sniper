@@ -39,6 +39,23 @@ pub struct HolderAnalysis {
     pub unique_holders: Option<u64>, // Total holder count (if available)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BirdeyeTokenOverview {
+    pub price: Option<f64>,
+    pub liquidity: Option<f64>,
+    #[serde(rename = "mc")]
+    pub market_cap: Option<f64>,
+    #[serde(rename = "v24hUSD")]
+    pub volume_24h: Option<f64>,
+    pub decimals: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BirdeyeHolder {
+    pub owner: String,
+    pub ui_amount: f64,
+}
+
 
 /// Fully enriched token ready for scoring/trading
 #[derive(Debug, Clone, Serialize)]
@@ -155,24 +172,26 @@ pub async fn start(
         .build()?;
     
     // Initial price fetch
-    if let Err(e) = update_sol_price_cache(&client).await {
+    if let Err(e) = update_sol_price_cache(&client, config).await {
         warn!("Failed to initialize SOL price cache: {}. Using default price.", e);
     }
 
     // Spawn background task to update SOL price every 30 seconds
     let price_client = client.clone();
+    let price_config = config.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            if let Err(e) = update_sol_price_cache(&price_client).await {
+            if let Err(e) = update_sol_price_cache(&price_client, &price_config).await {
                 warn!("Failed to update SOL price cache: {}", e);
             }
         }
     });
 
+    let loop_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = enrichment_loop(api_key, classified_rx, enriched_tx).await {
+        if let Err(e) = enrichment_loop(loop_config, classified_rx, enriched_tx).await {
             error!("Enrichment pipeline error: {}", e);
         }
     });
@@ -181,7 +200,7 @@ pub async fn start(
 }
 
 async fn enrichment_loop(
-    api_key: String,
+    config: Config,
     mut classified_rx: mpsc::Receiver<ClassifiedEvent>,
     enriched_tx: mpsc::Sender<EnrichedToken>,
 ) -> Result<()> {
@@ -230,7 +249,7 @@ async fn enrichment_loop(
                 let mut last_result: Result<EnrichedToken> = Err(anyhow::anyhow!("No attempts made"));
                 
                 while attempt <= max_retries {
-                    match enrich_token(&client, &api_key, pool_event.clone()).await {
+                    match enrich_token(&client, &config, pool_event.clone()).await {
                         Ok(enriched) => {
                             let liq = enriched.initial_liquidity_sol.unwrap_or(0.0);
                             
@@ -312,58 +331,66 @@ async fn enrichment_loop(
 /// Fast path for graduated tokens, full path for standard tokens
 async fn enrich_token(
     client: &Client,
-    api_key: &str,
+    config: &Config,
     pool_event: PoolCreationEvent,
 ) -> Result<EnrichedToken> {
     let start_time = std::time::Instant::now();
     
-    info!("⚡ Enriching graduated token: {} ({:?})", 
-        pool_event.token_mint,
-        pool_event.token_platform
+    info!("⚡ Enriching token: {} (Birdeye + Helius)", 
+        pool_event.token_mint
     );
     
-    // ========== PARALLEL RPC CALLS ==========
-    // Fetch all required data concurrently for maximum speed
+    // 1. Fetch mint data first (essential for Helius liquidity fallback if Birdeye stalls)
+    let mint_data_res = fetch_mint_account_cached(client, &config.helius_api_key, &pool_event.token_mint).await;
+    let mint_data = mint_data_res.ok();
+    let decimals = mint_data.as_ref().and_then(|m| m.decimals).unwrap_or(9);
+
+    // 2. Parallel fetch remaining data
     let (
-        mint_account_data,
-        liquidity_data,
+        birdeye_overview,
+        birdeye_holders,
         metadata_data,
-        holder_data,
-        total_holders,
+        helius_liq,
+        helius_holders_raw,
+        helius_total_holders,
         sol_price_data
     ) = tokio::join!(
-        fetch_mint_account_cached(client, api_key, &pool_event.token_mint),
-        fetch_liquidity_data(client, api_key, &pool_event.pool_address, &pool_event.token_mint, &pool_event.pair_token),
-        fetch_token_metadata(client, api_key, &pool_event.token_mint),
-        fetch_holder_analysis(client, api_key, &pool_event.token_mint),
-        fetch_total_holders(client, api_key, &pool_event.token_mint),
-        get_or_fetch_sol_price(client)
+        fetch_birdeye_overview(client, &config.birdeye_api_key, &pool_event.token_mint),
+        fetch_birdeye_holders(client, &config.birdeye_api_key, &pool_event.token_mint),
+        fetch_token_metadata(client, &config.helius_api_key, &pool_event.token_mint),
+        fetch_liquidity_data(client, &config.helius_api_key, &pool_event.pool_address, &pool_event.token_mint, &pool_event.pair_token, decimals),
+        fetch_holder_analysis(client, &config.helius_api_key, &pool_event.token_mint),
+        fetch_total_holders(client, &config.helius_api_key, &pool_event.token_mint),
+        get_or_fetch_sol_price(client, config)
     );
 
-    // Use fetched price or default if failed
     let sol_price = sol_price_data.unwrap_or(150.0);
 
     assemble_enriched_token(
         pool_event,
-        mint_account_data.ok(),
-        liquidity_data.ok(),
+        mint_data,
+        birdeye_overview.ok(),
+        birdeye_holders.ok(),
+        helius_liq.ok(),
         metadata_data.ok(),
-        holder_data.ok(),
-        total_holders.ok(),
+        helius_holders_raw.ok(),
+        helius_total_holders.ok(),
         sol_price,
         start_time,
     )
 }
 
 /// Assemble EnrichedToken from fetched data
-/// Assemble EnrichedToken from fetched data
+/// Assemble EnrichedToken from multiple sources
 fn assemble_enriched_token(
     pool_event: PoolCreationEvent,
     mint_data: Option<MintAccountData>,
-    liq_data: Option<LiquidityData>,
+    birdeye_ov: Option<BirdeyeTokenOverview>,
+    birdeye_holders: Option<Vec<BirdeyeHolder>>,
+    helius_liq: Option<LiquidityData>,
     metadata: Option<TokenMetadata>,
-    holders: Option<RawHolderData>,
-    total_holders: Option<u64>,
+    helius_holders: Option<RawHolderData>,
+    helius_total_holders: Option<u64>,
     sol_price: f64,
     start_time: std::time::Instant,
 ) -> Result<EnrichedToken> {
@@ -389,29 +416,53 @@ fn assemble_enriched_token(
         .and_then(|m| m.freeze_authority.as_ref())
         .is_some();
 
-    // Calculate market metrics
-    let (price_sol, price_usd, market_cap, fdv) = calculate_market_metrics(
-        &liq_data,
-        supply,
-        decimals,
-        sol_price,
-    );
+    // 1. LIQUIDITY PRIORITIZATION
+    let initial_liquidity_sol = birdeye_ov.as_ref()
+        .and_then(|b| b.liquidity)
+        .or_else(|| helius_liq.as_ref().and_then(|h| h.liquidity_sol));
 
-    // Fix Holder Analysis Percentages
-    let final_holders = if let Some(raw_holders) = holders {
+    // 2. PRICE PRIORITIZATION
+    let price_usd = birdeye_ov.as_ref()
+        .and_then(|b| b.price)
+        .or_else(|| metadata.as_ref().and_then(|m| m.price));
+    
+    let price_sol = price_usd.map(|p| p / sol_price);
+
+    // 3. MARKET CAP / FDV
+    let market_cap = birdeye_ov.as_ref().and_then(|b| b.market_cap);
+    let fdv = market_cap; // Assuming 100% circulating for graduated
+
+    // 4. HOLDER ANALYSIS PRIORITIZATION
+    let final_holders = if let Some(be_h) = birdeye_holders {
+        // Use Birdeye holders (usually cleaner than Helius for Top 10)
+        let mut sorted_amounts: Vec<f64> = be_h.iter().map(|h| h.ui_amount).collect();
+        sorted_amounts.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let total_supply_f64 = supply.unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
+        
+        if total_supply_f64 > 0.0 {
+            let top_1_amount = sorted_amounts.get(0).copied().unwrap_or(0.0);
+            let top_10_amount: f64 = sorted_amounts.iter().take(10).sum();
+            
+            Some(HolderAnalysis {
+                top_1_pct: (top_1_amount / total_supply_f64) * 100.0,
+                top_10_pct: (top_10_amount / total_supply_f64) * 100.0,
+                unique_holders: helius_total_holders, // Birdeye overview might lack this, use Helius
+            })
+        } else {
+            None
+        }
+    } else if let Some(raw_holders) = helius_holders {
+        // Fallback to Helius logic
         if let Some(s) = supply {
             let s_f64 = s as f64;
             if s_f64 > 0.0 {
-                // EXCLUDE POOL VAULTS: Remove the vault from concentration risk
-                let vault_addr = liq_data.as_ref().and_then(|l| l.pool_token_account.as_ref());
-                
+                let vault_addr = helius_liq.as_ref().and_then(|l| l.pool_token_account.as_ref());
                 let mut filtered_holders: Vec<f64> = raw_holders.holders.iter()
                     .filter(|h| {
-                        // Exclude identified vault
                         if let Some(v) = vault_addr {
                             if &h.address == v { return false; }
                         }
-                        // Also exclude the pool state account itself
                         if h.address == pool_event.pool_address { return false; }
                         true
                     })
@@ -419,21 +470,16 @@ fn assemble_enriched_token(
                     .collect();
                 
                 filtered_holders.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                
                 let top_1_amount = filtered_holders.get(0).copied().unwrap_or(0.0);
                 let top_10_amount: f64 = filtered_holders.iter().take(10).sum();
 
                 Some(HolderAnalysis {
                     top_1_pct: (top_1_amount / s_f64) * 100.0,
                     top_10_pct: (top_10_amount / s_f64) * 100.0,
-                    unique_holders: total_holders.or(raw_holders.unique_holders),
+                    unique_holders: helius_total_holders.or(raw_holders.unique_holders),
                 })
-            } else {
-                Some(HolderAnalysis { top_1_pct: 0.0, top_10_pct: 0.0, unique_holders: total_holders })
-            }
-        } else {
-             Some(HolderAnalysis { top_1_pct: 0.0, top_10_pct: 0.0, unique_holders: total_holders })
-        }
+            } else { None }
+        } else { None }
     } else {
         None
     };
@@ -450,15 +496,15 @@ fn assemble_enriched_token(
         supply,
         
         // Liquidity
-        has_liquidity: liq_data.is_some(),
+        has_liquidity: initial_liquidity_sol.is_some(),
         pool_address: pool_event.pool_address.clone(),
         pair_token: pool_event.pair_token.clone(),
         dex: pool_event.dex.clone(),
         
         // Price data
-        price_sol: price_sol.or(metadata.as_ref().and_then(|m| m.price).map(|p| p / sol_price)),
-        price_usd: price_usd.or(metadata.as_ref().and_then(|m| m.price)),
-        initial_liquidity_sol: liq_data.and_then(|l| l.liquidity_sol),
+        price_sol,
+        price_usd,
+        initial_liquidity_sol,
         fdv,
         market_cap,
         
@@ -497,6 +543,9 @@ fn assemble_enriched_token(
         unique_holders,
         socials_count
     );
+    
+    // NEW: Log the full struct for deep debugging as requested by user
+    TradeLogger::log_enriched_token(&enriched);
 
     Ok(enriched)
 }
@@ -614,11 +663,12 @@ async fn fetch_liquidity_data(
     pool_address: &str,
     token_mint: &str,
     pair_token: &str,
+    token_decimals: u8,
 ) -> Result<LiquidityData> {
     let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
     
     // Program IDs for SPL Token and Token-2022
-    let token_programs = [
+    let _token_programs = [
         "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
         "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
     ];
@@ -634,6 +684,7 @@ async fn fetch_liquidity_data(
     ];
 
     // STEP 1: DAS-based reserve discovery (More robust than direct RPC)
+
     let das_req = json!({
         "jsonrpc": "2.0",
         "id": "pool-reserves",
@@ -651,9 +702,18 @@ async fn fetch_liquidity_data(
                 for account in accounts {
                     let mint = account.get("mint").and_then(|m| m.as_str()).unwrap_or("");
                     let amount = account.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.0);
-                    let decimals = account.get("decimals").and_then(|d| d.as_u64()).unwrap_or(6) as u32;
-                    let ui_amount = amount / 10f64.powi(decimals as i32);
                     let pubkey = account.get("address").and_then(|s| s.as_str()).unwrap_or("");
+
+                    // CRITICAL: Determine correct decimals for calculation
+                    let decimals = if sol_mints.contains(&mint) || mint == pair_token {
+                        9 // SOL/WSOL
+                    } else if mint == token_mint {
+                        token_decimals as u32
+                    } else {
+                        6 // Default fallback
+                    };
+
+                    let ui_amount = amount / 10f64.powi(decimals as i32);
 
                     if sol_mints.contains(&mint) || mint == pair_token {
                         liquidity_sol = Some(ui_amount);
@@ -903,9 +963,15 @@ async fn fetch_total_holders(
     // If it returns 1 (just the pool) but the token is graduated/active, 
     // we fallback to the count of largest accounts we already fetched to avoid false "Ghost Town" penalties.
     if total <= 1 {
-        // Fetch largest accounts list to get a better lower bound
+        // Fetch largest accounts list to get a better lower bound (Limit increased to 100)
         let largest_req = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]
+            "jsonrpc": "2.0", 
+            "id": 1, 
+            "method": "getTokenLargestAccounts", 
+            "params": [
+                mint,
+                { "commitment": "confirmed" } // Optional params can take a limit but standard JSON-RPC use [mint]
+            ]
         });
         if let Ok(resp) = client.post(&url).json(&largest_req).send().await {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
@@ -980,7 +1046,7 @@ fn calculate_market_metrics(
 }
 
 /// Get cached SOL price or fetch new one if expired (async)
-async fn get_or_fetch_sol_price(client: &Client) -> Result<f64> {
+async fn get_or_fetch_sol_price(client: &Client, config: &Config) -> Result<f64> {
     const CACHE_TTL_SECONDS: i64 = 30;
 
     let now = chrono::Utc::now().timestamp();
@@ -996,15 +1062,15 @@ async fn get_or_fetch_sol_price(client: &Client) -> Result<f64> {
     }
 
     // Cache expired or empty, fetch new price
-    update_sol_price_cache(client).await
+    update_sol_price_cache(client, config).await
 }
 
 /// Fetch real-time SOL price from multiple sources with fallback
-pub async fn update_sol_price_cache(client: &Client) -> Result<f64> {
+pub async fn update_sol_price_cache(client: &Client, config: &Config) -> Result<f64> {
     // Try multiple sources in order of preference
-    let price = match fetch_sol_price_jupiter(client).await {
+    let price = match fetch_sol_price_jupiter_v6(client, &config.jupiter_api_key).await {
         Ok(p) => p,
-        Err(_) => match fetch_sol_price_birdeye(client).await {
+        Err(_) => match fetch_sol_price_birdeye_with_key(client, &config.birdeye_api_key).await {
             Ok(p) => p,
             Err(_) => fetch_sol_price_coingecko(client).await.unwrap_or(150.0),
         },
@@ -1023,40 +1089,44 @@ pub async fn update_sol_price_cache(client: &Client) -> Result<f64> {
     Ok(price)
 }
 
-/// Fetch SOL price from Jupiter Price API v3 (Lite)
-async fn fetch_sol_price_jupiter(client: &Client) -> Result<f64> {
-    // Using the specific Lite API endpoint for SOL
-    let url = "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112";
+/// Fetch SOL price from Jupiter Price API v2 (Authenticated)
+async fn fetch_sol_price_jupiter_v6(client: &Client, api_key: &str) -> Result<f64> {
+    let url = "https://api.jup.ag/price/v2/full?ids=So11111111111111111111111111111111111111112";
     
     let response = client
         .get(url)
+        .header("x-api-key", api_key)
         .timeout(Duration::from_secs(3))
         .send()
         .await
-        .context("Jupiter API request failed")?;
+        .context("Jupiter V6 Price API request failed")?;
 
     let json: serde_json::Value = response.json().await?;
     
-    // Parse response: {"So11...": {"usdPrice": ...}}
-    let price = json
-        .get("So11111111111111111111111111111111111111112")
-        .and_then(|d| d.get("usdPrice"))
-        .and_then(|p| p.as_f64())
-        .context("Failed to parse Jupiter price")?;
+    // Parse response: {"data": {"So11...": {"price": "..."}}}
+    let price_str = json
+        .get("data")
+        .and_then(|d| d.get("So11111111111111111111111111111111111111112"))
+        .and_then(|p| p.get("price"))
+        .and_then(|v| v.as_str())
+        .context("Failed to parse Jupiter v6 price")?;
 
+    let price: f64 = price_str.parse().context("Failed to parse price string as f64")?;
     Ok(price)
 }
 
-/// Fetch SOL price from Birdeye API
-async fn fetch_sol_price_birdeye(client: &Client) -> Result<f64> {
-    let url = "https://public-api.birdeye.so/public/price?address=So11111111111111111111111111111111111111112";
+/// Fetch SOL price from Birdeye API (Authenticated)
+async fn fetch_sol_price_birdeye_with_key(client: &Client, api_key: &str) -> Result<f64> {
+    let url = "https://public-api.birdeye.so/defi/price?address=So11111111111111111111111111111111111111112";
     
     let response = client
         .get(url)
+        .header("X-API-KEY", api_key)
+        .header("x-chain", "solana")
         .timeout(Duration::from_secs(3))
         .send()
         .await
-        .context("Birdeye API request failed")?;
+        .context("Birdeye Price API request failed")?;
 
     let json: serde_json::Value = response.json().await?;
     
@@ -1067,6 +1137,62 @@ async fn fetch_sol_price_birdeye(client: &Client) -> Result<f64> {
         .context("Failed to parse Birdeye price")?;
 
     Ok(price)
+}
+
+/// Fetch detailed token overview from Birdeye
+async fn fetch_birdeye_overview(
+    client: &Client,
+    api_key: &str,
+    mint: &str,
+) -> Result<BirdeyeTokenOverview> {
+    let url = format!("https://public-api.birdeye.so/defi/token_overview?address={}", mint);
+    
+    let response = client
+        .get(&url)
+        .header("X-API-KEY", api_key)
+        .header("x-chain", "solana")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .context("Birdeye Token Overview request failed")?;
+
+    let json: serde_json::Value = response.json().await?;
+    
+    if let Some(data) = json.get("data") {
+        let overview: BirdeyeTokenOverview = serde_json::from_value(data.clone())
+            .context("Failed to deserialize Birdeye token overview")?;
+        Ok(overview)
+    } else {
+        Err(anyhow::anyhow!("Birdeye overview returned no data for {}", mint))
+    }
+}
+
+/// Fetch token holders from Birdeye (Top 100)
+async fn fetch_birdeye_holders(
+    client: &Client,
+    api_key: &str,
+    mint: &str,
+) -> Result<Vec<BirdeyeHolder>> {
+    let url = format!("https://public-api.birdeye.so/defi/v3/token/holder?address={}&offset=0&limit=100", mint);
+    
+    let response = client
+        .get(&url)
+        .header("X-API-KEY", api_key)
+        .header("x-chain", "solana")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .context("Birdeye Token Holders request failed")?;
+
+    let json: serde_json::Value = response.json().await?;
+    
+    if let Some(items) = json.get("data").and_then(|d| d.get("items")) {
+        let holders: Vec<BirdeyeHolder> = serde_json::from_value(items.clone())
+            .context("Failed to deserialize Birdeye holders")?;
+        Ok(holders)
+    } else {
+        Err(anyhow::anyhow!("Birdeye holders returned no data for {}", mint))
+    }
 }
 
 /// Fetch SOL price from CoinGecko API (free tier, may be rate limited)

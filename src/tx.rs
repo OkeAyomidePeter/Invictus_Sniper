@@ -253,7 +253,6 @@ impl TransactionManager {
         Ok(versioned_tx)
     }
 
-    /// Get Jupiter quote
     async fn get_jupiter_quote(
         &self,
         input_mint: &str,
@@ -261,18 +260,31 @@ impl TransactionManager {
         amount: u64,
         slippage_bps: u16,
     ) -> Result<serde_json::Value> {
-        // Acquire rate limit token if enabled
-        if let Some(limiter) = &self.jupiter_limiter {
-            limiter.acquire().await;
-        }
-        
         let url = format!(
             "{}?inputMint={}&outputMint={}&amount={}&slippageBps={}",
             JUPITER_QUOTE_API, input_mint, output_mint, amount, slippage_bps
         );
-        
-        let response = self.client.get(&url).send().await?.json().await?;
-        Ok(response)
+
+        let mut last_err = None;
+        for attempt in 1..=3 {
+            // Acquire rate limit token
+            if let Some(limiter) = &self.jupiter_limiter {
+                limiter.acquire().await;
+            }
+
+            match self.client.get(&url).send().await {
+                Ok(resp) => {
+                    return Ok(resp.json().await?);
+                }
+                Err(e) => {
+                    warn!("⚠️ Jupiter Quote Attempt {} failed: {}. Retrying...", attempt, e);
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Jupiter Quote failed after 3 attempts: {:?}", last_err))
     }
 
     /// Create Jito tip instruction (single instruction, not separate tx)

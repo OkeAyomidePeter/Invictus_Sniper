@@ -70,6 +70,13 @@ impl TradeLogger {
             &mint[..12.min(mint.len())], liquidity_score, holder_score, social_score, final_score
         ));
     }
+
+    /// Log the full serialized EnrichedToken struct for deep debugging
+    pub fn log_enriched_token(token: &crate::enrichment::EnrichedToken) {
+        if let Ok(json) = serde_json::to_string_pretty(token) {
+            TradeLogger::log(&format!("💎 FULL_ENRICHED_DATA [{}]:\n{}", token.mint, json));
+        }
+    }
 }
 
 /// Log a specific step in the trade pipeline with timing

@@ -24,6 +24,8 @@ pub struct ConfigData {
     pub helius_api_key: String,
     pub rpc_url: String,
     pub solana_private_key: String,
+    pub birdeye_api_key: String,
+    pub jupiter_api_key: String,
     
     // Telegram Bot
     pub telegram_bot_token: String,
@@ -110,6 +112,8 @@ impl Default for ConfigData {
             helius_api_key: String::new(),
             rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             solana_private_key: String::new(),
+            birdeye_api_key: String::new(),
+            jupiter_api_key: String::new(),
             telegram_bot_token: String::new(),
             telegram_chat_id: String::new(),
             database_url: "sqlite://invictus.db".to_string(),
@@ -176,6 +180,8 @@ impl ConfigData {
             private_key: self.solana_private_key.clone(),
             telegram_token: self.telegram_bot_token.clone(),
             telegram_chat_id: self.telegram_chat_id.clone(),
+            birdeye_api_key: self.birdeye_api_key.clone(),
+            jupiter_api_key: self.jupiter_api_key.clone(),
             alternate_telegram_chat_id: None, // Loaded from env
             database_url: self.database_url.clone(),
             min_liquidity_sol: self.min_liquidity_sol.parse().map_err(|_| "Invalid min_liquidity_sol")?,
@@ -325,6 +331,8 @@ impl InvictusGUI {
         
         writeln!(file, "# Core Configuration")?;
         writeln!(file, "HELIUS_API_KEY={}", self.config.helius_api_key)?;
+        writeln!(file, "BIRDEYE_API_KEY={}", self.config.birdeye_api_key)?;
+        writeln!(file, "JUPITER_API_KEY={}", self.config.jupiter_api_key)?;
         writeln!(file, "SOLANA_RPC_URL={}", self.config.rpc_url)?;
         writeln!(file, "SOLANA_PRIVATE_KEY={}", self.config.solana_private_key)?;
         writeln!(file)?;
@@ -444,6 +452,8 @@ impl InvictusGUI {
         };
 
         load_str(&mut self.config.helius_api_key, "HELIUS_API_KEY");
+        load_str(&mut self.config.birdeye_api_key, "BIRDEYE_API_KEY");
+        load_str(&mut self.config.jupiter_api_key, "JUPITER_API_KEY");
         load_str(&mut self.config.rpc_url, "SOLANA_RPC_URL");
         load_str(&mut self.config.solana_private_key, "SOLANA_PRIVATE_KEY");
         load_str(&mut self.config.telegram_bot_token, "TELEGRAM_BOT_TOKEN");
