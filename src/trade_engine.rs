@@ -109,36 +109,60 @@ impl TradeEngine {
         }
         log_pipeline_step(&token.mint, "Sign Txs", start_step.elapsed().as_millis(), true);
 
-        // STEP 5: Send Jito Bundle
-        let start_step = Instant::now();
-        let bundle_id = match self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await {
-            Ok(id) => {
-                log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), true);
-                id
-            },
-            Err(e) => {
-                log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), false);
-                log_error_detailed(&token.mint, "Send Bundle", &e.to_string());
-                return Err(e);
-            }
-        };
-        
-        info!("🚀 Buy Bundle Sent! ID: {}", bundle_id);
-        log_bundle_sent(&bundle_id, 2);
-
-        // STEP 6: Wait for Bundle Confirmation
-        let start_step = Instant::now();
-        let bundle_status = self.presigner.wait_for_bundle_confirmation(&bundle_id, 30).await?;
-        
-        if bundle_status.is_success() {
-            log_pipeline_step(&token.mint, "Confirm Bundle", start_step.elapsed().as_millis(), true);
-            log_bundle_confirmed(&bundle_id, "Landed");
+        // STEP 5: Send (Standard vs Jito)
+        let mode = self.tx_manager.transaction_mode();
+        let bundle_id = if mode == crate::config::TransactionMode::Standard {
+            // STEP 5a: Send Standard Transaction
+            let start_step = Instant::now();
+            let sig = match self.presigner.send_versioned_transaction(&buy_tx) {
+                Ok(s) => {
+                    log_pipeline_step(&token.mint, "Send Standard Tx", start_step.elapsed().as_millis(), true);
+                    crate::trade_logger::log_priority_fees(&token.mint, self.config.priority_fee_lamports);
+                    s
+                },
+                Err(e) => {
+                    log_pipeline_step(&token.mint, "Send Standard Tx", start_step.elapsed().as_millis(), false);
+                    log_error_detailed(&token.mint, "Send Standard Tx", &e.to_string());
+                    return Err(e);
+                }
+            };
+            info!("🚀 Standard BUY Sent! Sig: {}", sig);
+            sig
         } else {
-            log_pipeline_step(&token.mint, "Confirm Bundle", start_step.elapsed().as_millis(), false);
-            log_error_detailed(&token.mint, "Confirm Bundle", &format!("{:?}", bundle_status));
-            log_bundle_confirmed(&bundle_id, &format!("{:?}", bundle_status));
-            return Err(anyhow::anyhow!("Bundle failed to land: {:?}", bundle_status));
-        }
+            // STEP 5b: Send Jito Bundle
+            let start_step = Instant::now();
+            // Build Tip Transaction (Jito Only)
+            let recent_blockhash = self.presigner.get_blockhash();
+            let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
+            buy_tx.message.set_recent_blockhash(recent_blockhash);
+            
+            self.presigner.sign_versioned_tx(&mut buy_tx)?;
+            self.presigner.sign_versioned_tx(&mut tip_tx)?;
+
+            let id = match self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await {
+                Ok(id) => {
+                    log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), true);
+                    id
+                },
+                Err(e) => {
+                    log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), false);
+                    log_error_detailed(&token.mint, "Send Bundle", &e.to_string());
+                    return Err(e);
+                }
+            };
+            
+            info!("🚀 Buy Bundle Sent! ID: {}", id);
+            log_bundle_sent(&id, 2);
+
+            // Wait for confirmation (Jito Only - standard uses confirm_transaction inside send_and_confirm)
+            let start_confirm = Instant::now();
+            let status = self.presigner.wait_for_bundle_confirmation(&id, 30).await?;
+            if !status.is_success() {
+                 return Err(anyhow::anyhow!("Bundle failed: {:?}", status));
+            }
+            log_pipeline_step(&token.mint, "Confirm Bundle", start_confirm.elapsed().as_millis(), true);
+            id
+        };
 
         // STEP 7: Verify Position & Record to DB
         let start_step = Instant::now();
@@ -190,29 +214,45 @@ impl TradeEngine {
         let slippage_bps = self.config.auto_sell_slippage_bps;
         let tip_lamports = self.tx_manager.calculate_tip(false); // Lower priority than buy, but still tipped
 
-        // 1. Build Sell Transaction
-        let mut sell_tx = self.tx_manager.build_sell_transaction(
-            &signal.position.mint,
-            amount_token,
-            slippage_bps,
-            DexRouter::Jupiter,
-            true, // Close ATA
-        ).await?;
+        // 1. Send (Standard vs Jito)
+        let mode = self.tx_manager.transaction_mode();
+        let bundle_id = if mode == crate::config::TransactionMode::Standard {
+            // 1a. Build & Send Standard Transaction
+            let sell_tx = self.tx_manager.build_sell_transaction(
+                &signal.position.mint,
+                amount_token,
+                slippage_bps,
+                DexRouter::Jupiter,
+                true, // Close ATA
+            ).await?;
 
-        // 2. Build Tip Transaction
-        let recent_blockhash = self.presigner.get_blockhash();
-        let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
+            let sig = self.presigner.send_versioned_transaction(&sell_tx)?;
+            info!("🚀 Standard SELL Sent! Sig: {}", sig);
+            crate::trade_logger::log_priority_fees(&signal.position.mint, self.config.priority_fee_lamports);
+            sig
+        } else {
+            // 1b. Build & Send Jito Bundle
+            let mut sell_tx = self.tx_manager.build_sell_transaction(
+                &signal.position.mint,
+                amount_token,
+                slippage_bps,
+                DexRouter::Jupiter,
+                true, // Close ATA
+            ).await?;
 
-        // 3. Sign Transactions
-        sell_tx.message.set_recent_blockhash(recent_blockhash);
-        self.presigner.sign_versioned_tx(&mut sell_tx)?;
-        self.presigner.sign_versioned_tx(&mut tip_tx)?;
+            let recent_blockhash = self.presigner.get_blockhash();
+            let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
 
-        // 4. Send Jito Bundle
-        let bundle_id = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
+            sell_tx.message.set_recent_blockhash(recent_blockhash);
+            self.presigner.sign_versioned_tx(&mut sell_tx)?;
+            self.presigner.sign_versioned_tx(&mut tip_tx)?;
+
+            let id = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
+            info!("🚀 Sell Bundle Sent! ID: {}", id);
+            log_bundle_sent(&id, 2);
+            id
+        };
         
-        info!("🚀 Sell Bundle Sent! ID: {}", bundle_id);
-        log_bundle_sent(&bundle_id, 2);
         Ok(bundle_id)
     }
 

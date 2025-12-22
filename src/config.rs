@@ -4,6 +4,32 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum TransactionMode {
+    Jito,
+    Standard,
+}
+
+impl std::fmt::Display for TransactionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionMode::Jito => write!(f, "Jito"),
+            TransactionMode::Standard => write!(f, "Standard"),
+        }
+    }
+}
+
+impl std::str::FromStr for TransactionMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "jito" => Ok(TransactionMode::Jito),
+            "standard" | "helius" => Ok(TransactionMode::Standard),
+            _ => Err(format!("Invalid transaction mode: {}", s)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub helius_api_key: String,
@@ -22,6 +48,10 @@ pub struct Config {
     pub max_creator_ownership_percentage: f64,
     pub honeypot_check_enabled: bool,
     pub jupiter_api_timeout_ms: u64,
+    // Transaction Mode
+    pub transaction_mode: TransactionMode,
+    pub priority_fee_lamports: u64,
+    pub compute_unit_limit: u32,
     // Auto-sell configuration
     pub auto_sell_enabled: bool,
     pub auto_sell_profit_target_pct: f64,
@@ -117,6 +147,19 @@ impl Config {
                 .unwrap_or("5000".to_string())
                 .parse()
                 .expect("JUPITER_API_TIMEOUT_MS must be a valid number"),
+            // Transaction Mode
+            transaction_mode: env::var("TRANSACTION_MODE")
+                .unwrap_or("Standard".to_string())
+                .parse()
+                .unwrap_or(TransactionMode::Standard),
+            priority_fee_lamports: env::var("PRIORITY_FEE_LAMPORTS")
+                .unwrap_or("100000".to_string())
+                .parse()
+                .expect("PRIORITY_FEE_LAMPORTS must be a valid number"),
+            compute_unit_limit: env::var("COMPUTE_UNIT_LIMIT")
+                .unwrap_or("200000".to_string())
+                .parse()
+                .expect("COMPUTE_UNIT_LIMIT must be a valid number"),
             // Auto-sell configuration
             auto_sell_enabled: env::var("AUTO_SELL_ENABLED")
                 .unwrap_or("true".to_string())
@@ -326,7 +369,8 @@ impl Config {
         };
 
         format!(
-            "Config loaded: helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
+            "Config loaded: mode={}, helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
+            self.transaction_mode,
             Self::mask_secret(&self.helius_api_key),
             Self::mask_secret(&self.birdeye_api_key),
             Self::mask_secret(&self.jupiter_api_key),
@@ -375,6 +419,7 @@ mod tests {
         let config = Config::load();
 
         // Test defaults
+        assert_eq!(config.transaction_mode, TransactionMode::Standard);
         assert_eq!(config.min_liquidity_sol, 10.0);
         assert_eq!(config.min_holders, 10);
         assert_eq!(config.max_trade_size_sol, 1.0);

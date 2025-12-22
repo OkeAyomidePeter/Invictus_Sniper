@@ -104,6 +104,14 @@ pub fn log_enrichment_debug(mint: &str, pool_address: &str, liquidity_sol: f64, 
     ));
 }
 
+/// Log priority fees used
+pub fn log_priority_fees(mint: &str, lamports: u64) {
+    TradeLogger::log(&format!(
+        "💸 FEES: {} | Priority Fee: {:.6} SOL", 
+        &mint[..12.min(mint.len())], lamports as f64 / 1_000_000_000.0
+    ));
+}
+
 /// Log a significant pipeline event
 pub fn log_pipeline_event(mint: &str, event: &str, details: &str) {
     TradeLogger::log(&format!(
@@ -189,10 +197,10 @@ pub fn log_buy_attempt(mint: &str, amount_sol: f64, is_watchlist: bool) {
 }
 
 /// Log a successful buy execution
-pub fn log_buy(mint: &str, amount_sol: f64, bundle_id: &str) {
+pub fn log_buy(mint: &str, amount_sol: f64, identifier: &str) {
     TradeLogger::log(&format!(
-        "🚀 BUY EXECUTED: {} | Amount: {:.4} SOL | Bundle: {}", 
-        &mint[..12.min(mint.len())], amount_sol, &bundle_id[..20.min(bundle_id.len())]
+        "🚀 BUY EXECUTED: {} | Amount: {:.4} SOL | ID: {}", 
+        &mint[..12.min(mint.len())], amount_sol, &identifier[..20.min(identifier.len())]
     ));
 }
 
@@ -205,13 +213,13 @@ pub fn log_buy_failed(mint: &str, amount_sol: f64, error: &str) {
 }
 
 /// Log a sell execution
-pub fn log_sell(mint: &str, pnl_sol: f64, pnl_pct: f64, trigger: &str, bundle_id: &str) {
+pub fn log_sell(mint: &str, pnl_sol: f64, pnl_pct: f64, trigger: &str, identifier: &str) {
     let emoji = if pnl_sol >= 0.0 { "💰" } else { "🔻" };
     let sign = if pnl_sol >= 0.0 { "+" } else { "" };
     TradeLogger::log(&format!(
-        "{} SELL EXECUTED: {} | P/L: {}{:.4} SOL ({}{:.2}%) | Trigger: {} | Bundle: {}", 
+        "{} SELL EXECUTED: {} | P/L: {}{:.4} SOL ({}{:.2}%) | Trigger: {} | ID: {}", 
         emoji, &mint[..12.min(mint.len())], sign, pnl_sol, sign, pnl_pct, trigger,
-        &bundle_id[..20.min(bundle_id.len())]
+        &identifier[..20.min(identifier.len())]
     ));
 }
 
