@@ -52,11 +52,6 @@ impl TradeEngine {
         let amount_lamports = (amount_sol * 1_000_000_000.0) as u64;
         let slippage_bps = 200; // Default 2%
         
-        // STEP 1: Calculate Tip
-        let start_step = Instant::now();
-        let tip_lamports = self.tx_manager.calculate_tip(true); // High priority for buys
-        log_pipeline_step(&token.mint, "Calculate Tip", start_step.elapsed().as_millis(), true);
-
         // STEP 2: Build Buy Transaction
         let start_step = Instant::now();
         let mut buy_tx = match self.tx_manager.build_buy_transaction(
@@ -64,7 +59,7 @@ impl TradeEngine {
             amount_lamports,
             slippage_bps,
             DexRouter::Jupiter, // Default to Jupiter for now
-            tip_lamports,
+            0, // Tip lamports not needed here anymore
         ).await {
             Ok(tx) => {
                 log_pipeline_step(&token.mint, "Build Buy Tx", start_step.elapsed().as_millis(), true);
@@ -77,42 +72,10 @@ impl TradeEngine {
             }
         };
 
-        // STEP 3: Build Tip Transaction
-        let start_step = Instant::now();
-        let recent_blockhash = self.presigner.get_blockhash();
-        let mut tip_tx = match self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash) {
-            Ok(tx) => {
-                log_pipeline_step(&token.mint, "Build Tip Tx", start_step.elapsed().as_millis(), true);
-                tx
-            },
-            Err(e) => {
-                log_pipeline_step(&token.mint, "Build Tip Tx", start_step.elapsed().as_millis(), false);
-                log_error_detailed(&token.mint, "Build Tip Tx", &e.to_string());
-                return Err(e);
-            }
-        };
-
-        // STEP 4: Sign Transactions
-        let start_step = Instant::now();
-        // Update blockhash for buy tx to match tip tx (critical for bundles)
-        buy_tx.message.set_recent_blockhash(recent_blockhash);
-        
-        if let Err(e) = self.presigner.sign_versioned_tx(&mut buy_tx) {
-             log_pipeline_step(&token.mint, "Sign Buy Tx", start_step.elapsed().as_millis(), false);
-             log_error_detailed(&token.mint, "Sign Buy Tx", &e.to_string());
-             return Err(e);
-        }
-        if let Err(e) = self.presigner.sign_versioned_tx(&mut tip_tx) {
-             log_pipeline_step(&token.mint, "Sign Tip Tx", start_step.elapsed().as_millis(), false);
-             log_error_detailed(&token.mint, "Sign Tip Tx", &e.to_string());
-             return Err(e);
-        }
-        log_pipeline_step(&token.mint, "Sign Txs", start_step.elapsed().as_millis(), true);
-
-        // STEP 5: Send (Standard vs Jito)
+        // STEP 3: Sign & Send (Standard vs Jito)
         let mode = self.tx_manager.transaction_mode();
-        let bundle_id = if mode == crate::config::TransactionMode::Standard {
-            // STEP 5a: Send Standard Transaction
+        let identifier = if mode == crate::config::TransactionMode::Standard {
+            // STEP 3a: Send Standard Transaction
             let start_step = Instant::now();
             let sig = match self.presigner.send_versioned_transaction(&buy_tx) {
                 Ok(s) => {
@@ -129,16 +92,18 @@ impl TradeEngine {
             info!("🚀 Standard BUY Sent! Sig: {}", sig);
             sig
         } else {
-            // STEP 5b: Send Jito Bundle
-            let start_step = Instant::now();
-            // Build Tip Transaction (Jito Only)
+            // STEP 3b: Send Jito Bundle
+            let tip_lamports = self.tx_manager.calculate_tip(true);
             let recent_blockhash = self.presigner.get_blockhash();
+            
+            // Build Tip Transaction (Jito Only)
             let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
             buy_tx.message.set_recent_blockhash(recent_blockhash);
             
             self.presigner.sign_versioned_tx(&mut buy_tx)?;
             self.presigner.sign_versioned_tx(&mut tip_tx)?;
 
+            let start_step = Instant::now();
             let id = match self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await {
                 Ok(id) => {
                     log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), true);
@@ -154,7 +119,7 @@ impl TradeEngine {
             info!("🚀 Buy Bundle Sent! ID: {}", id);
             log_bundle_sent(&id, 2);
 
-            // Wait for confirmation (Jito Only - standard uses confirm_transaction inside send_and_confirm)
+            // Wait for confirmation (Jito Only)
             let start_confirm = Instant::now();
             let status = self.presigner.wait_for_bundle_confirmation(&id, 30).await?;
             if !status.is_success() {
@@ -183,13 +148,13 @@ impl TradeEngine {
             "BUY",
             token_amount,
             amount_lamports,
-            &bundle_id,
-            Some(&bundle_id),
+            &identifier,
+            Some(&identifier),
             Some(amount_sol / 1.0), // Placeholder price
         ).await?;
 
         // Log successful buy
-        log_buy(&token.mint, amount_sol, &bundle_id);
+        log_buy(&token.mint, amount_sol, &identifier);
         log_pipeline_step(&token.mint, "Total Buy Flow", start_total.elapsed().as_millis(), true);
 
         // 7. Start Monitoring (if auto-sell enabled)
@@ -212,11 +177,10 @@ impl TradeEngine {
 
         let amount_token = signal.position.amount_token_raw;
         let slippage_bps = self.config.auto_sell_slippage_bps;
-        let tip_lamports = self.tx_manager.calculate_tip(false); // Lower priority than buy, but still tipped
 
         // 1. Send (Standard vs Jito)
         let mode = self.tx_manager.transaction_mode();
-        let bundle_id = if mode == crate::config::TransactionMode::Standard {
+        let identifier = if mode == crate::config::TransactionMode::Standard {
             // 1a. Build & Send Standard Transaction
             let sell_tx = self.tx_manager.build_sell_transaction(
                 &signal.position.mint,
@@ -231,7 +195,9 @@ impl TradeEngine {
             crate::trade_logger::log_priority_fees(&signal.position.mint, self.config.priority_fee_lamports);
             sig
         } else {
-            // 1b. Build & Send Jito Bundle
+            // 1b. Jito Bundle Mode
+            let tip_lamports = self.tx_manager.calculate_tip(false);
+            
             let mut sell_tx = self.tx_manager.build_sell_transaction(
                 &signal.position.mint,
                 amount_token,
@@ -253,7 +219,7 @@ impl TradeEngine {
             id
         };
         
-        Ok(bundle_id)
+        Ok(identifier)
     }
 
     /// Close all open positions (graceful shutdown)
