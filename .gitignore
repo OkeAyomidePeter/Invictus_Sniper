@@ -6,6 +6,3 @@
 /.log
 *.log
 *.db
-*target
-*.md
-/.md
