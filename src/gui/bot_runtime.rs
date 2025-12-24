@@ -306,9 +306,9 @@ async fn run_bot_logic(
                 let score = scorer.score(&enriched_token);
 
                 let log_msg = format!(
-                    "✨ ENRICHED: {} | Liq: ${:.2} | Score: {:.1}/70",
+                    "✨ ENRICHED: {} | Liq: ${:.0} | Score: {:.1}/150",
                     enriched_token.mint,
-                    enriched_token.initial_liquidity_sol.unwrap_or(0.0),
+                    enriched_token.liquidity_usd.unwrap_or(0.0),
                     score
                 );
                 let _ = event_tx.send(BotEvent::LogMessage {
@@ -316,10 +316,10 @@ async fn run_bot_logic(
                     message: log_msg,
                 });
 
-                if score > 50.0 {
+                if score > 100.0 {
                     let _ = event_tx.send(BotEvent::LogMessage {
                         level: "INFO".to_string(),
-                        message: format!("🚀 HIGH SCORE: {} ({:.1}/70)", enriched_token.mint, score),
+                        message: format!("🚀 HIGH SCORE: {} ({:.1}/150)", enriched_token.mint, score),
                     });
 
                     // Store in DB

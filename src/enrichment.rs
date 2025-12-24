@@ -95,6 +95,7 @@ pub struct EnrichedToken {
     // ========== PRICE DATA ==========
     pub price_sol: Option<f64>,
     pub price_usd: Option<f64>,
+    pub liquidity_usd: Option<f64>, // ✅ NEW: Birdeye liquidity in USD
     pub initial_liquidity_sol: Option<f64>,
     pub fdv: Option<f64>,
     pub market_cap: Option<f64>,
@@ -435,19 +436,13 @@ async fn enrich_token(
     // 2. Parallel fetch remaining data
     let (
         birdeye_overview,
-        birdeye_holders,
-        metadata_data,
-        helius_liq,
         helius_holders_raw,
-        helius_total_holders,
+        metadata_data,
         sol_price_data
     ) = tokio::join!(
         fetch_birdeye_overview(client, &config.birdeye_api_key, &pool_event.token_mint),
-        fetch_birdeye_holders(client, &config.birdeye_api_key, &pool_event.token_mint),
-        fetch_token_metadata(client, &config.helius_api_key, &pool_event.token_mint),
-        fetch_liquidity_data(client, &config.helius_api_key, &pool_event.pool_address, &pool_event.token_mint, &pool_event.pair_token, decimals),
         fetch_holder_analysis(client, &config.helius_api_key, &pool_event.token_mint),
-        fetch_total_holders(client, &config.helius_api_key, &pool_event.token_mint),
+        fetch_token_metadata(client, &config.helius_api_key, &pool_event.token_mint),
         get_or_fetch_sol_price(client, config)
     );
 
@@ -457,11 +452,8 @@ async fn enrich_token(
         pool_event,
         mint_data,
         birdeye_overview.ok(),
-        birdeye_holders.ok(),
-        helius_liq.ok(),
-        metadata_data.ok(),
         helius_holders_raw.ok(),
-        helius_total_holders.ok(),
+        metadata_data.ok(),
         sol_price,
         start_time,
     )
@@ -473,11 +465,8 @@ fn assemble_enriched_token(
     pool_event: PoolCreationEvent,
     mint_data: Option<MintAccountData>,
     birdeye_ov: Option<BirdeyeTokenOverview>,
-    birdeye_holders: Option<Vec<BirdeyeHolder>>,
-    helius_liq: Option<LiquidityData>,
-    metadata: Option<TokenMetadata>,
     helius_holders: Option<RawHolderData>,
-    helius_total_holders: Option<u64>,
+    metadata: Option<TokenMetadata>,
     sol_price: f64,
     start_time: std::time::Instant,
 ) -> Result<EnrichedToken> {
@@ -504,9 +493,9 @@ fn assemble_enriched_token(
         .is_some();
 
     // 1. LIQUIDITY PRIORITIZATION
-    let initial_liquidity_sol = birdeye_ov.as_ref()
-        .and_then(|b| b.liquidity)
-        .or_else(|| helius_liq.as_ref().and_then(|h| h.liquidity_sol));
+    // 1. LIQUIDITY PRIORITIZATION
+    let liquidity_usd = birdeye_ov.as_ref().and_then(|b| b.liquidity);
+    let initial_liquidity_sol = liquidity_usd.map(|usd| usd / sol_price);
 
     // 2. PRICE PRIORITIZATION
     let price_usd = birdeye_ov.as_ref()
@@ -544,51 +533,28 @@ fn assemble_enriched_token(
         m
     });
 
-    // 6. HOLDER ANALYSIS PRIORITIZATION
-    let final_holders = if let Some(be_h) = birdeye_holders {
-        // Use Birdeye holders (usually cleaner than Helius for Top 10)
-        let mut sorted_amounts: Vec<f64> = be_h.iter().map(|h| h.ui_amount).collect();
-        sorted_amounts.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        
-        let total_supply_f64 = supply.unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
-        
-        if total_supply_f64 > 0.0 {
-            let top_1_amount = sorted_amounts.get(0).copied().unwrap_or(0.0);
-            let top_10_amount: f64 = sorted_amounts.iter().take(10).sum();
-            
-            Some(HolderAnalysis {
-                top_1_pct: (top_1_amount / total_supply_f64) * 100.0,
-                top_10_pct: (top_10_amount / total_supply_f64) * 100.0,
-                unique_holders: birdeye_ov.as_ref().and_then(|b| b.holder).or(helius_total_holders),
-            })
-        } else {
-            None
-        }
-    } else if let Some(raw_holders) = helius_holders {
-        // Fallback to Helius logic
+    // 6. HOLDER ANALYSIS PRIORITIZATION (Helius Top 20)
+    let final_holders = if let Some(raw_holders) = helius_holders {
         if let Some(s) = supply {
             let s_f64 = s as f64;
             if s_f64 > 0.0 {
-                let vault_addr = helius_liq.as_ref().and_then(|l| l.pool_token_account.as_ref());
+                // Filter out pool address if it appears in holders
                 let mut filtered_holders: Vec<f64> = raw_holders.holders.iter()
-                    .filter(|h| {
-                        if let Some(v) = vault_addr {
-                            if &h.address == v { return false; }
-                        }
-                        if h.address == pool_event.pool_address { return false; }
-                        true
-                    })
+                    .filter(|h| h.address != pool_event.pool_address)
                     .map(|h| h.amount)
                     .collect();
                 
                 filtered_holders.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                
+                // Helius "largest accounts" returns top 20 by default
                 let top_1_amount = filtered_holders.get(0).copied().unwrap_or(0.0);
                 let top_10_amount: f64 = filtered_holders.iter().take(10).sum();
+                let supply_decimal_adjusted = s_f64 / 10f64.powi(decimals as i32);
 
                 Some(HolderAnalysis {
-                    top_1_pct: (top_1_amount / s_f64) * 100.0,
-                    top_10_pct: (top_10_amount / s_f64) * 100.0,
-                    unique_holders: helius_total_holders.or(raw_holders.unique_holders),
+                    top_1_pct: (top_1_amount / supply_decimal_adjusted) * 100.0,
+                    top_10_pct: (top_10_amount / supply_decimal_adjusted) * 100.0,
+                    unique_holders: birdeye_ov.as_ref().and_then(|b| b.holder), // Total from Birdeye
                 })
             } else { None }
         } else { None }
@@ -613,9 +579,10 @@ fn assemble_enriched_token(
         pair_token: pool_event.pair_token.clone(),
         dex: pool_event.dex.clone(),
         
-        // Price data
+        // Price & Liquidity
         price_sol,
         price_usd,
+        liquidity_usd,
         initial_liquidity_sol,
         fdv,
         market_cap,
@@ -754,13 +721,7 @@ async fn fetch_mint_account_info(
     }
 }
 
-#[derive(Debug)]
-struct LiquidityData {
-    liquidity_sol: Option<f64>,
-    liquidity_token: Option<f64>,
-    pool_token_account: Option<String>, // The account holding the tokens (to exclude from holders)
-}
-
+// SOL Price cache
 
 
 // SOL Price cache
@@ -775,121 +736,6 @@ lazy_static! {
 }
 
 /// Fetch liquidity data from pool by querying token account balances
-async fn fetch_liquidity_data(
-    client: &Client,
-    api_key: &str,
-    pool_address: &str,
-    token_mint: &str,
-    pair_token: &str,
-    token_decimals: u8,
-) -> Result<LiquidityData> {
-    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
-    
-    // Program IDs for SPL Token and Token-2022
-    let _token_programs = [
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
-        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
-    ];
-
-    let mut liquidity_sol: Option<f64> = None;
-    let mut liquidity_token: Option<f64> = None;
-    let mut pool_token_account: Option<String> = None;
-
-    // Common SOL/WSOL mint addresses
-    let sol_mints = [
-        "So11111111111111111111111111111111111111112", // WSOL
-        "11111111111111111111111111111111",           // Native SOL
-    ];
-
-    // STEP 1: DAS-based reserve discovery (More robust than direct RPC)
-
-    let das_req = json!({
-        "jsonrpc": "2.0",
-        "id": "pool-reserves",
-        "method": "getTokenAccounts",
-        "params": {
-            "owner": pool_address,
-            "page": 1,
-            "limit": 100
-        }
-    });
-
-    if let Ok(response) = client.post(&url).json(&das_req).send().await {
-        if let Ok(json) = response.json::<serde_json::Value>().await {
-            if let Some(accounts) = json.get("result").and_then(|r| r.get("token_accounts")).and_then(|a| a.as_array()) {
-                for account in accounts {
-                    let mint = account.get("mint").and_then(|m| m.as_str()).unwrap_or("");
-                    let amount = account.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.0);
-                    let pubkey = account.get("address").and_then(|s| s.as_str()).unwrap_or("");
-
-                    // CRITICAL: Determine correct decimals for calculation
-                    let decimals = if sol_mints.contains(&mint) || mint == pair_token {
-                        9 // SOL/WSOL
-                    } else if mint == token_mint {
-                        token_decimals as u32
-                    } else {
-                        6 // Default fallback
-                    };
-
-                    let ui_amount = amount / 10f64.powi(decimals as i32);
-
-                    if sol_mints.contains(&mint) || mint == pair_token {
-                        liquidity_sol = Some(ui_amount);
-                    } else if mint == token_mint {
-                        liquidity_token = Some(ui_amount);
-                        pool_token_account = Some(pubkey.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // STEP 2: Native SOL Fallback
-    // Some pools use native SOL instead of WSOL (mostly bonding curves or unusual AMMs)
-    if liquidity_sol.is_none() || liquidity_sol.unwrap_or(0.0) < 0.001 {
-        let sol_req = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pool_address]
-        });
-        if let Ok(resp) = client.post(&url).json(&sol_req).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(lamports) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_u64()) {
-                    let balance = lamports as f64 / 1_000_000_000.0;
-                    if balance > 0.001 {
-                        liquidity_sol = Some(balance);
-                    }
-                }
-            }
-        }
-    }
-
-    // STEP 3: Vault Discovery Fallback (for Raydium etc. where tokens are in separate vaults)
-    if liquidity_token.is_none() || liquidity_token.unwrap_or(0.0) < 0.1 {
-        let largest_req = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_mint]
-        });
-        if let Ok(resp) = client.post(&url).json(&largest_req).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(top_acc) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_array()).and_then(|a| a.get(0)) {
-                    let vault_addr = top_acc.get("address").and_then(|s| s.as_str()).unwrap_or("");
-                    let amount = top_acc.get("uiAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    
-                    if amount > 0.0 {
-                        liquidity_token = Some(amount);
-                        pool_token_account = Some(vault_addr.to_string());
-                        // If we found the token vault but still have no SOL, 
-                        // it's likely a complex Raydium pool where we'd need to parse the pool state for the SOL vault.
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(LiquidityData {
-        liquidity_sol,
-        liquidity_token,
-        pool_token_account,
-    })
-}
 
 
 
@@ -976,192 +822,11 @@ async fn fetch_token_metadata(
     })
 }
 
-#[derive(Debug)]
-struct Holder {
-    address: String,
-    amount: f64,
-}
-
-/// Raw holder data to be filtered later
-struct RawHolderData {
-    holders: Vec<Holder>,
-    unique_holders: Option<u64>,
-}
-
-/// Fetch holder analysis using getTokenLargestAccounts
-async fn fetch_holder_analysis(
-    client: &Client,
-    api_key: &str,
-    mint: &str,
-) -> Result<RawHolderData> {
-    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
-    
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTokenLargestAccounts",
-        "params": [
-            mint
-        ]
-    });
-
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await
-        .context("Failed to fetch largest accounts")?;
-
-    let json: serde_json::Value = response.json().await?;
-    
-    let accounts = json
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .and_then(|v| v.as_array())
-        .context("No accounts found")?;
-
-    if accounts.is_empty() {
-        return Err(anyhow::anyhow!("No holders found"));
-    }
-
-    // Return raw data for filtering in assembly
-    let mut holders = Vec::new();
-    for acc in accounts {
-        let amount = acc.get("amount").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-        let address = acc.get("address").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        
-        holders.push(Holder {
-            address,
-            amount,
-        });
-    }
-
-    Ok(RawHolderData {
-        holders,
-        unique_holders: None, 
-    })
-}
-
-/// Fetch total unique holders using Helius DAS getTokenAccounts
-async fn fetch_total_holders(
-    client: &Client,
-    api_key: &str,
-    mint: &str,
-) -> Result<u64> {
-    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
-    
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": "holders",
-        "method": "getTokenAccounts",
-        "params": {
-            "page": 1,
-            "limit": 1,
-            "displayOptions": {},
-            "mint": mint
-        }
-    });
-
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await
-        .context("Failed to fetch total holders")?;
-
-    let json: serde_json::Value = response.json().await?;
-    
-    // Result contains "total"
-    let total = json.get("result")
-        .and_then(|r| r.get("total"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    // CRITICAL: Helius DAS indexing can lag significantly for brand new tokens.
-    // If it returns 1 (just the pool) but the token is graduated/active, 
-    // we fallback to the count of largest accounts we already fetched to avoid false "Ghost Town" penalties.
-    if total <= 1 {
-        // Fetch largest accounts list to get a better lower bound (Limit increased to 100)
-        let largest_req = json!({
-            "jsonrpc": "2.0", 
-            "id": 1, 
-            "method": "getTokenLargestAccounts", 
-            "params": [
-                mint,
-                { "commitment": "confirmed" } // Optional params can take a limit but standard JSON-RPC use [mint]
-            ]
-        });
-        if let Ok(resp) = client.post(&url).json(&largest_req).send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(count) = json.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_array()).map(|a| a.len() as u64) {
-                    if count > total {
-                        return Ok(count);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(total)
-}
-
+// ========== HELPER FUNCTIONS ==========
 // ========== HELPER FUNCTIONS ==========
 
 
 
-fn calculate_market_metrics(
-    liq_data: &Option<LiquidityData>,
-    supply: Option<u64>,
-    decimals: u8,
-    sol_price_usd: f64,
-) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-    let liq = match liq_data.as_ref() {
-        Some(l) => l,
-        None => return (None, None, None, None),
-    };
-
-    let supply_val = match supply {
-        Some(s) if s > 0 => s,
-        _ => return (None, None, None, None),
-    };
-
-    // Get reserves
-    let reserve_sol = match liq.liquidity_sol {
-        Some(r) if r > 0.0 => r,
-        _ => return (None, None, None, None),
-    };
-
-    let reserve_token = match liq.liquidity_token {
-        Some(r) if r > 0.0 => r,
-        _ => {
-            // Fallback: if we don't have token reserve, use supply as approximation
-            // This is less accurate but better than nothing
-            supply_val as f64 / 10_f64.powi(decimals as i32)
-        }
-    };
-
-    // Calculate price using AMM constant product formula (x * y = k)
-    // price_in_sol = reserve_sol / reserve_token
-    let price_sol = if reserve_token > 0.0 {
-        Some(reserve_sol / reserve_token)
-    } else {
-        None
-    };
-
-    // Get real-time SOL price (passed in)
-    let price_usd = price_sol.map(|p| p * sol_price_usd);
-
-    // Calculate circulating supply (in human-readable units)
-    let supply_f64 = supply_val as f64 / 10_f64.powi(decimals as i32);
-
-    // Market cap = price * circulating supply
-    let market_cap = price_usd.map(|p| p * supply_f64);
-
-    // FDV = price * total supply (same as market cap if 100% circulating)
-    let fdv = market_cap;
-
-    (price_sol, price_usd, market_cap, fdv)
-}
 
 /// Get cached SOL price or fetch new one if expired (async)
 async fn get_or_fetch_sol_price(client: &Client, config: &Config) -> Result<f64> {
@@ -1303,50 +968,71 @@ async fn fetch_birdeye_overview(
     ).await
 }
 
-/// Fetch token holders from Birdeye (Top 100, with retry)
-async fn fetch_birdeye_holders(
+// ========== HELPER FUNCTIONS ==========
+
+#[derive(Debug)]
+struct Holder {
+    address: String,
+    amount: f64,
+}
+
+/// Raw holder data to be filtered later
+struct RawHolderData {
+    holders: Vec<Holder>,
+}
+
+/// Fetch holder analysis using getTokenLargestAccounts from Helius
+async fn fetch_holder_analysis(
     client: &Client,
     api_key: &str,
     mint: &str,
-) -> Result<Vec<BirdeyeHolder>> {
-    let retry_config = RetryConfig {
-        max_attempts: 3,
-        initial_delay_ms: 500,
-        max_delay_ms: 2000,
-        backoff_multiplier: 2.0,
-    };
+) -> Result<RawHolderData> {
+    let url = format!("https://mainnet.helius-rpc.com/?api-key={}", api_key);
     
-    let api_key = api_key.to_string();
-    let mint = mint.to_string();
-    let client = client.clone();
-    
-    retry_with_backoff(
-        "Birdeye Token Holders",
-        || async {
-            let url = format!("https://public-api.birdeye.so/defi/v3/token/holder?address={}&offset=0&limit=100", mint);
-            
-            let response = client
-                .get(&url)
-                .header("X-API-KEY", &api_key)
-                .header("x-chain", "solana")
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await
-                .context("Birdeye Token Holders request failed")?;
+    // Default is top 20 accounts
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenLargestAccounts",
+        "params": [
+            mint
+        ]
+    });
 
-            let json: serde_json::Value = response.json().await?;
-            
-            if let Some(items) = json.get("data").and_then(|d| d.get("items")) {
-                let holders: Vec<BirdeyeHolder> = serde_json::from_value(items.clone())
-                    .context("Failed to deserialize Birdeye holders")?;
-                Ok(holders)
-            } else {
-                Err(anyhow::anyhow!("Birdeye holders returned no data for {}", mint))
-            }
-        },
-        &retry_config,
-        is_network_error,
-    ).await
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .context("Failed to fetch largest accounts")?;
+
+    let json: serde_json::Value = response.json().await?;
+    
+    let accounts = json
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .and_then(|v| v.as_array())
+        .context("No accounts found")?;
+
+    if accounts.is_empty() {
+        return Err(anyhow::anyhow!("No holders found"));
+    }
+
+    // Return raw data for filtering in assembly
+    let mut holders = Vec::new();
+    for acc in accounts {
+        let amount = acc.get("uiAmount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let address = acc.get("address").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        
+        holders.push(Holder {
+            address,
+            amount,
+        });
+    }
+
+    Ok(RawHolderData {
+        holders,
+    })
 }
 
 /// Fetch SOL price from CoinGecko API (free tier, may be rate limited)

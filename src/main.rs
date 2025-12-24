@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
     log_startup(
         &presigner.pubkey().to_string(), 
         config.max_trade_size_sol, 
-        config.min_liquidity_sol
+        config.min_liquidity_usd
     );
 
     // Initialize Wallet Monitor
@@ -202,9 +202,9 @@ async fn main() -> Result<()> {
                 let score = scorer.score(&enriched_token);
 
                 info!(
-                    "✨ ENRICHED: {} | Liq: ${} | Score: {:.1}/150",
+                    "✨ ENRICHED: {} | Liq: ${:.0} | Score: {:.1}/150",
                     enriched_token.mint,
-                    enriched_token.initial_liquidity_sol.unwrap_or(0.0),
+                    enriched_token.liquidity_usd.unwrap_or(0.0),
                     score
                 );
                 TradeLogger::log(&format!("✨ ENRICHED: {} | Score: {:.1}/150", 
@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
 
                     // Direct Buy
                     info!("🚀 HIGH SCORE DETECTED: {} (Score: {:.1}/120) - EXECUTING IMMEDIATE BUY", enriched_token.mint, score);
-                    log_discovery(&enriched_token.mint, score, enriched_token.initial_liquidity_sol.unwrap_or(0.0));
+                    log_discovery(&enriched_token.mint, score, enriched_token.liquidity_usd.unwrap_or(0.0));
                     
                     // Store in DB
                     if let Err(e) = database.store_token(&enriched_token, score).await {

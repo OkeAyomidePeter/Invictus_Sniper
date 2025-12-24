@@ -39,6 +39,7 @@ impl Database {
                 decimals INTEGER,
                 supply TEXT,
                 initial_liquidity_sol REAL,
+                liquidity_usd REAL,
                 score REAL,
                 platform TEXT,
                 discovered_at INTEGER
@@ -85,6 +86,9 @@ impl Database {
             .execute(&self.pool).await;
         let _ = sqlx::query("ALTER TABLE trades ADD COLUMN remaining_amount_pct REAL DEFAULT 100.0")
             .execute(&self.pool).await;
+        // Migration for liquidity_usd
+        let _ = sqlx::query("ALTER TABLE tokens ADD COLUMN liquidity_usd REAL DEFAULT 0.0")
+            .execute(&self.pool).await;
 
         info!("✅ Database schema initialized");
         Ok(())
@@ -93,14 +97,15 @@ impl Database {
     pub async fn store_token(&self, token: &EnrichedToken, score: f64) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT OR REPLACE INTO tokens (mint, decimals, supply, initial_liquidity_sol, score, platform, discovered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO tokens (mint, decimals, supply, initial_liquidity_sol, liquidity_usd, score, platform, discovered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&token.mint)
         .bind(token.decimals as i64)
         .bind(token.supply.map(|s| s.to_string()))
         .bind(token.initial_liquidity_sol)
+        .bind(token.liquidity_usd)
         .bind(score)
         .bind(format!("{:?}", token.platform))
         .bind(token.enrichment_timestamp)

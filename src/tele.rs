@@ -330,7 +330,7 @@ async fn message_handler(
                     text.push_str("No tokens.");
                 } else {
                     for (mint, score, liq) in tokens {
-                        text.push_str(&format!("• {}... [{:.1}] {:.1} SOL\n", &mint[..8.min(mint.len())], score, liq));
+                        text.push_str(&format!("• {}... [{:.1}] {:.1} $\n", &mint[..8.min(mint.len())], score, liq));
                     }
                 }
                 bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).send().await.map(|_| ())

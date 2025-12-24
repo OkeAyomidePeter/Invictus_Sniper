@@ -22,8 +22,8 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::OnceCell;
 
 // Jupiter API endpoints (authenticated with API key)
-const JUPITER_QUOTE_API: &str = "https://api.jup.ag/quote/v1/quote";
-const JUPITER_SWAP_API: &str = "https://api.jup.ag/quote/v1/swap";
+const JUPITER_QUOTE_API: &str = "https://api.jup.ag/swap/v1/quote";
+const JUPITER_SWAP_API: &str = "https://api.jup.ag/swap/v1/swap";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const JITO_TIP_ACCOUNTS_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_accounts";
 
@@ -257,9 +257,20 @@ impl TransactionManager {
             .send().await?
             .json().await?;
 
+        // Check if there's an error in the response
+        if let Some(error) = response.get("error") {
+            error!("❌ Jupiter Swap API Error: {}", error);
+            return Err(anyhow::anyhow!("Jupiter API error: {}", error));
+        }
+
         let swap_tx_base64 = response.get("swapTransaction")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No swapTransaction in Jupiter response"))?;
+            .ok_or_else(|| {
+                // Log the full response to debug
+                error!("❌ Jupiter response missing swapTransaction. Full response: {}", 
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|_| "Unable to serialize".to_string()));
+                anyhow::anyhow!("No swapTransaction in Jupiter response")
+            })?;
 
         let tx_bytes = BASE64_STANDARD.decode(swap_tx_base64)?;
         

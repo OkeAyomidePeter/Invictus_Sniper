@@ -32,7 +32,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut InvictusGUI, colors: &ThemeColors) {
             ui.horizontal(|ui| {
                 config_field_inline(ui, colors, "Max Trade Size (SOL):", &mut app.config.max_trade_size_sol, 100.0);
                 ui.add_space(20.0);
-                config_field_inline(ui, colors, "Min Liquidity (SOL):", &mut app.config.min_liquidity_sol, 100.0);
+                config_field_inline(ui, colors, "Min Liquidity (USD):", &mut app.config.min_liquidity_usd, 100.0);
             });
             
             ui.add_space(10.0);

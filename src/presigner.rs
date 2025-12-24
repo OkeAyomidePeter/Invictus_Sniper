@@ -389,7 +389,7 @@ mod tests {
             telegram_token: "".to_string(),
             telegram_chat_id: "".to_string(),
             database_url: "".to_string(),
-            min_liquidity_sol: 0.0,
+            min_liquidity_usd: 0.0,
             min_holders: 0,
             max_trade_size_sol: 0.0,
             max_daily_exposure_sol: 0.0,

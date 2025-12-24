@@ -41,7 +41,7 @@ pub struct Config {
     pub telegram_chat_id: String,
     pub alternate_telegram_chat_id: Option<String>,
     pub database_url: String,
-    pub min_liquidity_sol: f64,
+    pub min_liquidity_usd: f64,
     pub min_holders: u32,
     pub max_trade_size_sol: f64,
     pub max_daily_exposure_sol: f64,
@@ -119,10 +119,10 @@ impl Config {
             telegram_chat_id: env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID must be set"),
             alternate_telegram_chat_id: env::var("ALTERNATE_TELEGRAM_CHAT_ID").ok().filter(|s| !s.is_empty()),
             database_url: env::var("DATABASE_URL").unwrap_or("sqlite://invictus.db".to_string()),
-            min_liquidity_sol: env::var("MIN_LIQUIDITY_SOL")
-                .unwrap_or("10.0".to_string())
+            min_liquidity_usd: env::var("MIN_LIQUIDITY_USD")
+                .unwrap_or("2500.0".to_string())
                 .parse()
-                .expect("MIN_LIQUIDITY_SOL must be a valid number"),
+                .expect("MIN_LIQUIDITY_USD must be a valid number"),
             min_holders: env::var("MIN_HOLDERS")
                 .unwrap_or("10".to_string())
                 .parse()
@@ -369,7 +369,7 @@ impl Config {
         };
 
         format!(
-            "Config loaded: mode={}, helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_sol={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
+            "Config loaded: mode={}, helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_usd={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
             self.transaction_mode,
             Self::mask_secret(&self.helius_api_key),
             Self::mask_secret(&self.birdeye_api_key),
@@ -379,7 +379,7 @@ impl Config {
             if self.telegram_token.is_empty() { "not_set".to_string() } else { Self::mask_secret(&self.telegram_token) },
             self.telegram_chat_id,
             self.database_url,
-            self.min_liquidity_sol,
+            self.min_liquidity_usd,
             self.min_holders,
             self.max_trade_size_sol,
             self.max_daily_exposure_sol,
@@ -405,7 +405,7 @@ mod tests {
         env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
 
         // Clear optional vars to ensure defaults
-        env::remove_var("MIN_LIQUIDITY_SOL");
+        env::remove_var("MIN_LIQUIDITY_USD");
         env::remove_var("MIN_HOLDERS");
         env::remove_var("MAX_TRADE_SIZE_SOL");
         env::remove_var("AUTO_SELL_ENABLED");
@@ -420,7 +420,7 @@ mod tests {
 
         // Test defaults
         assert_eq!(config.transaction_mode, TransactionMode::Standard);
-        assert_eq!(config.min_liquidity_sol, 10.0);
+        assert_eq!(config.min_liquidity_usd, 2500.0);
         assert_eq!(config.min_holders, 10);
         assert_eq!(config.max_trade_size_sol, 1.0);
         assert_eq!(config.auto_sell_enabled, true);
@@ -439,14 +439,14 @@ mod tests {
         env::set_var("SOLANA_PRIVATE_KEY", "test_private_key");
         env::set_var("TELEGRAM_BOT_TOKEN", "test_token");
         env::set_var("TELEGRAM_CHAT_ID", "test_chat_id");
-        env::set_var("MIN_LIQUIDITY_SOL", "25.0");
+        env::set_var("MIN_LIQUIDITY_USD", "3000.0");
         env::set_var("AUTO_SELL_PROFIT_TARGET_PCT", "100.0");
         env::set_var("JITO_BASE_TIP_LAMPORTS", "2000000");
         env::set_var("MAX_CONCURRENT_TRADES", "10");
 
         let config = Config::load();
 
-        assert_eq!(config.min_liquidity_sol, 25.0);
+        assert_eq!(config.min_liquidity_usd, 3000.0);
         assert_eq!(config.auto_sell_profit_target_pct, 100.0);
         assert_eq!(config.jito_base_tip_lamports, 2_000_000);
         assert_eq!(config.max_concurrent_trades, 10);

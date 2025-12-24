@@ -45,15 +45,15 @@ impl TradeLogger {
     /// Log detailed enrichment data
     pub fn log_enrichment_data(
         mint: &str, 
-        liquidity_sol: f64, 
+        liquidity_usd: f64, 
         top_10_pct: f64, 
         unique_holders: Option<u64>, 
         socials_count: usize
     ) {
         let holders_str = unique_holders.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string());
         TradeLogger::log(&format!(
-            "🔍 ENRICHMENT: {} | Liq: {:.2} SOL | Top10: {:.1}% | Holders: {} | Socials: {}", 
-            &mint[..12.min(mint.len())], liquidity_sol, top_10_pct, holders_str, socials_count
+            "🔍 ENRICHMENT: {} | Liq: ${:.0} | Top10: {:.1}% | Holders: {} | Socials: {}", 
+            &mint[..12.min(mint.len())], liquidity_usd, top_10_pct, holders_str, socials_count
         ));
     }
 
@@ -97,10 +97,10 @@ pub fn log_error_detailed(mint: &str, step: &str, error: &str) {
 }
 
 /// Log detailed enrichment debug info (pool address, retry attempts)
-pub fn log_enrichment_debug(mint: &str, pool_address: &str, liquidity_sol: f64, attempt: u8) {
+pub fn log_enrichment_debug(mint: &str, pool_address: &str, liquidity_usd: f64, attempt: u8) {
     TradeLogger::log(&format!(
-        "🔎 DEBUG: {} | Pool: {} | Liq: {:.2} SOL | Attempt: {}", 
-        &mint[..12.min(mint.len())], pool_address, liquidity_sol, attempt
+        "🔎 DEBUG: {} | Pool: {} | Liq: ${:.0} | Attempt: {}", 
+        &mint[..12.min(mint.len())], pool_address, liquidity_usd, attempt
     ));
 }
 
@@ -125,11 +125,11 @@ pub fn log_pipeline_event(mint: &str, event: &str, details: &str) {
 // ============================================================================
 
 /// Log bot startup
-pub fn log_startup(wallet_pubkey: &str, max_trade_sol: f64, min_liquidity: f64) {
+pub fn log_startup(wallet_pubkey: &str, max_trade_sol: f64, min_liquidity_usd: f64) {
     TradeLogger::log("═══════════════════════════════════════════════════════════════");
     TradeLogger::log("🚀 INVICTUS SNIPER BOT STARTED");
     TradeLogger::log(&format!("   Wallet: {}", wallet_pubkey));
-    TradeLogger::log(&format!("   Max Trade: {:.4} SOL | Min Liquidity: {:.1} SOL", max_trade_sol, min_liquidity));
+    TradeLogger::log(&format!("   Max Trade: {:.4} SOL | Min Liquidity: ${:.0}", max_trade_sol, min_liquidity_usd));
     TradeLogger::log("═══════════════════════════════════════════════════════════════");
 }
 
@@ -150,10 +150,10 @@ pub fn log_shutdown(positions_closed: usize, total_pnl: Option<f64>) {
 // ============================================================================
 
 /// Log a high score token discovery
-pub fn log_discovery(mint: &str, score: f64, liquidity: f64) {
+pub fn log_discovery(mint: &str, score: f64, liquidity_usd: f64) {
     TradeLogger::log(&format!(
-        "✨ DISCOVERY: {} | Score: {:.1}/70 | Liq: {:.2} SOL", 
-        &mint[..12.min(mint.len())], score, liquidity
+        "✨ DISCOVERY: {} | Score: {:.1}/150 | Liq: ${:.0}", 
+        &mint[..12.min(mint.len())], score, liquidity_usd
     ));
 }
 

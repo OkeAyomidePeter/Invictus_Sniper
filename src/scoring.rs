@@ -23,8 +23,9 @@ use crate::trade_logger::TradeLogger;
 /// - Extreme whale concentration: -50 points
 
 // Liquidity thresholds (minimum requirements)
-const LIQUIDITY_MIN_THRESHOLD: f64 = 20.0; // Instant fail below this
-const LIQUIDITY_HEALTHY_THRESHOLD: f64 = 40.0; // Preferred minimum
+// Liquidity thresholds (minimum requirements in USD)
+const LIQUIDITY_MIN_THRESHOLD_USD: f64 = 2500.0; // ~$20 SOL at $125
+const LIQUIDITY_HEALTHY_THRESHOLD_USD: f64 = 5000.0; // ~$40 SOL
 
 // Momentum scoring (30m window)
 const PRICE_CHANGE_30M_EXCELLENT: f64 = 50.0; // +50% in 30m
@@ -93,10 +94,10 @@ impl TokenScorer {
         }
 
         // LIQUIDITY MINIMUM: Instant Fail if too low
-        let liquidity_sol = token.initial_liquidity_sol.unwrap_or(0.0);
-        if liquidity_sol < LIQUIDITY_MIN_THRESHOLD {
-            warn!("💀 SCORING: {} has insufficient liquidity ({:.1} SOL < {})", 
-                token.mint, liquidity_sol, LIQUIDITY_MIN_THRESHOLD);
+        let liquidity_usd = token.liquidity_usd.unwrap_or(0.0);
+        if liquidity_usd < LIQUIDITY_MIN_THRESHOLD_USD {
+            warn!("💀 SCORING: {} has insufficient liquidity (${:.0} < ${})", 
+                token.mint, liquidity_usd, LIQUIDITY_MIN_THRESHOLD_USD);
             TradeLogger::log(&format!("💀 SCORING REJECTED: {} insufficient liquidity", token.mint));
             return 0.0;
         }
@@ -281,8 +282,8 @@ impl TokenScorer {
         // =====================================================================
         // 7. LIQUIDITY BONUS (if exceptionally high)
         // =====================================================================
-        if liquidity_sol >= LIQUIDITY_HEALTHY_THRESHOLD {
-            info!("    💧 HEALTHY LIQUIDITY: {:.1} SOL (threshold met)", liquidity_sol);
+        if liquidity_usd >= LIQUIDITY_HEALTHY_THRESHOLD_USD {
+            info!("    💧 HEALTHY LIQUIDITY: ${:.0} (threshold met)", liquidity_usd);
         }
 
         // Final bounds
@@ -293,10 +294,10 @@ impl TokenScorer {
             score = 150.0;
         }
 
-        info!("📊 SCORING: {} -> {:.1}/150 (Liq: {:.1} SOL, Momentum: {:.1}%, Wallets: {})", 
+        info!("📊 SCORING: {} -> {:.1}/150 (Liq: ${:.0}, Momentum: {:.1}%, Wallets: {})", 
             token.mint, 
             score, 
-            liquidity_sol,
+            liquidity_usd,
             token.price_change_30m_pct.unwrap_or(0.0),
             token.unique_wallets_30m.unwrap_or(0)
         );

@@ -35,7 +35,7 @@ pub struct ConfigData {
     pub database_url: String,
     
     // Risk Parameters
-    pub min_liquidity_sol: String,
+    pub min_liquidity_usd: String,
     pub min_holders: String,
     pub max_trade_size_sol: String,
     pub max_daily_exposure_sol: String,
@@ -122,7 +122,7 @@ impl Default for ConfigData {
             telegram_bot_token: String::new(),
             telegram_chat_id: String::new(),
             database_url: "sqlite://invictus.db".to_string(),
-            min_liquidity_sol: "10.0".to_string(),
+            min_liquidity_usd: "2500.0".to_string(),
             min_holders: "10".to_string(),
             max_trade_size_sol: "1.0".to_string(),
             max_daily_exposure_sol: "10.0".to_string(),
@@ -192,7 +192,7 @@ impl ConfigData {
             jupiter_api_key: self.jupiter_api_key.clone(),
             alternate_telegram_chat_id: None, // Loaded from env
             database_url: self.database_url.clone(),
-            min_liquidity_sol: self.min_liquidity_sol.parse().map_err(|_| "Invalid min_liquidity_sol")?,
+            min_liquidity_usd: self.min_liquidity_usd.parse().map_err(|_| "Invalid min_liquidity_usd")?,
             min_holders: self.min_holders.parse().map_err(|_| "Invalid min_holders")?,
             max_trade_size_sol: self.max_trade_size_sol.parse().map_err(|_| "Invalid max_trade_size_sol")?,
             max_daily_exposure_sol: self.max_daily_exposure_sol.parse().map_err(|_| "Invalid max_daily_exposure_sol")?,
@@ -358,7 +358,7 @@ impl InvictusGUI {
         writeln!(file)?;
         
         writeln!(file, "# Risk Parameters")?;
-        writeln!(file, "MIN_LIQUIDITY_SOL={}", self.config.min_liquidity_sol)?;
+        writeln!(file, "MIN_LIQUIDITY_USD={}", self.config.min_liquidity_usd)?;
         writeln!(file, "MIN_HOLDERS={}", self.config.min_holders)?;
         writeln!(file, "MAX_TRADE_SIZE_SOL={}", self.config.max_trade_size_sol)?;
         writeln!(file, "MAX_DAILY_EXPOSURE_SOL={}", self.config.max_daily_exposure_sol)?;
@@ -474,7 +474,7 @@ impl InvictusGUI {
         load_str(&mut self.config.telegram_chat_id, "TELEGRAM_CHAT_ID");
         load_str(&mut self.config.database_url, "DATABASE_URL");
         
-        load_str(&mut self.config.min_liquidity_sol, "MIN_LIQUIDITY_SOL");
+        load_str(&mut self.config.min_liquidity_usd, "MIN_LIQUIDITY_USD");
         load_str(&mut self.config.min_holders, "MIN_HOLDERS");
         load_str(&mut self.config.max_trade_size_sol, "MAX_TRADE_SIZE_SOL");
         load_str(&mut self.config.max_daily_exposure_sol, "MAX_DAILY_EXPOSURE_SOL");
