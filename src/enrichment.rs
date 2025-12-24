@@ -11,7 +11,10 @@ use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::collections::HashMap;
+ use std::collections::VecDeque;
 use crate::trade_logger::{TradeLogger, log_enrichment_debug};
+use crate::rate_limiter::RateLimiter;
+use crate::retry::{retry_with_backoff, RetryConfig, is_network_error};
 
 // ========== NEW STRUCTS ==========
 
@@ -48,6 +51,17 @@ struct BirdeyeTokenOverview {
     #[serde(rename = "v24hUSD")]
     pub volume_24h: Option<f64>,
     pub decimals: Option<u8>,
+    // New high-value metrics
+    #[serde(rename = "uniqueWallet30m")]
+    pub unique_wallets_30m: Option<u64>,
+    #[serde(rename = "vBuy30mUSD")]
+    pub buy_volume_30m_usd: Option<f64>,
+    #[serde(rename = "vSell30mUSD")]
+    pub sell_volume_30m_usd: Option<f64>,
+    #[serde(rename = "priceChange30mPercent")]
+    pub price_change_30m_pct: Option<f64>,
+    pub holder: Option<u64>, // Total holder count
+    pub extensions: Option<serde_json::Value>, // For socials
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +111,12 @@ pub struct EnrichedToken {
     
     // ========== HOLDER ANALYSIS ==========
     pub holders: Option<HolderAnalysis>,
+
+    // ========== BIRDEYE METRICS (30m window) ==========
+    pub unique_wallets_30m: Option<u64>,
+    pub buy_volume_30m_usd: Option<f64>,
+    pub sell_volume_30m_usd: Option<f64>,
+    pub price_change_30m_pct: Option<f64>,
 
     // ========== TIMING ==========
     pub enrichment_timestamp: i64,
@@ -189,9 +209,60 @@ pub async fn start(
         }
     });
 
+    // Initialize Birdeye rate limiter (1 req/sec for free plan)
+    let birdeye_limiter = Arc::new(RateLimiter::new(1.0, "Birdeye"));
+    
+    // Pending token queue for when Birdeye is rate-limited
+    let pending_tokens: Arc<Mutex<VecDeque<PoolCreationEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+    
+    // Clone config for background tasks
     let loop_config = config.clone();
+    
+    // Spawn background task to process pending tokens
+    let pending_clone = pending_tokens.clone();
+    let limiter_clone = birdeye_limiter.clone();
+    let enriched_tx_clone = enriched_tx.clone();
+    let config_clone = loop_config.clone();
     tokio::spawn(async move {
-        if let Err(e) = enrichment_loop(loop_config, classified_rx, enriched_tx).await {
+        let client = Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            
+            // Try to process pending tokens
+            let pool_event = {
+                let mut queue = pending_clone.lock();
+                queue.pop_front()
+            };
+            
+            if let Some(event) = pool_event {
+                // Try to acquire rate limit token (non-blocking)
+                if limiter_clone.try_acquire().await {
+                    info!("📤 Processing pending token from queue: {}", event.token_mint);
+                    let start_time = std::time::Instant::now();
+                    
+                    match enrich_token(&client, &config_clone, event.clone()).await {
+                        Ok(enriched) => {
+                            if let Err(e) = enriched_tx_clone.send(enriched).await {
+                                warn!("Failed to send enriched token from queue: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to enrich pending token {}: {}", event.token_mint, e);
+                        }
+                    }
+                } else {
+                    // Put it back if we can't process yet
+                    let mut queue = pending_clone.lock();
+                    queue.push_front(event);
+                }
+            }
+        }
+    });
+
+    let loop_config_final = loop_config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = enrichment_loop(loop_config_final, classified_rx, enriched_tx, birdeye_limiter, pending_tokens).await {
             error!("Enrichment pipeline error: {}", e);
         }
     });
@@ -203,6 +274,8 @@ async fn enrichment_loop(
     config: Config,
     mut classified_rx: mpsc::Receiver<ClassifiedEvent>,
     enriched_tx: mpsc::Sender<EnrichedToken>,
+    birdeye_limiter: Arc<RateLimiter>,
+    pending_tokens: Arc<Mutex<VecDeque<PoolCreationEvent>>>,
 ) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
@@ -237,6 +310,20 @@ async fn enrichment_loop(
                 seen_mints.insert(pool_event.token_mint.clone(), now);
 
                 info!("🔍 Enriching token: {}", pool_event.token_mint);
+                
+                // ====== RATE LIMIT CHECK ======
+                // Try to acquire Birdeye rate limit token (non-blocking)
+                if !birdeye_limiter.try_acquire().await {
+                    // Rate limited - add to pending queue
+                    let queue_size = {
+                        let mut queue = pending_tokens.lock();
+                        queue.push_back(pool_event.clone());
+                        queue.len()
+                    };
+                    warn!("⚠️ Birdeye rate limited - queued token {} (queue size: {})", pool_event.token_mint, queue_size);
+                    TradeLogger::log(&format!("📥 QUEUED: {} | Rate limited", &pool_event.token_mint[..12.min(pool_event.token_mint.len())]));
+                    continue;
+                }
                 
                 // ====== GRADUATION DELAY ======
                 // Wait 2 seconds for pool liquidity to settle after graduation event
@@ -432,7 +519,32 @@ fn assemble_enriched_token(
     let market_cap = birdeye_ov.as_ref().and_then(|b| b.market_cap);
     let fdv = market_cap; // Assuming 100% circulating for graduated
 
-    // 4. HOLDER ANALYSIS PRIORITIZATION
+    // 4. BIRDEYE METRICS (30m window)
+    let unique_wallets_30m = birdeye_ov.as_ref().and_then(|b| b.unique_wallets_30m);
+    let buy_volume_30m_usd = birdeye_ov.as_ref().and_then(|b| b.buy_volume_30m_usd);
+    let sell_volume_30m_usd = birdeye_ov.as_ref().and_then(|b| b.sell_volume_30m_usd);
+    let price_change_30m_pct = birdeye_ov.as_ref().and_then(|b| b.price_change_30m_pct);
+
+    // 5. SOCIALS (Birdeye extensions)
+    let birdeye_socials = birdeye_ov.as_ref().and_then(|b| {
+        b.extensions.as_ref().and_then(|ext| {
+            Some(SocialLinks {
+                twitter: ext.get("twitter").and_then(|v| v.as_str()).map(String::from),
+                telegram: ext.get("telegram").and_then(|v| v.as_str()).map(String::from),
+                website: ext.get("website").and_then(|v| v.as_str()).map(String::from),
+            })
+        })
+    });
+
+    // Update metadata with Birdeye socials if available
+    let final_metadata = metadata.map(|mut m| {
+        if birdeye_socials.is_some() {
+            m.socials = birdeye_socials.clone();
+        }
+        m
+    });
+
+    // 6. HOLDER ANALYSIS PRIORITIZATION
     let final_holders = if let Some(be_h) = birdeye_holders {
         // Use Birdeye holders (usually cleaner than Helius for Top 10)
         let mut sorted_amounts: Vec<f64> = be_h.iter().map(|h| h.ui_amount).collect();
@@ -447,7 +559,7 @@ fn assemble_enriched_token(
             Some(HolderAnalysis {
                 top_1_pct: (top_1_amount / total_supply_f64) * 100.0,
                 top_10_pct: (top_10_amount / total_supply_f64) * 100.0,
-                unique_holders: helius_total_holders, // Birdeye overview might lack this, use Helius
+                unique_holders: birdeye_ov.as_ref().and_then(|b| b.holder).or(helius_total_holders),
             })
         } else {
             None
@@ -516,8 +628,14 @@ fn assemble_enriched_token(
         has_mint_authority,
         
         // New Metrics
-        metadata,
+        metadata: final_metadata,
         holders: final_holders,
+
+        // Birdeye Metrics (30m window)
+        unique_wallets_30m,
+        buy_volume_30m_usd,
+        sell_volume_30m_usd,
+        price_change_30m_pct,
 
         
         // Timing
@@ -1139,60 +1257,96 @@ async fn fetch_sol_price_birdeye_with_key(client: &Client, api_key: &str) -> Res
     Ok(price)
 }
 
-/// Fetch detailed token overview from Birdeye
+/// Fetch detailed token overview from Birdeye (with retry)
 async fn fetch_birdeye_overview(
     client: &Client,
     api_key: &str,
     mint: &str,
 ) -> Result<BirdeyeTokenOverview> {
-    let url = format!("https://public-api.birdeye.so/defi/token_overview?address={}", mint);
+    let retry_config = RetryConfig {
+        max_attempts: 3,
+        initial_delay_ms: 500,
+        max_delay_ms: 2000,
+        backoff_multiplier: 2.0,
+    };
     
-    let response = client
-        .get(&url)
-        .header("X-API-KEY", api_key)
-        .header("x-chain", "solana")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .context("Birdeye Token Overview request failed")?;
+    let api_key = api_key.to_string();
+    let mint = mint.to_string();
+    let client = client.clone();
+    
+    retry_with_backoff(
+        "Birdeye Token Overview",
+        || async {
+            let url = format!("https://public-api.birdeye.so/defi/token_overview?address={}", mint);
+            
+            let response = client
+                .get(&url)
+                .header("X-API-KEY", &api_key)
+                .header("x-chain", "solana")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .context("Birdeye Token Overview request failed")?;
 
-    let json: serde_json::Value = response.json().await?;
-    
-    if let Some(data) = json.get("data") {
-        let overview: BirdeyeTokenOverview = serde_json::from_value(data.clone())
-            .context("Failed to deserialize Birdeye token overview")?;
-        Ok(overview)
-    } else {
-        Err(anyhow::anyhow!("Birdeye overview returned no data for {}", mint))
-    }
+            let json: serde_json::Value = response.json().await?;
+            
+            if let Some(data) = json.get("data") {
+                let overview: BirdeyeTokenOverview = serde_json::from_value(data.clone())
+                    .context("Failed to deserialize Birdeye token overview")?;
+                Ok(overview)
+            } else {
+                Err(anyhow::anyhow!("Birdeye overview returned no data for {}", mint))
+            }
+        },
+        &retry_config,
+        is_network_error,
+    ).await
 }
 
-/// Fetch token holders from Birdeye (Top 100)
+/// Fetch token holders from Birdeye (Top 100, with retry)
 async fn fetch_birdeye_holders(
     client: &Client,
     api_key: &str,
     mint: &str,
 ) -> Result<Vec<BirdeyeHolder>> {
-    let url = format!("https://public-api.birdeye.so/defi/v3/token/holder?address={}&offset=0&limit=100", mint);
+    let retry_config = RetryConfig {
+        max_attempts: 3,
+        initial_delay_ms: 500,
+        max_delay_ms: 2000,
+        backoff_multiplier: 2.0,
+    };
     
-    let response = client
-        .get(&url)
-        .header("X-API-KEY", api_key)
-        .header("x-chain", "solana")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .context("Birdeye Token Holders request failed")?;
+    let api_key = api_key.to_string();
+    let mint = mint.to_string();
+    let client = client.clone();
+    
+    retry_with_backoff(
+        "Birdeye Token Holders",
+        || async {
+            let url = format!("https://public-api.birdeye.so/defi/v3/token/holder?address={}&offset=0&limit=100", mint);
+            
+            let response = client
+                .get(&url)
+                .header("X-API-KEY", &api_key)
+                .header("x-chain", "solana")
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .context("Birdeye Token Holders request failed")?;
 
-    let json: serde_json::Value = response.json().await?;
-    
-    if let Some(items) = json.get("data").and_then(|d| d.get("items")) {
-        let holders: Vec<BirdeyeHolder> = serde_json::from_value(items.clone())
-            .context("Failed to deserialize Birdeye holders")?;
-        Ok(holders)
-    } else {
-        Err(anyhow::anyhow!("Birdeye holders returned no data for {}", mint))
-    }
+            let json: serde_json::Value = response.json().await?;
+            
+            if let Some(items) = json.get("data").and_then(|d| d.get("items")) {
+                let holders: Vec<BirdeyeHolder> = serde_json::from_value(items.clone())
+                    .context("Failed to deserialize Birdeye holders")?;
+                Ok(holders)
+            } else {
+                Err(anyhow::anyhow!("Birdeye holders returned no data for {}", mint))
+            }
+        },
+        &retry_config,
+        is_network_error,
+    ).await
 }
 
 /// Fetch SOL price from CoinGecko API (free tier, may be rate limited)

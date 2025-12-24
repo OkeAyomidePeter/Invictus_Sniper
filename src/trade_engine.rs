@@ -75,8 +75,12 @@ impl TradeEngine {
         // STEP 3: Sign & Send (Standard vs Jito)
         let mode = self.tx_manager.transaction_mode();
         let identifier = if mode == crate::config::TransactionMode::Standard {
-            // STEP 3a: Send Standard Transaction
+            // STEP 3a: Sign and Send Standard Transaction
             let start_step = Instant::now();
+            
+            // Sign the transaction first
+            self.presigner.sign_versioned_tx(&mut buy_tx)?;
+            
             let sig = match self.presigner.send_versioned_transaction(&buy_tx) {
                 Ok(s) => {
                     log_pipeline_step(&token.mint, "Send Standard Tx", start_step.elapsed().as_millis(), true);
@@ -181,14 +185,17 @@ impl TradeEngine {
         // 1. Send (Standard vs Jito)
         let mode = self.tx_manager.transaction_mode();
         let identifier = if mode == crate::config::TransactionMode::Standard {
-            // 1a. Build & Send Standard Transaction
-            let sell_tx = self.tx_manager.build_sell_transaction(
+            // 1a. Build, Sign & Send Standard Transaction
+            let mut sell_tx = self.tx_manager.build_sell_transaction(
                 &signal.position.mint,
                 amount_token,
                 slippage_bps,
                 DexRouter::Jupiter,
                 true, // Close ATA
             ).await?;
+
+            // Sign the transaction first
+            self.presigner.sign_versioned_tx(&mut sell_tx)?;
 
             let sig = self.presigner.send_versioned_transaction(&sell_tx)?;
             info!("🚀 Standard SELL Sent! Sig: {}", sig);

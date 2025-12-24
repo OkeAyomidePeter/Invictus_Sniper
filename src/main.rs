@@ -202,17 +202,19 @@ async fn main() -> Result<()> {
                 let score = scorer.score(&enriched_token);
 
                 info!(
-                    "✨ ENRICHED: {} | Liq: ${} | Score: {:.1}/120",
+                    "✨ ENRICHED: {} | Liq: ${} | Score: {:.1}/150",
                     enriched_token.mint,
                     enriched_token.initial_liquidity_sol.unwrap_or(0.0),
                     score
                 );
-                TradeLogger::log(&format!("✨ ENRICHED: {} | Score: {:.1}/120", 
+                TradeLogger::log(&format!("✨ ENRICHED: {} | Score: {:.1}/150", 
                     &enriched_token.mint[..12.min(enriched_token.mint.len())], score));
                 
-                // Thresholds
-                let buy_threshold = 80.0;
-                let watchlist_threshold = 50.0;
+                // Thresholds (adjusted for new 150-point scale)
+                // Buy: ~67% of max (high-conviction only)
+                // Watchlist: ~47% of max (moderate potential)
+                let buy_threshold = 100.0;
+                let watchlist_threshold = 70.0;
 
                 if score >= buy_threshold {
                     // RISK CHECK: Max Open Positions

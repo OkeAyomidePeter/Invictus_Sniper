@@ -21,8 +21,9 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio::sync::OnceCell;
 
-const JUPITER_QUOTE_API: &str = "https://quote-api.jup.ag/v6/quote";
-const JUPITER_SWAP_API: &str = "https://quote-api.jup.ag/v6/swap";
+// Jupiter API endpoints (authenticated with API key)
+const JUPITER_QUOTE_API: &str = "https://api.jup.ag/quote/v1/quote";
+const JUPITER_SWAP_API: &str = "https://api.jup.ag/quote/v1/swap";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const JITO_TIP_ACCOUNTS_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_accounts";
 
@@ -97,6 +98,7 @@ pub struct TransactionManager {
     client: Client,
     payer_pubkey: Pubkey,
     jupiter_limiter: Option<Arc<RateLimiter>>,
+    jupiter_api_key: String,
     transaction_mode: crate::config::TransactionMode,
     priority_fee_lamports: u64,
     compute_unit_limit: u32,
@@ -126,6 +128,7 @@ impl TransactionManager {
             client,
             payer_pubkey: presigner.pubkey(),
             jupiter_limiter,
+            jupiter_api_key: config.jupiter_api_key.clone(),
             transaction_mode: config.transaction_mode,
             priority_fee_lamports: config.priority_fee_lamports,
             compute_unit_limit: config.compute_unit_limit,
@@ -249,6 +252,7 @@ impl TransactionManager {
         }
 
         let response: serde_json::Value = self.client.post(JUPITER_SWAP_API)
+            .header("x-api-key", &self.jupiter_api_key)
             .json(&request)
             .send().await?
             .json().await?;
@@ -285,7 +289,12 @@ impl TransactionManager {
                 limiter.acquire().await;
             }
 
-            match self.client.get(&url).send().await {
+            match self.client
+                .get(&url)
+                .header("x-api-key", &self.jupiter_api_key)
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     return Ok(resp.json().await?);
                 }
