@@ -197,7 +197,7 @@ async fn run_bot_logic(
     // let risk_engine = RiskEngine::new(&config);
     let presigner = Arc::new(Presigner::new(&config));
     let tx_manager = TransactionManager::new(presigner.clone(), &config);
-    let database = Arc::new(Database::new("sqlite://invictus.db").await?);
+    let database = Arc::new(Database::new(&config.database_url).await?);
     
     // Initialize Wallet Monitor
     let wallet_monitor = Arc::new(WalletMonitor::new(

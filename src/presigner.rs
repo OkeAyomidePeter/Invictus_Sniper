@@ -193,10 +193,42 @@ impl Presigner {
         match self.rpc_client.send_and_confirm_transaction(tx) {
             Ok(sig) => Ok(sig.to_string()),
             Err(e) => {
-                error!("❌ RPC Send Failure: {:?}", e);
-                // Return a more descriptive error that includes the reason
-                Err(anyhow::anyhow!("Failed to send versioned transaction: {}", e))
+                let logs = self.extract_rpc_logs(&e);
+                if !logs.is_empty() {
+                    error!("❌ RPC Send Failure with Logs:");
+                    for log in &logs {
+                        error!("  > {}", log);
+                    }
+                } else {
+                    error!("❌ RPC Send Failure: {:?}", e);
+                }
+                
+                // Return a more descriptive error that includes the logs if available
+                let err_msg = if !logs.is_empty() {
+                    format!("Failed to send versioned transaction: {}. Logs: {:?}", e, logs)
+                } else {
+                    format!("Failed to send versioned transaction: {}", e)
+                };
+                
+                Err(anyhow::anyhow!(err_msg))
             }
+        }
+    }
+
+    /// Extract program logs from a Solana RPC client error
+    fn extract_rpc_logs(&self, err: &solana_client::client_error::ClientError) -> Vec<String> {
+        use solana_client::client_error::ClientErrorKind;
+        use solana_client::rpc_request::RpcError;
+        use solana_client::rpc_request::RpcResponseErrorData;
+
+        match err.kind() {
+            ClientErrorKind::RpcError(RpcError::RpcResponseError { 
+                data: RpcResponseErrorData::SendTransactionPreflightFailure(result),
+                ..
+            }) => {
+                result.logs.clone().unwrap_or_default()
+            }
+            _ => Vec::new()
         }
     }
 

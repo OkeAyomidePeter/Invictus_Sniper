@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     let tx_manager = TransactionManager::new(presigner.clone(), &config);
 
     // Initialize Database
-    let database = std::sync::Arc::new(Database::new("sqlite://invictus.db").await?);
+    let database = std::sync::Arc::new(Database::new(&config.database_url).await?);
 
     // Log startup
     log_startup(
