@@ -157,7 +157,7 @@ impl PositionTracker {
                 // Check timeout
                 if position.entry_time.elapsed() >= timeout {
                     // Fetch price to make intelligent decision
-                    let current_price = match fetch_price_from_rpc(&client, &rpc_url, &position.mint).await {
+                    let current_price = match fetch_current_price(&client, &config, &position.mint).await {
                         Ok(p) => p,
                         Err(e) => {
                             warn!("Failed to fetch price at timeout check for {}: {}. Assuming entry price.", position.mint, e);
@@ -217,7 +217,7 @@ impl PositionTracker {
                 }
 
                 // Fetch current price
-                match fetch_price_from_rpc(&client, &rpc_url, &position.mint).await {
+                match fetch_current_price(&client, &config, &position.mint).await {
                     Ok(current_price) => {
                         check_count += 1;
                         let pnl_pct = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
@@ -361,9 +361,72 @@ impl PositionTracker {
     }
 }
 
-/// Fetch current price for a token via Helius RPC (Standard API)
-/// Calculates price from AMM pool reserves (Raydium/PumpFun)
-async fn fetch_price_from_rpc(
+/// Fetch current price: 1. Birdeye (Best), 2. RPC (Fallback)
+async fn fetch_current_price(
+    client: &Client,
+    config: &Config,
+    token_mint: &str,
+) -> Result<f64> {
+    // 1. Try Birdeye (Supporting Pump.fun & Raydium)
+    if let Ok(price) = fetch_price_from_birdeye(client, &config.birdeye_api_key, token_mint).await {
+        return Ok(price);
+    }
+
+    // 2. Fallback to Raydium RPC Check
+    fetch_price_from_raydium_rpc(client, &config.rpc_url, token_mint).await
+}
+
+/// Fetch price from Birdeye API (Returns price in SOL)
+async fn fetch_price_from_birdeye(client: &Client, api_key: &str, mint: &str) -> Result<f64> {
+    let url = format!("https://public-api.birdeye.so/defi/price?address={}", mint);
+    
+    let resp = client.get(&url)
+        .header("X-API-KEY", api_key)
+        .header("x-chain", "solana")
+        .send().await?;
+        
+    let json: serde_json::Value = resp.json().await?;
+    
+    if let Some(token_price_usd) = json.get("data").and_then(|d| d.get("value")).and_then(|v| v.as_f64()) {
+        if token_price_usd > 0.0 {
+            // Fetch SOL price to convert USD -> SOL
+            let sol_price_usd = fetch_sol_price(client, api_key).await;
+            
+            // Avoid division by zero (unlikely with fallback)
+            if sol_price_usd > 0.0 {
+                return Ok(token_price_usd / sol_price_usd);
+            }
+        }
+    }
+    
+    Err(anyhow::anyhow!("Birdeye price not found"))
+}
+
+/// Helper to fetch SOL price from Birdeye (with safe fallback)
+async fn fetch_sol_price(client: &Client, api_key: &str) -> f64 {
+    let sol_mint = "So11111111111111111111111111111111111111112";
+    let url = format!("https://public-api.birdeye.so/defi/price?address={}", sol_mint);
+    
+    if let Ok(resp) = client.get(&url)
+        .header("X-API-KEY", api_key)
+        .header("x-chain", "solana")
+        .timeout(std::time::Duration::from_secs(2)) // Fast timeout
+        .send().await 
+    {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+             if let Some(p) = json.get("data").and_then(|d| d.get("value")).and_then(|v| v.as_f64()) {
+                 return p;
+             }
+        }
+    }
+    
+    // Fallback if API fails
+    warn!("⚠️ Failed to fetch SOL price from Birdeye. Using fallback $150.0");
+    150.0 
+}
+
+/// Fetch current price via Helius RPC (Raydium Only)
+async fn fetch_price_from_raydium_rpc(
     client: &Client,
     rpc_url: &str,
     token_mint: &str,
