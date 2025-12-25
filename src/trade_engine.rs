@@ -165,12 +165,23 @@ impl TradeEngine {
 
         if !verified {
             log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), false);
-            // CRITICAL: We don't return Err here IF the transaction was sent successfully.
-            // We want to record it in the DB even if balance check failed so the user can see the signature.
-            error!("❌ CRITICAL: Failed to verify token balance after 5 attempts for {}. Trade may be untracked!", token.mint);
             
-            // We'll proceed with 0 balance for now but it will likely break auto-sell.
-            // The DB record will at least have the transaction signature.
+            // If balance check failed, check if the transaction actually succeeded
+            match self.presigner.check_signature_success(&identifier).await {
+                Ok(true) => {
+                     error!("❌ CRITICAL: Transaction {} CONFIRMED but balance is 0. Likely RPC/Moralis lag.", identifier);
+                     // We proceed to record, but we MUST NOT start auto-sell with 0 tokens.
+                },
+                Ok(false) => {
+                    error!("❌ TRANSACTION FAILED/DROPPED: {}. Aborting trade record.", identifier);
+                    return Err(anyhow::anyhow!("Transaction failed or dropped: {}", identifier));
+                },
+                Err(e) => {
+                    error!("❌ Failed to verify transaction status: {}", e);
+                    // Assume failed to be safe
+                    return Err(anyhow::anyhow!("Failed to verify transaction status: {}", e));
+                }
+            }
         } else {
             log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), true);
         }
@@ -192,13 +203,17 @@ impl TradeEngine {
 
         // 7. Start Monitoring (if auto-sell enabled)
         if self.config.auto_sell_enabled {
-            log_position_started(
-                &token.mint, 
-                amount_sol / (token_amount as f64 / 1e6),  // Entry price per token
-                self.config.auto_sell_profit_target_pct,
-                self.config.auto_sell_stop_loss_pct
-            );
-            self.start_auto_sell_monitoring(token.mint.clone(), amount_sol, token_amount).await;
+            if token_amount > 0 {
+                log_position_started(
+                    &token.mint, 
+                    amount_sol / (token_amount as f64 / 1e6),  // Entry price per token
+                    self.config.auto_sell_profit_target_pct,
+                    self.config.auto_sell_stop_loss_pct
+                );
+                self.start_auto_sell_monitoring(token.mint.clone(), amount_sol, token_amount).await;
+            } else {
+                warn!("⚠️ AUTO-SELL PAUSED: Token balance is 0. Position will be tracked in DB but not actively monitored for sell.");
+            }
         }
 
         Ok(())

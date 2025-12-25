@@ -418,13 +418,29 @@ impl Presigner {
     pub async fn get_token_balance(&self, mint_str: &str) -> Result<u64> {
         // Try Moralis first if available
         if let Some(moralis) = &self.moralis_client {
-            match moralis.get_spl_token_balance(&self.wallet_address, mint_str).await {
-                Ok(balance) => {
-                    info!("✅ Moralis: Token balance for {} = {}", &mint_str[..8.min(mint_str.len())], balance);
-                    return Ok(balance);
-                }
-                Err(e) => {
-                    warn!("⚠️ Moralis balance check failed: {}. Falling back to RPC.", e);
+            for attempt in 1..=3 {
+                match moralis.get_spl_token_balance(&self.wallet_address, mint_str).await {
+                    Ok(balance) => {
+                        if balance > 0 {
+                            info!("✅ Moralis: Token balance for {} = {}", &mint_str[..8.min(mint_str.len())], balance);
+                            return Ok(balance);
+                        } else {
+                            if attempt < 3 {
+                                warn!("⚠️ Moralis returned 0 for {}. Retrying (attempt {}/3)...", &mint_str[..8.min(mint_str.len())], attempt);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            } else {
+                                warn!("⚠️ Moralis returned 0 after 3 attempts for {}. Falling back to RPC.", &mint_str[..8.min(mint_str.len())]);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if attempt < 3 {
+                            warn!("⚠️ Moralis check failed: {}. Retrying (attempt {}/3)...", e, attempt);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        } else {
+                            warn!("⚠️ Moralis failed after 3 attempts: {}. Falling back to RPC.", e);
+                        }
+                    }
                 }
             }
         }
@@ -441,6 +457,22 @@ impl Presigner {
         }).await??;
         
         Ok(balance.amount.parse::<u64>()?)
+    }
+
+    /// Check if a transaction signature resulted in a successful execution
+    pub async fn check_signature_success(&self, signature: &str) -> Result<bool> {
+        let sig = solana_sdk::signature::Signature::from_str(signature)?;
+        let rpc = self.rpc_client.clone();
+        
+        let status_opt = tokio::task::spawn_blocking(move || {
+            rpc.get_signature_status(&sig)
+        }).await??;
+        
+        if let Some(status) = status_opt {
+             return Ok(status.is_ok());
+        }
+        
+        Ok(false) // Not found or dropped
     }
 }
 
