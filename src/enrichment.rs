@@ -60,6 +60,23 @@ struct BirdeyeTokenOverview {
     pub sell_volume_30m_usd: Option<f64>,
     #[serde(rename = "priceChange30mPercent")]
     pub price_change_30m_pct: Option<f64>,
+
+    // 5m Metrics (PUMP DETECTION)
+    #[serde(rename = "uniqueWallet5m")]
+    pub unique_wallets_5m: Option<u64>,
+    #[serde(rename = "vBuy5mUSD")]
+    pub buy_volume_5m_usd: Option<f64>,
+    #[serde(rename = "vSell5mUSD")]
+    pub sell_volume_5m_usd: Option<f64>,
+    #[serde(rename = "priceChange5mPercent")]
+    pub price_change_5m_pct: Option<f64>,
+
+    // 1m Metrics (IGNITION DETECTION)
+    #[serde(rename = "uniqueWallet1m")]
+    pub unique_wallets_1m: Option<u64>,
+    #[serde(rename = "priceChange1mPercent")]
+    pub price_change_1m_pct: Option<f64>,
+
     pub holder: Option<u64>, // Total holder count
     pub extensions: Option<serde_json::Value>, // For socials
 }
@@ -118,6 +135,16 @@ pub struct EnrichedToken {
     pub buy_volume_30m_usd: Option<f64>,
     pub sell_volume_30m_usd: Option<f64>,
     pub price_change_30m_pct: Option<f64>,
+
+    // ========== BIRDEYE METRICS (5m window - PRIMARY) ==========
+    pub unique_wallets_5m: Option<u64>,
+    pub buy_volume_5m_usd: Option<f64>,
+    pub sell_volume_5m_usd: Option<f64>,
+    pub price_change_5m_pct: Option<f64>,
+
+    // ========== BIRDEYE METRICS (1m window - IGNITION) ==========
+    pub unique_wallets_1m: Option<u64>,
+    pub price_change_1m_pct: Option<f64>,
 
     // ========== TIMING ==========
     pub enrichment_timestamp: i64,
@@ -514,6 +541,16 @@ fn assemble_enriched_token(
     let sell_volume_30m_usd = birdeye_ov.as_ref().and_then(|b| b.sell_volume_30m_usd);
     let price_change_30m_pct = birdeye_ov.as_ref().and_then(|b| b.price_change_30m_pct);
 
+    // 5m Metrics
+    let unique_wallets_5m = birdeye_ov.as_ref().and_then(|b| b.unique_wallets_5m);
+    let buy_volume_5m_usd = birdeye_ov.as_ref().and_then(|b| b.buy_volume_5m_usd);
+    let sell_volume_5m_usd = birdeye_ov.as_ref().and_then(|b| b.sell_volume_5m_usd);
+    let price_change_5m_pct = birdeye_ov.as_ref().and_then(|b| b.price_change_5m_pct);
+
+    // 1m Metrics
+    let unique_wallets_1m = birdeye_ov.as_ref().and_then(|b| b.unique_wallets_1m);
+    let price_change_1m_pct = birdeye_ov.as_ref().and_then(|b| b.price_change_1m_pct);
+
     // 5. SOCIALS (Birdeye extensions)
     let birdeye_socials = birdeye_ov.as_ref().and_then(|b| {
         b.extensions.as_ref().and_then(|ext| {
@@ -603,6 +640,16 @@ fn assemble_enriched_token(
         buy_volume_30m_usd,
         sell_volume_30m_usd,
         price_change_30m_pct,
+
+        // 5m Metrics
+        unique_wallets_5m,
+        buy_volume_5m_usd,
+        sell_volume_5m_usd,
+        price_change_5m_pct,
+
+        // 1m Metrics
+        unique_wallets_1m,
+        price_change_1m_pct,
 
         
         // Timing

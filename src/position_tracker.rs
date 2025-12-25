@@ -156,27 +156,46 @@ impl PositionTracker {
             loop {
                 // Check timeout
                 if position.entry_time.elapsed() >= timeout {
-                    // Check if we should extend timeout
+                    // Fetch price to make intelligent decision
+                    let current_price = match fetch_price_from_rpc(&client, &rpc_url, &position.mint).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Failed to fetch price at timeout check for {}: {}. Assuming entry price.", position.mint, e);
+                            position.entry_price_sol_per_token
+                        }
+                    };
+                    
+                    let pnl_pct = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
+                    
+                    // Check if we should extend timeout based on PROFITABILITY
                     if config.dynamic_timeout_enabled 
                         && position.timeout_extensions < config.max_timeout_extensions {
                         
-                        // Extend timeout
-                        position.timeout_extensions += 1;
-                        timeout += Duration::from_secs(config.timeout_extension_seconds);
-                        
-                        info!("⏱️  Timeout extended for {} (extension #{}, now: {}s)", 
-                            position.mint, position.timeout_extensions, timeout.as_secs());
-                        continue;
+                        // Rule 1: MOONING (>50% profit) -> Big Extension
+                        if pnl_pct >= 50.0 {
+                            position.timeout_extensions += 1;
+                            let ext_duration = Duration::from_secs(config.timeout_extension_seconds * 3); // 3x extension
+                            timeout += ext_duration;
+                            info!("🚀 MOONING (+{:.1}%) - Extending timeout for {} by {}s (Big Extension #{})", 
+                                pnl_pct, position.mint, ext_duration.as_secs(), position.timeout_extensions);
+                            continue;
+                        }
+                        // Rule 2: PROFITABLE (>5% profit) -> Normal Extension
+                        else if pnl_pct >= 5.0 {
+                             position.timeout_extensions += 1;
+                             let ext_duration = Duration::from_secs(config.timeout_extension_seconds);
+                             timeout += ext_duration;
+                             info!("✅ PROFITABLE (+{:.1}%) - Extending timeout for {} by {}s (Extension #{})", 
+                                 pnl_pct, position.mint, ext_duration.as_secs(), position.timeout_extensions);
+                             continue;
+                        }
+                        // Rule 3: LOSING/STAGNANT -> Do not extend, let it sell
+                        else {
+                            info!("⏱️  Timeout reached for {}. PnL: {:.2}%. Not extending (below profit threshold).", position.mint, pnl_pct);
+                        }
+                    } else {
+                         info!("⏱️  Timeout reached for {} ({:.0}s). Max extensions used or dynamic disabled.", position.mint, timeout.as_secs());
                     }
-                    
-                    info!("⏱️  Position timeout reached for {} ({:.0}s)", position.mint, timeout.as_secs());
-                    
-                    let final_price = match fetch_price_from_rpc(&client, &rpc_url, &position.mint).await {
-                        Ok(price) => price,
-                        Err(_) => position.entry_price_sol_per_token,
-                    };
-                    
-                    let pnl_pct = ((final_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
                     
                     let trigger = if position.timeout_extensions > 0 {
                         SellTrigger::ExtendedTimeout(position.timeout_extensions)
@@ -187,7 +206,7 @@ impl PositionTracker {
                     let signal = SellSignal {
                         position: position.clone(),
                         trigger,
-                        current_price_sol_per_token: final_price,
+                        current_price_sol_per_token: current_price,
                         pnl_percentage: pnl_pct,
                     };
                     
