@@ -436,11 +436,34 @@ impl TradeEngine {
             let elapsed = chrono::Utc::now().timestamp() - timestamp;
             let entry_time = Instant::now() - std::time::Duration::from_secs(elapsed as u64);
             
+            let mut final_amount = amount;
+            
+            // Auto-heal: If DB says 0 amount (due to previous bug), check actual wallet balance
+            if final_amount == 0 {
+                warn!("⚠️ Resuming position for {} has 0 tokens. Attempting to fetch actual balance...", mint);
+                match self.presigner.get_token_balance(&mint).await {
+                    Ok(bal) => {
+                        if bal > 0 {
+                           info!("✅ Recovered zombie position: {} has {} tokens. Updating state.", mint, bal);
+                           final_amount = bal;
+                           // We use this fresh balance for the Position struct so selling works
+                        } else {
+                           warn!("❌ Still 0 balance for {}. Skipping monitoring to avoid 'No Route' errors.", mint);
+                           continue; // Skip monitoring this dead/failed position
+                        }
+                    },
+                    Err(e) => {
+                       warn!("❌ Failed to fetch balance for {}: {}. Skipping.", mint, e);
+                       continue;
+                    }
+                }
+            }
+
             let position = Position {
                 mint: mint.clone(),
                 entry_price_sol_per_token: entry_price,
                 entry_time,
-                amount_token_raw: amount,
+                amount_token_raw: final_amount,
                 amount_sol_invested: sol_invested,
                 decimals: 6, // TODO: Store decimals in DB
                 highest_price_reached: high,
