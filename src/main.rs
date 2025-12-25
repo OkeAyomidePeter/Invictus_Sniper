@@ -166,6 +166,7 @@ async fn main() -> Result<()> {
         presigner.clone(),
         std::sync::Arc::new(tx_manager.clone()),
         std::sync::Arc::new(position_tracker.clone()),
+        Some(tele_interface.clone()),
     ));
 
     // Resume monitoring for active positions

@@ -251,6 +251,7 @@ async fn run_bot_logic(
         presigner.clone(),
         Arc::new(tx_manager.clone()),
         Arc::new(position_tracker.clone()),
+        None, // No Telegram in GUI runtime for now
     ));
 
     // Resume monitoring

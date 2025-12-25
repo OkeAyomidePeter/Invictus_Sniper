@@ -14,6 +14,7 @@ use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use crate::tele::TelegramInterface;
 
 /// TradeEngine orchestrates the entire lifecycle of a trade:
 /// Buy -> Monitor -> Sell
@@ -24,6 +25,7 @@ pub struct TradeEngine {
     presigner: Arc<Presigner>,
     tx_manager: Arc<TransactionManager>,
     position_tracker: Arc<PositionTracker>,
+    tele: Option<Arc<TelegramInterface>>,
 }
 
 impl TradeEngine {
@@ -33,6 +35,7 @@ impl TradeEngine {
         presigner: Arc<Presigner>,
         tx_manager: Arc<TransactionManager>,
         position_tracker: Arc<PositionTracker>,
+        tele: Option<Arc<TelegramInterface>>,
     ) -> Self {
         Self {
             config: config.clone(),
@@ -40,6 +43,7 @@ impl TradeEngine {
             presigner,
             tx_manager,
             position_tracker,
+            tele,
         }
     }
 
@@ -370,6 +374,30 @@ impl TradeEngine {
                             &signal.trigger.to_string(), 
                             &bundle_id
                         );
+
+                        // Send Telegram Notification
+                        if let Some(tele) = &trade_engine.tele {
+                            let tele = tele.clone();
+                            let mint = signal.position.mint.clone();
+                            let trigger = signal.trigger.to_string();
+                            let pnl_pct = signal.pnl_percentage;
+                            let entry = signal.position.entry_price_sol_per_token;
+                            let exit = signal.current_price_sol_per_token;
+                            let pnl = pnl_sol;
+                            let bid = bundle_id.clone();
+                            
+                            tokio::spawn(async move {
+                                tele.notify_auto_sell(
+                                    &mint,
+                                    &trigger,
+                                    pnl_pct,
+                                    entry,
+                                    exit,
+                                    pnl,
+                                    &bid
+                                ).await;
+                            });
+                        }
                     },
                     Err(e) => {
                         error!("❌ Failed to execute SELL for {}: {}", signal.position.mint, e);
@@ -441,6 +469,30 @@ impl TradeEngine {
                                 &signal.trigger.to_string(), 
                                 &bundle_id
                             );
+
+                            // Send Telegram Notification (Resumed)
+                            if let Some(tele) = &trade_engine.tele {
+                                let tele = tele.clone();
+                                let mint = signal.position.mint.clone();
+                                let trigger = signal.trigger.to_string();
+                                let pnl_pct = 0.0; // PnL pct unknown for resumed
+                                let entry = signal.position.entry_price_sol_per_token;
+                                let exit = signal.current_price_sol_per_token;
+                                let pnl = pnl_sol;
+                                let bid = bundle_id.clone();
+                                
+                                tokio::spawn(async move {
+                                    tele.notify_auto_sell(
+                                        &mint,
+                                        &trigger,
+                                        pnl_pct,
+                                        entry,
+                                        exit,
+                                        pnl,
+                                        &bid
+                                    ).await;
+                                });
+                            }
                         },
                         Err(e) => {
                              error!("❌ Failed to execute SELL (Resumed) for {}: {}", signal.position.mint, e);
