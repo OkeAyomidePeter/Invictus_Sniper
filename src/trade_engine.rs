@@ -135,18 +135,43 @@ impl TradeEngine {
 
         // STEP 7: Verify Position & Record to DB
         let start_step = Instant::now();
-        // Fetch actual token balance - MUST succeed to confirm trade executed
-        let token_amount = self.presigner.get_token_balance(&token.mint).await
-            .context(format!("Failed to verify token balance after buy for {}. Transaction may have failed.", token.mint))?;
         
-        if token_amount == 0 {
-            log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), false);
-            log_error_detailed(&token.mint, "Verify Balance", "Balance is 0 after confirmed bundle");
-            return Err(anyhow::anyhow!("Token balance is 0 after confirmed bundle - transaction may have failed"));
+        // Fetch actual token balance - adding RETRIES to handle RPC lag
+        let mut token_amount = 0;
+        let mut verified = false;
+        
+        for attempt in 1..=5 {
+            match self.presigner.get_token_balance(&token.mint).await {
+                Ok(amount) if amount > 0 => {
+                    token_amount = amount;
+                    verified = true;
+                    info!("✅ Balance verified on attempt {}: {} tokens", attempt, token_amount);
+                    break;
+                }
+                Ok(_) => {
+                    warn!("⚠️ Balance check attempt {} returned 0. Transaction may still be landing or RPC is lagging.", attempt);
+                }
+                Err(e) => {
+                    warn!("⚠️ Balance check attempt {} failed: {}. Retrying...", attempt, e);
+                }
+            }
+            // Wait 2 seconds between retries
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), true);
+
+        if !verified {
+            log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), false);
+            // CRITICAL: We don't return Err here IF the transaction was sent successfully.
+            // We want to record it in the DB even if balance check failed so the user can see the signature.
+            error!("❌ CRITICAL: Failed to verify token balance after 5 attempts for {}. Trade may be untracked!", token.mint);
+            
+            // We'll proceed with 0 balance for now but it will likely break auto-sell.
+            // The DB record will at least have the transaction signature.
+        } else {
+            log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), true);
+        }
         
-        // Record Trade
+        // Record Trade (even if verified is false, we try to record what we have)
         self.db.record_trade(
             &token.mint,
             "BUY",

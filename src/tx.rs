@@ -307,7 +307,21 @@ impl TransactionManager {
                 .await
             {
                 Ok(resp) => {
-                    return Ok(resp.json().await?);
+                    let json: serde_json::Value = resp.json().await?;
+                    
+                    // Check if Jupiter returned an error JSON instead of a quote
+                    if let Some(err_msg) = json.get("error").or_else(|| json.get("message")) {
+                         warn!("⚠️ Jupiter Quote API returned error: {}. Raw response: {}", err_msg, json);
+                         return Err(anyhow::anyhow!("Jupiter Quote Error: {}", err_msg));
+                    }
+                    
+                    // Validate that it looks like a real quote (has inputMint or other core fields)
+                    if json.get("inputMint").is_none() {
+                        error!("❌ Jupiter Quote response missing 'inputMint'. Raw: {}", json);
+                        return Err(anyhow::anyhow!("Jupiter Quote response malformed: missing inputMint"));
+                    }
+
+                    return Ok(json);
                 }
                 Err(e) => {
                     warn!("⚠️ Jupiter Quote Attempt {} failed: {}. Retrying...", attempt, e);

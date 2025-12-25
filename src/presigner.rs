@@ -190,9 +190,14 @@ impl Presigner {
 
     /// Send a VersionedTransaction immediately
     pub fn send_versioned_transaction(&self, tx: &VersionedTransaction) -> Result<String> {
-        let signature = self.rpc_client.send_and_confirm_transaction(tx)
-            .context("Failed to send versioned transaction")?;
-        Ok(signature.to_string())
+        match self.rpc_client.send_and_confirm_transaction(tx) {
+            Ok(sig) => Ok(sig.to_string()),
+            Err(e) => {
+                error!("❌ RPC Send Failure: {:?}", e);
+                // Return a more descriptive error that includes the reason
+                Err(anyhow::anyhow!("Failed to send versioned transaction: {}", e))
+            }
+        }
     }
 
     /// Sign an existing VersionedTransaction with the loaded keypair

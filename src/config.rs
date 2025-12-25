@@ -153,7 +153,7 @@ impl Config {
                 .parse()
                 .unwrap_or(TransactionMode::Standard),
             priority_fee_lamports: env::var("PRIORITY_FEE_LAMPORTS")
-                .unwrap_or("100000".to_string())
+                .unwrap_or("10000".to_string())
                 .parse()
                 .expect("PRIORITY_FEE_LAMPORTS must be a valid number"),
             compute_unit_limit: env::var("COMPUTE_UNIT_LIMIT")
