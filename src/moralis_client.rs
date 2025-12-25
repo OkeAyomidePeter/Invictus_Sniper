@@ -36,7 +36,7 @@ pub struct MoralisTokenBalance {
     #[serde(rename = "amountRaw")]
     pub amount_raw: String,
     /// Token decimals
-    pub decimals: String,
+    pub decimals: u32,
     /// Human-readable amount
     pub amount: String,
 }
