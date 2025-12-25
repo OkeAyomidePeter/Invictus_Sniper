@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use std::str::FromStr;
 use reqwest::Client; // For Jito Bundle API
+use crate::moralis_client::MoralisClient;
 
 const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
@@ -52,6 +53,8 @@ pub struct Presigner {
     keypair: Arc<Keypair>,
     blockhash: Arc<RwLock<Hash>>,
     _update_handle: JoinHandle<()>,
+    moralis_client: Option<MoralisClient>, // Optional Moralis for balance checks
+    wallet_address: String, // For Moralis queries
 }
 
 impl Presigner {
@@ -116,13 +119,27 @@ impl Presigner {
         });
 
         info!("⚡ Presigner initialized with background blockhash updates");
-
+        
+        let wallet_address = keypair.pubkey().to_string();
+        
+        // Initialize Moralis client if API key is available
+        let moralis_client = if !config.moralis_api_key.is_empty() {
+            Some(MoralisClient::new(
+                config.moralis_api_key.clone(),
+                "mainnet".to_string()
+            ))
+        } else {
+            None
+        };
+        
         Self {
             rpc_client,
             http_client: Client::new(),
             keypair,
             blockhash,
             _update_handle: update_handle,
+            moralis_client,
+            wallet_address,
         }
     }
 
@@ -397,7 +414,22 @@ impl Presigner {
     }
 
     /// Get token balance for a specific mint
+    /// Get token balance (Moralis with RPC fallback)
     pub async fn get_token_balance(&self, mint_str: &str) -> Result<u64> {
+        // Try Moralis first if available
+        if let Some(moralis) = &self.moralis_client {
+            match moralis.get_spl_token_balance(&self.wallet_address, mint_str).await {
+                Ok(balance) => {
+                    info!("✅ Moralis: Token balance for {} = {}", &mint_str[..8.min(mint_str.len())], balance);
+                    return Ok(balance);
+                }
+                Err(e) => {
+                    warn!("⚠️ Moralis balance check failed: {}. Falling back to RPC.", e);
+                }
+            }
+        }
+        
+        // Fallback to RPC
         let mint = Pubkey::from_str(mint_str)?;
         let owner = self.keypair.pubkey();
         let ata = spl_associated_token_account::get_associated_token_address(&owner, &mint);

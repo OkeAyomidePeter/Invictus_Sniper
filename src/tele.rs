@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::retry::{retry_with_backoff, RetryConfig, is_network_error};
 use crate::wallet_monitor::WalletMonitor;
+use crate::pnl_tracker::PnLTracker;
 use log::{info, warn, error};
 use std::sync::Arc;
 use teloxide::{
@@ -405,6 +406,14 @@ async fn message_handler(
                 info!("Processing Detailed Stats button");
                 send_detailed_stats(&bot, msg.chat.id, &db).await
             }
+            "💹 PnL Stats" => {
+                info!("Processing PnL Stats button");
+                send_pnl_stats(&bot, msg.chat.id, &db).await
+            }
+            "🏅 Best Trades" => {
+                info!("Processing Best Trades button");
+                send_best_trades(&bot, msg.chat.id, &db).await
+            }
             "💀 Kill Bot" => {
                 info!("Processing Kill Bot button");
                 let keyboard = ReplyMarkup::Keyboard(
@@ -521,6 +530,10 @@ fn create_main_keyboard() -> ReplyMarkup {
                 KeyboardButton::new("📈 Active Positions"),
             ],
             vec![
+                KeyboardButton::new("💹 PnL Stats"),
+                KeyboardButton::new("🏅 Best Trades"),
+            ],
+            vec![
                 KeyboardButton::new("🔍 System Status"),
                 KeyboardButton::new("💀 Kill Bot"),
             ],
@@ -555,5 +568,86 @@ async fn send_detailed_stats(bot: &Bot, chat_id: ChatId, db: &Database) -> Respo
     );
     
     bot.send_message(chat_id, text).parse_mode(ParseMode::Html).send().await?;
+    Ok(())
+}
+
+/// Send PnL statistics
+async fn send_pnl_stats(bot: &Bot, chat_id: ChatId, db: &Database) -> ResponseResult<()> {
+    let pnl_tracker = PnLTracker::new(db.clone());
+    
+    match pnl_tracker.get_stats().await {
+        Ok(stats) => {
+            let pnl_emoji = if stats.total_pnl_sol > 0.0 { "✅" } else if stats.total_pnl_sol < 0.0 { "🛑" } else { "➖" };
+            let pnl_sign = if stats.total_pnl_sol > 0.0 { "+" } else { "" };
+            
+            let text = format!(
+                "<b>💹 PnL Statistics</b>\n\n\
+                • <b>Total Trades:</b> {}\n\
+                • <b>Closed Positions:</b> {}\n\
+                • <b>Active Positions:</b> {}\n\n\
+                • <b>Winning Trades:</b> {} ({:.1}%)\n\
+                • <b>Losing Trades:</b> {}\n\n\
+                • <b>Avg Win:</b> +{:.4} SOL\n\
+                • <b>Avg Loss:</b> {:.4} SOL\n\n\
+                • <b>Total P/L:</b> {} {}{:.4} SOL",
+                stats.total_trades,
+                stats.closed_trades,
+                stats.active_positions,
+                stats.winning_trades,
+                stats.win_rate_pct,
+                stats.losing_trades,
+                stats.avg_win_sol,
+                stats.avg_loss_sol,
+                pnl_emoji,
+                pnl_sign,
+                stats.total_pnl_sol
+            );
+            
+            bot.send_message(chat_id, text).parse_mode(ParseMode::Html).send().await?;
+        }
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Failed to get PnL stats: {}", e)).send().await?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// Send best trades
+async fn send_best_trades(bot: &Bot, chat_id: ChatId, db: &Database) -> ResponseResult<()> {
+    let pnl_tracker = PnLTracker::new(db.clone());
+    
+    match pnl_tracker.get_top_trades(5).await {
+        Ok(trades) => {
+            let mut text = "<b>🏅 Best Trades (Top 5)</b>\n\n".to_string();
+            
+            if trades.is_empty() {
+                text.push_str("No closed trades yet.");
+            } else {
+                for (i, trade) in trades.iter().enumerate() {
+                    let pnl_sol = trade.pnl_sol.unwrap_or(0.0);
+                    let pnl_sign = if pnl_sol > 0.0 { "+" } else { "" };
+                    let trigger = trade.sell_trigger.as_deref().unwrap_or("UNKNOWN");
+                    
+                    text.push_str(&format!(
+                        "{}. <code>{}</code>\n   Entry: {:.10} SOL\n   Exit: {:.10} SOL\n   P/L: {}{:.4} SOL ({})\n\n",
+                        i + 1,
+                        &trade.mint[..12.min(trade.mint.len())],
+                        trade.entry_price,
+                        trade.exit_price.unwrap_or(0.0),
+                        pnl_sign,
+                        pnl_sol,
+                        trigger
+                    ));
+                }
+            }
+            
+            bot.send_message(chat_id, text).parse_mode(ParseMode::Html).send().await?;
+        }
+        Err(e) => {
+            bot.send_message(chat_id, format!("❌ Failed to get best trades: {}", e)).send().await?;
+        }
+    }
+    
     Ok(())
 }

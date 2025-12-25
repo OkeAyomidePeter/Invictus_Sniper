@@ -26,6 +26,7 @@ pub struct ConfigData {
     pub solana_private_key: String,
     pub birdeye_api_key: String,
     pub jupiter_api_key: String,
+    pub moralis_api_key: String,
     
     // Telegram Bot
     pub telegram_bot_token: String,
@@ -119,6 +120,7 @@ impl Default for ConfigData {
             solana_private_key: String::new(),
             birdeye_api_key: String::new(),
             jupiter_api_key: String::new(),
+            moralis_api_key: String::new(),
             telegram_bot_token: String::new(),
             telegram_chat_id: String::new(),
             database_url: "sqlite://invictus.db".to_string(),
@@ -186,6 +188,7 @@ impl ConfigData {
             helius_api_key: self.helius_api_key.clone(),
             rpc_url: self.rpc_url.clone(),
             private_key: self.solana_private_key.clone(),
+            moralis_api_key: self.moralis_api_key.clone(),
             telegram_token: self.telegram_bot_token.clone(),
             telegram_chat_id: self.telegram_chat_id.clone(),
             birdeye_api_key: self.birdeye_api_key.clone(),

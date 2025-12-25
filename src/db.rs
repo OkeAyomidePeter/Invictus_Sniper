@@ -7,7 +7,7 @@ use std::fs::File;
 
 #[derive(Clone)]
 pub struct Database {
-    pool: Pool<Sqlite>,
+    pub(crate) pool: Pool<Sqlite>,
 }
 
 impl Database {

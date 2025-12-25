@@ -21,3 +21,5 @@ pub mod watchlist;
 pub mod trade_engine;
 pub mod trade_logger;
 pub mod health;
+pub mod moralis_client;
+pub mod pnl_tracker;

@@ -5,6 +5,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
+use crate::moralis_client::MoralisClient;
 
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
@@ -21,6 +22,8 @@ pub struct WalletMonitor {
     low_balance_threshold_lamports: u64,
     reserve_for_fees_lamports: u64,
     check_interval_secs: u64,
+    moralis_client: Option<MoralisClient>,
+    wallet_address: String,
 }
 
 impl WalletMonitor {
@@ -31,12 +34,26 @@ impl WalletMonitor {
         reserve_for_fees_sol: f64,
         check_interval_secs: u64,
     ) -> Self {
+        Self::new_with_moralis(rpc_url, pubkey, low_balance_threshold_sol, reserve_for_fees_sol, check_interval_secs, None)
+    }
+    
+    pub fn new_with_moralis(
+        rpc_url: String,
+        pubkey: Pubkey,
+        low_balance_threshold_sol: f64,
+        reserve_for_fees_sol: f64,
+        check_interval_secs: u64,
+        moralis_client: Option<MoralisClient>,
+    ) -> Self {
+        let wallet_address = pubkey.to_string();
         Self {
             rpc_client: Arc::new(RpcClient::new(rpc_url)),
             pubkey,
             low_balance_threshold_lamports: (low_balance_threshold_sol * LAMPORTS_PER_SOL as f64) as u64,
             reserve_for_fees_lamports: (reserve_for_fees_sol * LAMPORTS_PER_SOL as f64) as u64,
             check_interval_secs,
+            moralis_client,
+            wallet_address,
         }
     }
 
@@ -92,8 +109,24 @@ impl WalletMonitor {
         rx
     }
 
-    /// Get current SOL balance
+    /// Get current SOL balance (Moralis with RPC fallback)
     pub async fn get_balance(&self) -> Result<u64> {
+        // Try Moralis first if available
+        if let Some(moralis) = &self.moralis_client {
+            match moralis.get_sol_balance(&self.wallet_address).await {
+                Ok(balance_response) => {
+                    let lamports = balance_response.lamports.parse::<u64>()
+                        .context("Failed to parse Moralis lamports")?;
+                    info!("✅ Moralis: SOL balance = {} lamports", lamports);
+                    return Ok(lamports);
+                }
+                Err(e) => {
+                    warn!("⚠️ Moralis SOL balance check failed: {}. Falling back to RPC.", e);
+                }
+            }
+        }
+        
+        // Fallback to RPC
         self.rpc_client
             .get_balance(&self.pubkey)
             .await

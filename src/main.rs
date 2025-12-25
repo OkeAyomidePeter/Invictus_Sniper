@@ -15,6 +15,8 @@ mod watchlist;
 mod trade_logger;
 mod trade_engine;
 mod health;
+mod pnl_tracker;
+mod moralis_client;
 
 use trade_logger::{
     log_startup, log_shutdown, log_discovery, log_buy, log_buy_failed,
