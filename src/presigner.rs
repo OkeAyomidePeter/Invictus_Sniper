@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use std::str::FromStr;
 use reqwest::Client; // For Jito Bundle API
 use crate::moralis_client::MoralisClient;
+use solana_client::rpc_response::RpcSimulateTransactionResult;
 
 const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
@@ -85,35 +86,46 @@ impl Presigner {
         
         let blockhash = Arc::new(RwLock::new(initial_hash));
         
-        // Start background update loop
+        // Start background update loop with supervisor (restarts on panic or accidental exit)
         let blockhash_clone = blockhash.clone();
         let rpc_clone = rpc_client.clone();
         
         let update_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
-                interval.tick().await;
-                // We use a blocking RPC call inside spawn_blocking or just accept it here since it's a dedicated task
-                // Ideally use non-blocking client, but RpcClient is blocking.
-                // For this snippet, we'll wrap in spawn_blocking if strictly needed, but tokio::spawn allows blocking if it doesn't block the runtime.
-                // RpcClient IS blocking. We should use RpcClient inside spawn_blocking.
-                
                 let rpc = rpc_clone.clone();
                 let hash_lock = blockhash_clone.clone();
                 
-                let res = tokio::task::spawn_blocking(move || {
-                    rpc.get_latest_blockhash()
-                }).await;
+                let task = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(2));
+                    loop {
+                        interval.tick().await;
+                        
+                        let rpc_inner = rpc.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            rpc_inner.get_latest_blockhash()
+                        }).await;
 
-                match res {
-                    Ok(Ok(new_hash)) => {
-                        if let Ok(mut w) = hash_lock.write() {
-                            *w = new_hash;
-                            // info!("🔄 Blockhash updated: {}", new_hash); // Verbose
+                        match res {
+                            Ok(Ok(new_hash)) => {
+                                if let Ok(mut w) = hash_lock.write() {
+                                    *w = new_hash;
+                                }
+                            },
+                            Ok(Err(e)) => warn!("⚠️ Failed to update blockhash: {}", e),
+                            Err(e) => {
+                                error!("❌ Blockhash update task crashed: {}", e);
+                                break; // Exit inner loop to trigger restart
+                            }
                         }
-                    },
-                    Ok(Err(e)) => warn!("⚠️ Failed to update blockhash: {}", e),
-                    Err(e) => error!("❌ Blockhash update task panicked: {}", e),
+                    }
+                });
+
+                if let Err(e) = task.await {
+                    error!("❌ Blockhash supervisor detected panic: {}. Restarting in 5s...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                } else {
+                    warn!("⚠️ Blockhash loop exited unexpectedly. Restarting in 1s...");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         });
@@ -198,18 +210,42 @@ impl Presigner {
         Ok(())
     }
 
+    /// Simulates a transaction
+    pub async fn simulate_transaction(&self, tx: &VersionedTransaction) -> Result<RpcSimulateTransactionResult> {
+        let rpc = self.rpc_client.clone();
+        let tx_clone = tx.clone();
+        
+        let res = tokio::task::spawn_blocking(move || {
+            rpc.simulate_transaction(&tx_clone)
+        }).await??;
+        
+        Ok(res.value)
+    }
+
     /// Send a transaction immediately
-    pub fn send_transaction(&self, tx: &Transaction) -> Result<String> {
-        self.rpc_client.send_and_confirm_transaction(tx)
-            .context("Failed to send transaction")
-            .map(|s| s.to_string())
+    pub async fn send_transaction(&self, tx: &Transaction) -> Result<String> {
+        let rpc = self.rpc_client.clone();
+        let tx_clone = tx.clone();
+        
+        let sig = tokio::task::spawn_blocking(move || {
+            rpc.send_and_confirm_transaction(&tx_clone)
+        }).await??;
+        
+        Ok(sig.to_string())
     }
 
     /// Send a VersionedTransaction immediately
-    pub fn send_versioned_transaction(&self, tx: &VersionedTransaction) -> Result<String> {
-        match self.rpc_client.send_and_confirm_transaction(tx) {
-            Ok(sig) => Ok(sig.to_string()),
-            Err(e) => {
+    pub async fn send_versioned_transaction(&self, tx: &VersionedTransaction) -> Result<String> {
+        let rpc = self.rpc_client.clone();
+        let tx_clone = tx.clone();
+        
+        let res = tokio::task::spawn_blocking(move || {
+            rpc.send_and_confirm_transaction(&tx_clone)
+        }).await;
+
+        match res {
+            Ok(Ok(sig)) => Ok(sig.to_string()),
+            Ok(Err(e)) => {
                 let logs = self.extract_rpc_logs(&e);
                 if !logs.is_empty() {
                     error!("❌ RPC Send Failure with Logs:");
@@ -220,7 +256,6 @@ impl Presigner {
                     error!("❌ RPC Send Failure: {:?}", e);
                 }
                 
-                // Return a more descriptive error that includes the logs if available
                 let err_msg = if !logs.is_empty() {
                     format!("Failed to send versioned transaction: {}. Logs: {:?}", e, logs)
                 } else {
@@ -229,6 +264,7 @@ impl Presigner {
                 
                 Err(anyhow::anyhow!(err_msg))
             }
+            Err(e) => Err(anyhow::anyhow!("RPC task panicked: {}", e)),
         }
     }
 
@@ -452,11 +488,14 @@ impl Presigner {
         
         let rpc = self.rpc_client.clone();
         
-        let balance = tokio::task::spawn_blocking(move || {
+        let res = tokio::task::spawn_blocking(move || {
             rpc.get_token_account_balance(&ata)
-        }).await??;
-        
-        Ok(balance.amount.parse::<u64>()?)
+        }).await?;
+
+        match res {
+            Ok(balance) => Ok(balance.amount.parse::<u64>()?),
+            Err(e) => Err(anyhow::anyhow!("Failed to fetch token balance from RPC: {}", e)),
+        }
     }
 
     /// Check if a transaction signature resulted in a successful execution
@@ -464,15 +503,15 @@ impl Presigner {
         let sig = solana_sdk::signature::Signature::from_str(signature)?;
         let rpc = self.rpc_client.clone();
         
-        let status_opt = tokio::task::spawn_blocking(move || {
+        let res = tokio::task::spawn_blocking(move || {
             rpc.get_signature_status(&sig)
-        }).await??;
+        }).await?;
         
-        if let Some(status) = status_opt {
-             return Ok(status.is_ok());
+        match res {
+            Ok(Some(status)) => Ok(status.is_ok()),
+            Ok(None) => Ok(false), // Not found or dropped
+            Err(e) => Err(anyhow::anyhow!("Failed to verify transaction status: {}", e)),
         }
-        
-        Ok(false) // Not found or dropped
     }
 }
 

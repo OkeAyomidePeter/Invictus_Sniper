@@ -82,10 +82,19 @@ impl TradeEngine {
             // STEP 3a: Sign and Send Standard Transaction
             let start_step = Instant::now();
             
+            // SIMULATION CHECK (Standard)
+            let sim_res = self.presigner.simulate_transaction(&buy_tx).await?;
+            if sim_res.err.is_some() {
+                log_pipeline_step(&token.mint, "Simulate Buy (Standard)", start_step.elapsed().as_millis(), false);
+                error!("❌ BUY Simulation FAILED for {}: {:?}", token.mint, sim_res.err);
+                return Err(anyhow::anyhow!("Buy simulation failed: {:?}", sim_res.err));
+            }
+            log_pipeline_step(&token.mint, "Simulate Buy (Standard)", start_step.elapsed().as_millis(), true);
+
             // Sign the transaction first
             self.presigner.sign_versioned_tx(&mut buy_tx)?;
             
-            let sig = match self.presigner.send_versioned_transaction(&buy_tx) {
+            let sig = match self.presigner.send_versioned_transaction(&buy_tx).await {
                 Ok(s) => {
                     log_pipeline_step(&token.mint, "Send Standard Tx", start_step.elapsed().as_millis(), true);
                     crate::trade_logger::log_priority_fees(&token.mint, self.config.priority_fee_lamports);
@@ -108,6 +117,16 @@ impl TradeEngine {
             let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
             buy_tx.message.set_recent_blockhash(recent_blockhash);
             
+            // SIMULATION CHECK (Jito)
+            let sim_start = Instant::now();
+            let sim_res = self.presigner.simulate_transaction(&buy_tx).await?;
+            if sim_res.err.is_some() {
+                log_pipeline_step(&token.mint, "Simulate Buy (Bundle)", sim_start.elapsed().as_millis(), false);
+                error!("❌ BUY Simulation FAILED for {}: {:?}", token.mint, sim_res.err);
+                return Err(anyhow::anyhow!("Buy simulation failed: {:?}", sim_res.err));
+            }
+            log_pipeline_step(&token.mint, "Simulate Buy (Bundle)", sim_start.elapsed().as_millis(), true);
+
             self.presigner.sign_versioned_tx(&mut buy_tx)?;
             self.presigner.sign_versioned_tx(&mut tip_tx)?;
 
@@ -194,7 +213,8 @@ impl TradeEngine {
             amount_lamports,
             &identifier,
             Some(&identifier),
-            Some(amount_sol / 1.0), // Placeholder price
+            Some(amount_sol / (token_amount as f64 / 10f64.powf(token.decimals as f64))),
+            token.decimals,
         ).await?;
 
         // Log successful buy
@@ -210,7 +230,7 @@ impl TradeEngine {
                     self.config.auto_sell_profit_target_pct,
                     self.config.auto_sell_stop_loss_pct
                 );
-                self.start_auto_sell_monitoring(token.mint.clone(), amount_sol, token_amount).await;
+                self.start_auto_sell_monitoring(token.mint.clone(), amount_sol, token_amount, token.decimals).await;
             } else {
                 warn!("⚠️ AUTO-SELL PAUSED: Token balance is 0. Position will be tracked in DB but not actively monitored for sell.");
             }
@@ -238,10 +258,17 @@ impl TradeEngine {
                 true, // Close ATA
             ).await?;
 
+            // SIMULATION CHECK (Standard Sell)
+            let sim_res = self.presigner.simulate_transaction(&sell_tx).await?;
+            if sim_res.err.is_some() {
+                error!("❌ SELL Simulation FAILED for {}: {:?}", signal.position.mint, sim_res.err);
+                return Err(anyhow::anyhow!("Sell simulation failed: {:?}", sim_res.err));
+            }
+
             // Sign the transaction first
             self.presigner.sign_versioned_tx(&mut sell_tx)?;
 
-            let sig = self.presigner.send_versioned_transaction(&sell_tx)?;
+            let sig = self.presigner.send_versioned_transaction(&sell_tx).await?;
             info!("🚀 Standard SELL Sent! Sig: {}", sig);
             crate::trade_logger::log_priority_fees(&signal.position.mint, self.config.priority_fee_lamports);
             sig
@@ -261,6 +288,14 @@ impl TradeEngine {
             let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
 
             sell_tx.message.set_recent_blockhash(recent_blockhash);
+
+            // SIMULATION CHECK (Jito Sell)
+            let sim_res = self.presigner.simulate_transaction(&sell_tx).await?;
+            if sim_res.err.is_some() {
+                error!("❌ SELL Simulation FAILED for {}: {:?}", signal.position.mint, sim_res.err);
+                return Err(anyhow::anyhow!("Sell simulation failed: {:?}", sim_res.err));
+            }
+
             self.presigner.sign_versioned_tx(&mut sell_tx)?;
             self.presigner.sign_versioned_tx(&mut tip_tx)?;
 
@@ -333,18 +368,12 @@ impl TradeEngine {
     }
 
     /// Start monitoring a position for auto-sell
-    async fn start_auto_sell_monitoring(&self, mint: String, entry_sol: f64, token_amount: u64) {
+    async fn start_auto_sell_monitoring(&self, mint: String, entry_sol: f64, token_amount: u64, decimals: u8) {
         info!("📊 Starting auto-sell monitoring for {}", mint);
         
         // Standardize Price to SOL per 1.0 Token (Fixes Unit Mismatch)
         let entry_price = if token_amount > 0 {
-            // Assume 6 decimals if we don't have better info here, 
-            // OR ideally pass decimals to start_auto_sell_monitoring separately?
-            // `start_auto_sell_monitoring` signature doesn't take decimals.
-            // We should check if we can pass it.
-            // But for now, PumpFun tokens are 6.
-            let decimals = 6.0; 
-            let token_amount_whole = token_amount as f64 / 10f64.powf(decimals);
+            let token_amount_whole = token_amount as f64 / 10f64.powf(decimals as f64);
             entry_sol / token_amount_whole
         } else {
             0.0
@@ -356,7 +385,7 @@ impl TradeEngine {
             entry_time: Instant::now(),
             amount_token_raw: token_amount,
             amount_sol_invested: (entry_sol * 1e9) as u64,
-            decimals: 6, // Default, should fetch
+            decimals,
             highest_price_reached: 0.0,
             partial_exit_executed: false,
             remaining_amount_pct: 100.0,
@@ -377,9 +406,10 @@ impl TradeEngine {
                 match trade_engine.execute_sell(&signal).await {
                     Ok(bundle_id) => {
                          sell_success = true;
-                         // Calculate P/L in SOL
-                        let pnl_sol = (signal.position.amount_token_raw as f64 * signal.current_price_sol_per_token
-                            - signal.position.amount_sol_invested as f64) / 1_000_000_000.0;
+                         // Calculate P/L in SOL (Cleaned units)
+                        let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
+                        let pnl_sol = (token_amount_whole * signal.current_price_sol_per_token
+                            - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0));
 
                         // Record exit in DB
                         if let Err(e) = trade_engine.db.update_trade_exit(
@@ -448,7 +478,7 @@ impl TradeEngine {
         let positions = self.db.get_open_positions_state().await?;
         info!("🔄 Resuming monitoring for {} active positions", positions.len());
         
-        for (mint, entry_price, amount, timestamp, high, ext, sol_invested, partial_exit, remaining_pct) in positions {
+        for (mint, entry_price, amount, timestamp, high, ext, sol_invested, partial_exit, remaining_pct, decimals) in positions {
             let elapsed = chrono::Utc::now().timestamp() - timestamp;
             let entry_time = Instant::now() - std::time::Duration::from_secs(elapsed as u64);
             
@@ -481,7 +511,7 @@ impl TradeEngine {
                 entry_time,
                 amount_token_raw: final_amount,
                 amount_sol_invested: sol_invested,
-                decimals: 6, // TODO: Store decimals in DB
+                decimals,
                 highest_price_reached: high,
                 partial_exit_executed: partial_exit,  // Restored from DB
                 remaining_amount_pct: remaining_pct,   // Restored from DB
@@ -502,8 +532,10 @@ impl TradeEngine {
                     
                     match trade_engine.execute_sell(&signal).await {
                         Ok(bundle_id) => {
-                             let pnl_sol = (signal.position.amount_token_raw as f64 * signal.current_price_sol_per_token
-                                - signal.position.amount_sol_invested as f64) / 1_000_000_000.0;
+                             // Calculate P/L in SOL (Cleaned units)
+                             let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
+                             let pnl_sol = (token_amount_whole * signal.current_price_sol_per_token
+                                - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0));
 
                              if let Err(e) = trade_engine.db.update_trade_exit(
                                 &signal.position.mint,

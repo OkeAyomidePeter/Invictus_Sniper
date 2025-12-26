@@ -1,7 +1,7 @@
 use crate::enrichment::EnrichedToken;
 use anyhow::Result;
 use log::{info, warn};
-use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
+use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite, Row};
 use std::path::Path;
 use std::fs::File;
 
@@ -63,6 +63,7 @@ impl Database {
                 jito_bundle_id TEXT,
                 timestamp INTEGER,
                 entry_price REAL DEFAULT 0.0,
+                decimals INTEGER DEFAULT 6,
                 exit_price REAL,
                 pnl_sol REAL,
                 sell_trigger TEXT,
@@ -85,6 +86,9 @@ impl Database {
         let _ = sqlx::query("ALTER TABLE trades ADD COLUMN partial_exit_executed INTEGER DEFAULT 0")
             .execute(&self.pool).await;
         let _ = sqlx::query("ALTER TABLE trades ADD COLUMN remaining_amount_pct REAL DEFAULT 100.0")
+            .execute(&self.pool).await;
+        // Migration for decimals
+        let _ = sqlx::query("ALTER TABLE trades ADD COLUMN decimals INTEGER DEFAULT 6")
             .execute(&self.pool).await;
         // Migration for liquidity_usd
         let _ = sqlx::query("ALTER TABLE tokens ADD COLUMN liquidity_usd REAL DEFAULT 0.0")
@@ -124,6 +128,7 @@ impl Database {
         signature: &str,
         jito_bundle_id: Option<&str>,
         entry_price: Option<f64>,
+        decimals: u8,
     ) -> Result<()> {
         let price_sol = if amount_token > 0 {
             amount_sol as f64 / amount_token as f64
@@ -133,8 +138,8 @@ impl Database {
 
         sqlx::query(
             r#"
-            INSERT INTO trades (mint, action, amount_token, amount_sol, price_sol, signature, jito_bundle_id, timestamp, entry_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (mint, action, amount_token, amount_sol, price_sol, signature, jito_bundle_id, timestamp, entry_price, decimals)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(mint)
@@ -145,7 +150,8 @@ impl Database {
         .bind(signature)
         .bind(jito_bundle_id)
         .bind(chrono::Utc::now().timestamp())
-        .bind(entry_price)
+        .bind(entry_price.unwrap_or(0.0))
+        .bind(decimals as i32)
         .execute(&self.pool)
         .await?;
 
@@ -316,11 +322,11 @@ impl Database {
     }
 
     /// Get full active positions with state for restoration
-    /// Returns (mint, entry_price, amount_token, timestamp, highest_price, extensions, amount_sol, partial_exit_executed, remaining_amount_pct)
-    pub async fn get_open_positions_state(&self) -> Result<Vec<(String, f64, u64, i64, f64, u32, u64, bool, f64)>> {
-        let rows: Vec<(String, f64, String, i64, Option<f64>, Option<i32>, i64, Option<i32>, Option<f64>)> = sqlx::query_as(
+    /// Returns (mint, entry_price, amount_token, timestamp, highest_price, extensions, amount_sol, partial_exit_executed, remaining_amount_pct, decimals)
+    pub async fn get_open_positions_state(&self) -> Result<Vec<(String, f64, u64, i64, f64, u32, u64, bool, f64, u8)>> {
+        let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(
             r#"
-            SELECT mint, entry_price, amount_token, timestamp, highest_price_reached, timeout_extensions, amount_sol, partial_exit_executed, remaining_amount_pct
+            SELECT mint, entry_price, amount_token, timestamp, highest_price_reached, timeout_extensions, amount_sol, partial_exit_executed, remaining_amount_pct, decimals
             FROM trades 
             WHERE action = 'BUY' AND exit_price IS NULL
             ORDER BY timestamp DESC
@@ -329,18 +335,30 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         
-        let result = rows.into_iter().map(|(mint, price, amt_str, ts, high, ext, sol, partial_exit, remaining)| {
-            let amt = amt_str.parse::<u64>().unwrap_or(0);
+        let result = rows.into_iter().map(|row| {
+            let mint: String = row.get("mint");
+            let entry_price: f64 = row.get("entry_price");
+            let amount_token_str: String = row.get("amount_token");
+            let timestamp: i64 = row.get("timestamp");
+            let highest_price_reached: Option<f64> = row.get("highest_price_reached");
+            let timeout_extensions: Option<i32> = row.get("timeout_extensions");
+            let amount_sol: i64 = row.get("amount_sol");
+            let partial_exit_executed: Option<i32> = row.get("partial_exit_executed");
+            let remaining_amount_pct: Option<f64> = row.get("remaining_amount_pct");
+            let decimals: i32 = row.get("decimals");
+
+            let amt = amount_token_str.parse::<u64>().unwrap_or(0);
             (
                 mint, 
-                price, 
+                entry_price, 
                 amt, 
-                ts, 
-                high.unwrap_or(price), 
-                ext.unwrap_or(0) as u32,
-                sol as u64,
-                partial_exit.unwrap_or(0) != 0,  // Convert to bool
-                remaining.unwrap_or(100.0)
+                timestamp, 
+                highest_price_reached.unwrap_or(entry_price), 
+                timeout_extensions.unwrap_or(0) as u32,
+                amount_sol as u64,
+                partial_exit_executed.unwrap_or(0) != 0,  // Convert to bool
+                remaining_amount_pct.unwrap_or(100.0),
+                decimals as u8
             )
         }).collect();
         
