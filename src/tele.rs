@@ -372,11 +372,12 @@ async fn message_handler(
                     for (mint, entry_price, amount, timestamp) in positions {
                         let elapsed = chrono::Utc::now().timestamp() - timestamp;
                         let minutes = elapsed / 60;
+                        let amount_ui = amount as f64 / 1_000_000.0; // Assume 6 decimals
                         text.push_str(&format!(
-                            "• {}...\n  Entry: {:.10} SOL\n  Amount: {} tokens\n  Time: {}m ago\n\n",
+                            "• {}...\n  Entry: {:.10} SOL\n  Amount: {:.2} tokens\n  Time: {}m ago\n\n",
                             &mint[..8.min(mint.len())],
                             entry_price,
-                            amount,
+                            amount_ui,
                             minutes
                         ));
                     }

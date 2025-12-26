@@ -336,8 +336,16 @@ impl TradeEngine {
     async fn start_auto_sell_monitoring(&self, mint: String, entry_sol: f64, token_amount: u64) {
         info!("📊 Starting auto-sell monitoring for {}", mint);
         
+        // Standardize Price to SOL per 1.0 Token (Fixes Unit Mismatch)
         let entry_price = if token_amount > 0 {
-            (entry_sol * 1e9) / token_amount as f64
+            // Assume 6 decimals if we don't have better info here, 
+            // OR ideally pass decimals to start_auto_sell_monitoring separately?
+            // `start_auto_sell_monitoring` signature doesn't take decimals.
+            // We should check if we can pass it.
+            // But for now, PumpFun tokens are 6.
+            let decimals = 6.0; 
+            let token_amount_whole = token_amount as f64 / 10f64.powf(decimals);
+            entry_sol / token_amount_whole
         } else {
             0.0
         };
@@ -363,9 +371,12 @@ impl TradeEngine {
             while let Some(signal) = rx.recv().await {
                 info!("🚨 SELL SIGNAL for {}: {} (P/L: {:.2}%)", signal.position.mint, signal.trigger, signal.pnl_percentage);
                 
+                let mut sell_success = false;
+                
                 // Execute Sell
                 match trade_engine.execute_sell(&signal).await {
                     Ok(bundle_id) => {
+                         sell_success = true;
                          // Calculate P/L in SOL
                         let pnl_sol = (signal.position.amount_token_raw as f64 * signal.current_price_sol_per_token
                             - signal.position.amount_sol_invested as f64) / 1_000_000_000.0;
@@ -420,8 +431,13 @@ impl TradeEngine {
                     }
                 }
                 
-                if matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout) {
+                
+                // Only stop monitoring if the sell was successfully sent
+                if sell_success && matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout) {
+                    info!("✅ Trade lifecycle complete for {}. Stopping monitoring.", signal.position.mint);
                     break; // Stop monitoring after full exit
+                } else if !sell_success {
+                    warn!("🔄 Sell failed for {}. Continuing to monitor/retry...", signal.position.mint);
                 }
             }
         });
