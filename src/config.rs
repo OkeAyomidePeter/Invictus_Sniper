@@ -73,6 +73,7 @@ pub struct Config {
     // Rate limiting
     pub helius_max_requests_per_second: f64,
     pub jupiter_max_requests_per_second: f64,
+    pub birdeye_max_requests_per_second: f64,
     pub rate_limiting_enabled: bool,
     // Wallet monitoring
     pub wallet_low_balance_alert_sol: f64,
@@ -230,6 +231,10 @@ impl Config {
                 .unwrap_or("5.0".to_string())
                 .parse()
                 .expect("JUPITER_MAX_REQUESTS_PER_SECOND must be a valid number"),
+            birdeye_max_requests_per_second: env::var("BIRDEYE_MAX_REQUESTS_PER_SECOND")
+                .unwrap_or("5.0".to_string())
+                .parse()
+                .expect("BIRDEYE_MAX_REQUESTS_PER_SECOND must be a valid number"),
             rate_limiting_enabled: env::var("RATE_LIMITING_ENABLED")
                 .unwrap_or("true".to_string())
                 .parse()

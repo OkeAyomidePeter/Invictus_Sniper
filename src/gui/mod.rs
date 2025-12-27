@@ -73,6 +73,7 @@ pub struct ConfigData {
     pub rate_limiting_enabled: bool,
     pub helius_max_requests_per_second: String,
     pub jupiter_max_requests_per_second: String,
+    pub birdeye_max_requests_per_second: String,
     
     // Wallet Monitoring
     pub wallet_low_balance_alert_sol: String,
@@ -151,6 +152,7 @@ impl Default for ConfigData {
             rate_limiting_enabled: true,
             helius_max_requests_per_second: "10.0".to_string(),
             jupiter_max_requests_per_second: "5.0".to_string(),
+            birdeye_max_requests_per_second: "5.0".to_string(),
             wallet_low_balance_alert_sol: "0.5".to_string(),
             wallet_monitor_interval_secs: "60".to_string(),
             wallet_reserve_for_fees_sol: "0.1".to_string(),
@@ -185,6 +187,7 @@ impl Default for ConfigData {
 impl ConfigData {
     fn to_config(&self) -> Result<Config, String> {
         Ok(Config {
+            birdeye_max_requests_per_second: self.birdeye_max_requests_per_second.parse().map_err(|_| "Invalid birdeye_max_requests_per_second")?,
             helius_api_key: self.helius_api_key.clone(),
             rpc_url: self.rpc_url.clone(),
             private_key: self.solana_private_key.clone(),

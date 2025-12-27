@@ -9,12 +9,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tokio::sync::RwLock;
-
 use crate::db::Database;
 use solana_sdk::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
-
+use crate::rate_limiter::RateLimiter;
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 /// Represents an active trading position
@@ -65,11 +63,7 @@ pub struct SellSignal {
     pub pnl_percentage: f64,
 }
 
-#[derive(Debug, Clone)]
-struct SolCache {
-    price: f64,
-    timestamp: Instant,
-}
+
 
 /// Position tracker manages active positions and monitors for sell conditions
 #[derive(Clone)]
@@ -83,7 +77,7 @@ pub struct PositionTracker {
     timeout_seconds: u64,
     price_check_interval_ms: u64,
     rpc_url: String,
-    sol_cache: Arc<RwLock<Option<SolCache>>>,
+    birdeye_limiter: Arc<RateLimiter>,
 }
 
 impl PositionTracker {
@@ -92,6 +86,11 @@ impl PositionTracker {
             .timeout(Duration::from_millis(config.jupiter_api_timeout_ms))
             .build()
             .unwrap_or_else(|_| Client::new());
+
+        let birdeye_limiter = Arc::new(RateLimiter::new(
+            config.birdeye_max_requests_per_second,
+            "BirdeyePositionTracker",
+        ));
 
         Self {
             client,
@@ -103,7 +102,7 @@ impl PositionTracker {
             timeout_seconds: config.auto_sell_timeout_seconds,
             price_check_interval_ms: config.auto_sell_price_check_interval_ms,
             rpc_url: config.rpc_url.clone(),
-            sol_cache: Arc::new(RwLock::new(None)),
+            birdeye_limiter,
         }
     }
 
@@ -149,7 +148,7 @@ impl PositionTracker {
         let db = self.db.clone();
         let config = self.config.clone();
         let client = self.client.clone();
-        let sol_cache = self.sol_cache.clone();
+        let birdeye_limiter = self.birdeye_limiter.clone();
         let mint_clone = position.mint.clone();
 
         tokio::spawn(async move {
@@ -168,7 +167,7 @@ impl PositionTracker {
                 // Check timeout
                 if position.entry_time.elapsed() >= timeout {
                     // Fetch price to make intelligent decision
-                    let current_price = match fetch_current_price(&client, &config, &position.mint, sol_cache.clone()).await {
+                    let current_price = match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter).await {
                         Ok(p) => p,
                         Err(e) => {
                             warn!("Failed to fetch price at timeout check for {}: {}. Assuming entry price.", position.mint, e);
@@ -233,7 +232,7 @@ impl PositionTracker {
                 }
 
                 // Fetch current price
-                match fetch_current_price(&client, &config, &position.mint, sol_cache.clone()).await {
+                match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter).await {
                     Ok(current_price) => {
                         check_count += 1;
                         let pnl_pct = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
@@ -349,8 +348,8 @@ impl PositionTracker {
                             }
                         }
 
-                        // CHECK 4: Fixed Stop Loss (if trailing stop not enabled or hasn't risen yet)
-                        if !config.trailing_stop_enabled && pnl_pct <= -stop_loss {
+                        // CHECK 4: Fixed Stop Loss (Safety Floor)
+                        if pnl_pct <= -stop_loss {
                             warn!("🛑 Stop-loss triggered for {}: {:.2}%", position.mint, pnl_pct);
                             
                             let signal = SellSignal {
@@ -399,160 +398,52 @@ impl PositionTracker {
     }
 }
 
-/// Fetch current price: Concurrently queries Jupiter, Birdeye, and Raydium RPC.
-/// Takes the most recent valid price or median for stability.
 async fn fetch_current_price(
     client: &Client,
     config: &Config,
     token_mint: &str,
-    sol_cache: Arc<RwLock<Option<SolCache>>>,
+    limiter: &RateLimiter,
 ) -> Result<f64> {
     let mint = token_mint.to_string();
     let api_key = config.birdeye_api_key.clone();
-    let rpc_url = config.rpc_url.clone();
 
-    // Spawn concurrent price check tasks
-    let birdeye_task = fetch_price_from_birdeye(client, &api_key, &mint, sol_cache.clone());
-    let jupiter_task = fetch_price_from_jupiter(client, &mint);
-
-    // Wait for all to complete
-    let (birdeye_res, jupiter_res) = tokio::join!(birdeye_task, jupiter_task);
-
-    let mut valid_prices = Vec::new();
-
-    if let Ok(p) = birdeye_res {
-        if p > 0.0 { valid_prices.push(("Birdeye", p)); }
-    }
-    if let Ok(p) = jupiter_res {
-        if p > 0.0 { valid_prices.push(("Jupiter", p)); }
-    }
-
-    if valid_prices.is_empty() {
-        return Err(anyhow::anyhow!("All price sources failed for {}", token_mint));
-    }
-
-    // Selection Logic:
-    // If we have multiple, we'll take the median to avoid outliers from any one provider.
-    // If only one, we take it.
-    if valid_prices.len() == 1 {
-        let (source, price) = valid_prices[0];
-        // info!("📈 Price for {} from {}: {:.10}", token_mint, source, price);
-        Ok(price)
-    } else {
-        // Sort and take median
-        valid_prices.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let median_idx = valid_prices.len() / 2;
-        let p = valid_prices[median_idx].1;
-        // info!("📈 Multi-Path Price for {} (Median): {:.10} (Sources: {})", 
-        //     token_mint, p, valid_prices.len());
-        Ok(p)
-    }
+    // Fetch from Birdeye directly (native SOL price)
+    fetch_price_from_birdeye(client, &api_key, &mint, limiter).await
 }
 
-/// Fetch price from Jupiter Price API V2
-async fn fetch_price_from_jupiter(client: &Client, mint: &str) -> Result<f64> {
-    let sol_mint = "So11111111111111111111111111111111111111112";
-    let url = format!("https://api.jup.ag/price/v2/full?ids={}&vsToken={}", mint, sol_mint);
-    
-    let resp = client.get(&url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send().await?;
-        
-    let json: serde_json::Value = resp.json().await?;
-    
-    // Parse response format: { "data": { "MINT": { "price": "..." } } }
-    if let Some(data) = json.get("data").and_then(|d| d.get(mint)) {
-        if let Some(price_str) = data.get("price").and_then(|p| p.as_str()) {
-            let price = price_str.parse::<f64>()?;
-            if price > 0.0 {
-                return Ok(price);
-            }
-        }
-    }
-    
-    Err(anyhow::anyhow!("Jupiter price not found for {}", mint))
-}
 
-/// Fetch price from Birdeye API (Returns price in SOL)
+
+/// Fetch price from Birdeye API (Returns price in SOL directly via priceInNative)
 async fn fetch_price_from_birdeye(
     client: &Client, 
     api_key: &str, 
     mint: &str,
-    sol_cache: Arc<RwLock<Option<SolCache>>>,
+    limiter: &RateLimiter,
 ) -> Result<f64> {
+    // Apply rate limiting
+    limiter.acquire().await;
+
     let url = format!("https://public-api.birdeye.so/defi/price?address={}", mint);
     
     let resp = client.get(&url)
         .header("X-API-KEY", api_key)
         .header("x-chain", "solana")
+        .header("accept", "application/json")
+        .timeout(Duration::from_secs(5))
         .send().await?;
         
     let json: serde_json::Value = resp.json().await?;
     
-    if let Some(token_price_usd) = json.get("data").and_then(|d| d.get("value")).and_then(|v| v.as_f64()) {
-        if token_price_usd > 0.0 {
-            // Fetch SOL price to convert USD -> SOL
-            if let Some(sol_price_usd) = fetch_sol_price(client, api_key, sol_cache).await {
-                // Avoid division by zero
-                if sol_price_usd > 0.0 {
-                    return Ok(token_price_usd / sol_price_usd);
-                }
-            }
+    if let Some(price_in_native) = json.get("data").and_then(|d| d.get("priceInNative")).and_then(|v| v.as_f64()) {
+        if price_in_native > 0.0 {
+            return Ok(price_in_native);
         }
     }
     
-    Err(anyhow::anyhow!("Birdeye price not found or SOL price unavailable"))
+    Err(anyhow::anyhow!("Birdeye priceInNative not found for {}", mint))
 }
 
-/// Helper to fetch SOL price from Birdeye (with cache and healthy fallback removal)
-async fn fetch_sol_price(
-    client: &Client, 
-    api_key: &str,
-    sol_cache: Arc<RwLock<Option<SolCache>>>,
-) -> Option<f64> {
-    // 1. Try Fetching Fresh Price
-    let sol_mint = "So11111111111111111111111111111111111111112";
-    let url = format!("https://public-api.birdeye.so/defi/price?address={}", sol_mint);
-    
-    let fetch_result = async {
-        let resp = client.get(&url)
-            .header("X-API-KEY", api_key)
-            .header("x-chain", "solana")
-            .timeout(std::time::Duration::from_secs(3)) 
-            .send().await?;
-            
-        let json = resp.json::<serde_json::Value>().await?;
-        let price = json.get("data").and_then(|d| d.get("value")).and_then(|v| v.as_f64())
-            .ok_or_else(|| anyhow::anyhow!("No price in JSON"))?;
-            
-        Ok::<f64, anyhow::Error>(price)
-    }.await;
 
-    match fetch_result {
-        Ok(price) => {
-            // Update Cache
-            let mut cache = sol_cache.write().await;
-            *cache = Some(SolCache {
-                price,
-                timestamp: Instant::now(),
-            });
-            Some(price)
-        }
-        Err(e) => {
-            // 2. Fallback to Cache if fresh fetch fails
-            let cache = sol_cache.read().await;
-            if let Some(cached) = &*cache {
-                // Use cache if it's not older than 60 seconds
-                if cached.timestamp.elapsed().as_secs() < 60 {
-                    return Some(cached.price);
-                }
-            }
-            
-            warn!("⚠️ Failed to fetch SOL price and no recent cache available: {}", e);
-            None // No $150 fallback! Returning None triggers a loop continue/wait.
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
