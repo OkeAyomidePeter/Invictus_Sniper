@@ -12,12 +12,10 @@ use tokio::time::sleep;
 use tokio::sync::RwLock;
 
 use crate::db::Database;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use solana_sdk::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const RAYDIUM_AMM_V4_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 
 /// Represents an active trading position
 #[derive(Debug, Clone)]
@@ -225,8 +223,13 @@ impl PositionTracker {
                     
                     if tx.send(signal).await.is_err() {
                         warn!("Failed to send timeout signal for {} (receiver dropped)", position.mint);
+                        break; // Channel closed, give up
                     }
-                    break;
+
+                    // We don't break here! We wait for the trade engine to succeed and remove us from the map.
+                    // This allows retries if the sell fails.
+                    sleep(Duration::from_secs(10)).await; // Slow down checking while waiting for exit
+                    continue;
                 }
 
                 // Fetch current price
@@ -308,8 +311,12 @@ impl PositionTracker {
                             
                             if tx.send(signal).await.is_err() {
                                 warn!("Failed to send profit signal for {}", position.mint);
+                                break;
                             }
-                            break;
+                            
+                            // Don't break loop, let TradeEngine confirmation remove us from map
+                            sleep(Duration::from_secs(5)).await; 
+                            continue;
                         }
 
                         // CHECK 3: Trailing Stop Loss (if enabled)
@@ -333,8 +340,12 @@ impl PositionTracker {
                                 
                                 if tx.send(signal).await.is_err() {
                                     warn!("Failed to send trailing stop signal for {}", position.mint);
+                                    break;
                                 }
-                                break;
+                                
+                                // Don't break loop, let TradeEngine confirmation remove us from map
+                                sleep(Duration::from_secs(5)).await; 
+                                continue;
                             }
                         }
 
@@ -351,12 +362,26 @@ impl PositionTracker {
                             
                             if tx.send(signal).await.is_err() {
                                 warn!("Failed to send stop-loss signal for {}", position.mint);
+                                break;
                             }
-                            break;
+                            
+                            // Don't break loop, let TradeEngine confirmation remove us from map
+                            sleep(Duration::from_secs(5)).await; 
+                            continue;
                         }
                     }
                     Err(e) => {
                         error!("Failed to fetch price for {}: {}", position.mint, e);
+                    }
+                }
+
+                // EXIT CHECK: Only stop monitoring if the position is no longer in the active map.
+                // This happens when TradeEngine successfully calls update_trade_exit and cleans up.
+                {
+                    let guard = active_positions_clone.lock().await;
+                    if !guard.contains_key(&mint_clone) {
+                        info!("🏁 Position {} removed from active map. Exiting monitoring loop.", mint_clone);
+                        break;
                     }
                 }
 
@@ -386,21 +411,17 @@ async fn fetch_current_price(
     let api_key = config.birdeye_api_key.clone();
     let rpc_url = config.rpc_url.clone();
 
-    // Spawn 3 concurrent price check tasks
+    // Spawn concurrent price check tasks
     let birdeye_task = fetch_price_from_birdeye(client, &api_key, &mint, sol_cache.clone());
-    let raydium_task = fetch_price_from_raydium_rpc(client, &rpc_url, &mint);
     let jupiter_task = fetch_price_from_jupiter(client, &mint);
 
-    // Wait for all to complete (with internal timeouts)
-    let (birdeye_res, raydium_res, jupiter_res) = tokio::join!(birdeye_task, raydium_task, jupiter_task);
+    // Wait for all to complete
+    let (birdeye_res, jupiter_res) = tokio::join!(birdeye_task, jupiter_task);
 
     let mut valid_prices = Vec::new();
 
     if let Ok(p) = birdeye_res {
         if p > 0.0 { valid_prices.push(("Birdeye", p)); }
-    }
-    if let Ok(p) = raydium_res {
-        if p > 0.0 { valid_prices.push(("Raydium", p)); }
     }
     if let Ok(p) = jupiter_res {
         if p > 0.0 { valid_prices.push(("Jupiter", p)); }
@@ -531,166 +552,6 @@ async fn fetch_sol_price(
             None // No $150 fallback! Returning None triggers a loop continue/wait.
         }
     }
-}
-
-/// Fetch current price via Helius RPC (Raydium Only)
-async fn fetch_price_from_raydium_rpc(
-    client: &Client,
-    rpc_url: &str,
-    token_mint: &str,
-) -> Result<f64> {
-    // 1. Find the Raydium AMM Pool for this token/SOL pair
-    // We need to find the pool account. For Raydium v4, we can derive it or search for it.
-    // For simplicity and speed without heavy dependencies, we'll use getProgramAccounts 
-    // filtered by the token mints.
-    
-    // Note: This is a simplified implementation. In production, you should cache pool addresses
-    // or derive them deterministically if possible.
-    
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getProgramAccounts",
-        "params": [
-            RAYDIUM_AMM_V4_PROGRAM_ID,
-            {
-                "encoding": "base64",
-                "filters": [
-                    {
-                        "dataSize": 752 // Raydium AMM v4 layout size
-                    },
-                    {
-                        "memcmp": {
-                            "offset": 400, // Offset for coinMint (Token A)
-                            "bytes": token_mint
-                        }
-                    },
-                    {
-                        "memcmp": {
-                            "offset": 432, // Offset for pcMint (Token B - usually SOL/USDC)
-                            "bytes": SOL_MINT
-                        }
-                    }
-                ]
-            }
-        ]
-    });
-
-    let response = client.post(rpc_url).json(&request_body).send().await?;
-    let response_json: serde_json::Value = response.json().await?;
-    
-    // Check if we found the pool
-    if let Some(result) = response_json.get("result").and_then(|r| r.as_array()) {
-        if !result.is_empty() {
-            // Found pool where Token is Coin and SOL is PC
-            let account_data = result[0].get("account").and_then(|a| a.get("data").and_then(|d| d.get(0).and_then(|s| s.as_str()))).context("No data")?;
-            let data_bytes = BASE64_STANDARD.decode(account_data)?;
-            
-            // Extract reserves (offsets based on Raydium layout)
-            // coinVault: 400 (mint) -> need to fetch vault balance? No, layout has reserves?
-            // Raydium layout doesn't store reserves directly in the AMM account, it stores the vault Pubkeys.
-            // We need to fetch the vault accounts.
-            
-            // Let's try a simpler approach for the audit fix:
-            // Use getAsset from Helius DAS API if available, or fallback to Jupiter Quote if RPC fails.
-            // But user specifically asked for "Helius free/normal api not geyser".
-            // The most reliable way without complex parsing is actually to use `getTokenAccountBalance` on the pool's vaults.
-            
-            // For this implementation, we will assume we can get the price from Jupiter for now 
-            // BUT since the user banned Jupiter API, we must use RPC.
-            
-            // Let's implement the Vault Balance fetch.
-            // We need to parse the vault pubkeys from the AMM account.
-            // coinVault: offset 448
-            // pcVault: offset 480
-            
-            if data_bytes.len() >= 512 {
-                let coin_vault_key = solana_sdk::pubkey::Pubkey::new(&data_bytes[448..480]);
-                let pc_vault_key = solana_sdk::pubkey::Pubkey::new(&data_bytes[480..512]);
-                
-                // Fetch balances
-                let coin_bal = get_token_balance(client, rpc_url, &coin_vault_key.to_string()).await?;
-                let pc_bal = get_token_balance(client, rpc_url, &pc_vault_key.to_string()).await?;
-                
-                if coin_bal > 0.0 {
-                    return Ok(pc_bal / coin_bal);
-                }
-            }
-        }
-    }
-    
-    // Try reverse pair (SOL is Coin, Token is PC)
-    let request_body_reverse = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getProgramAccounts",
-        "params": [
-            RAYDIUM_AMM_V4_PROGRAM_ID,
-            {
-                "encoding": "base64",
-                "filters": [
-                    {
-                        "dataSize": 752
-                    },
-                    {
-                        "memcmp": {
-                            "offset": 400,
-                            "bytes": SOL_MINT
-                        }
-                    },
-                    {
-                        "memcmp": {
-                            "offset": 432,
-                            "bytes": token_mint
-                        }
-                    }
-                ]
-            }
-        ]
-    });
-    
-    let response_rev = client.post(rpc_url).json(&request_body_reverse).send().await?;
-    let response_json_rev: serde_json::Value = response_rev.json().await?;
-    
-    if let Some(result) = response_json_rev.get("result").and_then(|r| r.as_array()) {
-        if !result.is_empty() {
-             let account_data = result[0].get("account").and_then(|a| a.get("data").and_then(|d| d.get(0).and_then(|s| s.as_str()))).context("No data")?;
-            let data_bytes = BASE64_STANDARD.decode(account_data)?;
-            
-            if data_bytes.len() >= 512 {
-                let coin_vault_key = solana_sdk::pubkey::Pubkey::new(&data_bytes[448..480]);
-                let pc_vault_key = solana_sdk::pubkey::Pubkey::new(&data_bytes[480..512]);
-                
-                let coin_bal = get_token_balance(client, rpc_url, &coin_vault_key.to_string()).await?;
-                let pc_bal = get_token_balance(client, rpc_url, &pc_vault_key.to_string()).await?;
-                
-                if pc_bal > 0.0 {
-                    return Ok(coin_bal / pc_bal); // Price is Coin/PC (SOL/Token) -> we want SOL per Token
-                }
-            }
-        }
-    }
-
-    // Fallback: Return 0.0 if not found (will trigger error handling in caller)
-    // In a real implementation, we would also check Pump.fun bonding curves
-    Err(anyhow::anyhow!("Price not found on Raydium"))
-}
-
-async fn get_token_balance(client: &Client, rpc_url: &str, pubkey: &str) -> Result<f64> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTokenAccountBalance",
-        "params": [pubkey]
-    });
-    
-    let resp: serde_json::Value = client.post(rpc_url).json(&body).send().await?.json().await?;
-    
-    if let Some(val) = resp.get("result").and_then(|r| r.get("value")).and_then(|v| v.get("uiAmount")) {
-        return Ok(val.as_f64().unwrap_or(0.0));
-    }
-    
-    Ok(0.0)
 }
 
 #[cfg(test)]

@@ -226,7 +226,7 @@ impl TradeEngine {
             if token_amount > 0 {
                 log_position_started(
                     &token.mint, 
-                    amount_sol / (token_amount as f64 / 1e6),  // Entry price per token
+                    amount_sol / (token_amount as f64 / 10f64.powf(token.decimals as f64)),  // Entry price per token
                     self.config.auto_sell_profit_target_pct,
                     self.config.auto_sell_stop_loss_pct
                 );
