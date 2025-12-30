@@ -208,7 +208,17 @@ async fn command_handler(
     let result = match cmd {
         Command::Start => {
             info!("Processing /start command");
-            let welcome_msg = r#"🤖 <b>Invictus Bot Control Panel</b>
+            let is_comatose = std::path::Path::new(KILL_SWITCH_PATH).exists();
+            
+            let welcome_msg = if is_comatose {
+                r#"💤 <b>Invictus Bot (Comatose)</b>
+
+The bot is currently in <b>Comatose Mode</b>.
+All trading is disabled.
+
+Use the button below to Revive and restart operations."#
+            } else {
+                r#"🤖 <b>Invictus Bot Control Panel</b>
 
 Welcome to the Invictus Bot Telegram interface!
 
@@ -219,12 +229,14 @@ Available commands:
 • 💀 Kill Bot - Shutdown the bot
 • ❓ Help - Show this help message
 
-Use the buttons below for quick access:
-                    "#;
+Use the buttons below for quick access:"#
+            };
+
+            let keyboard = if is_comatose { create_comatose_keyboard() } else { create_main_keyboard() };
             
             bot.send_message(msg.chat.id, welcome_msg)
                 .parse_mode(ParseMode::Html)
-                .reply_markup(create_main_keyboard())
+                .reply_markup(keyboard)
                 .send()
                 .await
                 .map(|_| ())
@@ -462,8 +474,9 @@ async fn message_handler(
                      error!("Failed to create Kill Switch file: {}", e);
                      bot.send_message(msg.chat.id, format!("❌ Failed to activate Kill Switch: {}", e)).send().await.map(|_| ())
                 } else {
-                    let result = bot.send_message(msg.chat.id, "💀 <b>KILL SWITCH ACTIVATED</b>\n\nBot will enter Comatose Mode upon restart. Use /revive to restore operations.")
+                    let result = bot.send_message(msg.chat.id, "💀 <b>KILL SWITCH ACTIVATED</b>\n\nBot will enter Comatose Mode upon restart. Use /revive or the button below to restore operations.")
                         .parse_mode(ParseMode::Html)
+                        .reply_markup(create_comatose_keyboard()) // Switch to Comatose Keyboard
                         .send()
                         .await
                         .map(|_| ());
@@ -471,6 +484,32 @@ async fn message_handler(
                     let _ = shutdown_tx.send(()).await;
                     result
                 }
+            }
+            "✅ Revive Bot" => {
+                 info!("Processing Revive Bot button");
+                 // Re-use the revive logic
+                 if std::path::Path::new(KILL_SWITCH_PATH).exists() {
+                     match std::fs::remove_file(KILL_SWITCH_PATH) {
+                         Ok(_) => {
+                             let _ = bot.send_message(msg.chat.id, "✅ <b>Kill Switch Deactivated!</b>\n\nRestarting bot to resume operations...")
+                                .parse_mode(ParseMode::Html)
+                                .reply_markup(create_main_keyboard()) // Switch back to Main Keyboard (though we exit)
+                                .send()
+                                .await;
+                             std::process::exit(0);
+                         },
+                         Err(e) => {
+                             bot.send_message(msg.chat.id, format!("❌ Failed to remove Kill Switch: {}", e)).send().await.map(|_| ())
+                         }
+                     }
+                 } else {
+                     bot.send_message(msg.chat.id, "ℹ️ <b>Kill Switch is not active.</b> Bot is already running normally.")
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(create_main_keyboard())
+                        .send()
+                        .await
+                        .map(|_| ())
+                 }
             }
             "❌ Cancel" => {
                 info!("Processing Cancel button");
@@ -564,6 +603,19 @@ fn create_main_keyboard() -> ReplyMarkup {
             vec![
                 KeyboardButton::new("🔍 System Status"),
                 KeyboardButton::new("💀 Kill Bot"),
+            ],
+            vec![KeyboardButton::new("❓ Help")],
+        ])
+        .resize_keyboard(true),
+    )
+}
+
+/// Create comatose keyboard (Only Revive)
+fn create_comatose_keyboard() -> ReplyMarkup {
+    ReplyMarkup::Keyboard(
+        KeyboardMarkup::new([
+            vec![
+                KeyboardButton::new("✅ Revive Bot"),
             ],
             vec![KeyboardButton::new("❓ Help")],
         ])
