@@ -59,6 +59,14 @@ const SCORE_SOCIAL_MAX: f64 = 10.0;
 // Total holders (Safety)
 const UNIQUE_HOLDERS_CRITICAL_LOW: u64 = 10;
 
+// Survival Gate Thresholds
+const DISPLACEMENT_RATIO_MIN: f64 = 0.5; // Min price movement per $1k volume
+const MOMENTUM_DECAY_THRESHOLD_5M: f64 = 10.0;
+const LOW_LIQUIDITY_VOLATILITY_MAX_5M: f64 = 25.0;
+const LOW_LIQUIDITY_LIMIT_USD: f64 = 10000.0;
+const BUY_PRESSURE_ABSORPTION_RATIO: f64 = 1.5;
+const PENALTY_SURVIVAL_GATE: f64 = 50.0;
+
 #[derive(Debug, Clone)]
 pub struct TokenScorer;
 
@@ -101,6 +109,19 @@ impl TokenScorer {
                  if unique < UNIQUE_HOLDERS_CRITICAL_LOW {
                     warn!("💀 SCORING: {} has only {} holders (ghost token)", token.mint, unique);
                     TradeLogger::log(&format!("💀 SCORING REJECTED: {} ghost token", token.mint));
+                    return 0.0;
+                }
+            }
+        }
+
+        // --- NEW SURVIVAL GATES ---
+        
+        // Gate A: Liquidity-Aware Volatility Filter
+        if liquidity_usd < LOW_LIQUIDITY_LIMIT_USD {
+            if let Some(pct_5m) = token.price_change_5m_pct {
+                if pct_5m > LOW_LIQUIDITY_VOLATILITY_MAX_5M {
+                    warn!("💀 SCORING: {} REJECTED - Extreme volatility in low liquidity (+{:.1}% < $10k liq)", token.mint, pct_5m);
+                    TradeLogger::log(&format!("💀 SCORING REJECTED: {} extreme vol/low liq", token.mint));
                     return 0.0;
                 }
             }
@@ -206,13 +227,46 @@ impl TokenScorer {
         // 7. SOCIALS
         // =====================================================================
         let mut social_score = 0.0;
-         if let Some(meta) = &token.metadata {
+        if let Some(meta) = &token.metadata {
             if let Some(socials) = &meta.socials {
                 if socials.telegram.is_some() || socials.twitter.is_some() { social_score += 10.0; }
             }
         }
         score += social_score;
         breakdown.socials = social_score;
+
+        // =====================================================================
+        // 8. FINAL SURVIVAL PENALTIES (MOMENTUM / CHOP / ABSORPTION)
+        // =====================================================================
+        
+        // Penalty 1: Momentum Health Gate (Late Entry Protection)
+        if let (Some(p5m), Some(p1m)) = (token.price_change_5m_pct, token.price_change_1m_pct) {
+            if p5m >= MOMENTUM_DECAY_THRESHOLD_5M && p1m <= 0.0 {
+                warn!("⚠️ SCORING: {} Penalty - Momentum Health Gate (Momentum decayed: 5m={:.1}%, 1m={:.1}%)", token.mint, p5m, p1m);
+                score -= PENALTY_SURVIVAL_GATE;
+            }
+        }
+
+        // Penalty 2: Chop Detector (Displacement Ratio)
+        if let (Some(p5m), Some(b5m), Some(s5m)) = (token.price_change_5m_pct, token.buy_volume_5m_usd, token.sell_volume_5m_usd) {
+            let total_vol = b5m + s5m;
+            let displacement_ratio = p5m.abs() / (total_vol / 1000.0).max(1.0);
+            if displacement_ratio < DISPLACEMENT_RATIO_MIN {
+                warn!("⚠️ SCORING: {} Penalty - Chop Detector (Low displacement: {:.2} ratio for ${:.0} vol)", token.mint, displacement_ratio, total_vol);
+                score -= PENALTY_SURVIVAL_GATE;
+            }
+        }
+
+        // Penalty 3: Buy Pressure Sanity (Absorption Check)
+        if let (Some(b5m), Some(s5m), Some(p1m)) = (token.buy_volume_5m_usd, token.sell_volume_5m_usd, token.price_change_1m_pct) {
+            if s5m > 0.0 {
+                let ratio = b5m / s5m;
+                if ratio > BUY_PRESSURE_ABSORPTION_RATIO && p1m <= 0.0 {
+                    warn!("⚠️ SCORING: {} Penalty - Buy Pressure Sanity (Buys absorbed: Ratio={:.2}, 1m={:.1}%)", token.mint, ratio, p1m);
+                    score -= (PENALTY_SURVIVAL_GATE / 2.0); // Moderate penalty
+                }
+            }
+        }
 
         // Bounds
         if score > 150.0 { score = 150.0; }

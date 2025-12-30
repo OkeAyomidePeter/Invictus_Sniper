@@ -93,6 +93,9 @@ impl Database {
         // Migration for liquidity_usd
         let _ = sqlx::query("ALTER TABLE tokens ADD COLUMN liquidity_usd REAL DEFAULT 0.0")
             .execute(&self.pool).await;
+        // Migration for entry_1m_move
+        let _ = sqlx::query("ALTER TABLE trades ADD COLUMN entry_1m_move REAL DEFAULT 0.0")
+            .execute(&self.pool).await;
 
         info!("✅ Database schema initialized");
         Ok(())
@@ -129,6 +132,7 @@ impl Database {
         jito_bundle_id: Option<&str>,
         entry_price: Option<f64>,
         decimals: u8,
+        entry_1m_move: f64,
     ) -> Result<()> {
         let price_sol = if amount_token > 0 {
             amount_sol as f64 / amount_token as f64
@@ -138,8 +142,8 @@ impl Database {
 
         sqlx::query(
             r#"
-            INSERT INTO trades (mint, action, amount_token, amount_sol, price_sol, signature, jito_bundle_id, timestamp, entry_price, decimals)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO trades (mint, action, amount_token, amount_sol, price_sol, signature, jito_bundle_id, timestamp, entry_price, decimals, entry_1m_move)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(mint)
@@ -152,6 +156,7 @@ impl Database {
         .bind(chrono::Utc::now().timestamp())
         .bind(entry_price.unwrap_or(0.0))
         .bind(decimals as i32)
+        .bind(entry_1m_move)
         .execute(&self.pool)
         .await?;
 
@@ -322,11 +327,11 @@ impl Database {
     }
 
     /// Get full active positions with state for restoration
-    /// Returns (mint, entry_price, amount_token, timestamp, highest_price, extensions, amount_sol, partial_exit_executed, remaining_amount_pct, decimals)
-    pub async fn get_open_positions_state(&self) -> Result<Vec<(String, f64, u64, i64, f64, u32, u64, bool, f64, u8)>> {
+    /// Returns (mint, entry_price, amount_token, timestamp, highest_price, extensions, amount_sol, partial_exit_executed, remaining_amount_pct, decimals, entry_1m_move)
+    pub async fn get_open_positions_state(&self) -> Result<Vec<(String, f64, u64, i64, f64, u32, u64, bool, f64, u8, f64)>> {
         let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(
             r#"
-            SELECT mint, entry_price, amount_token, timestamp, highest_price_reached, timeout_extensions, amount_sol, partial_exit_executed, remaining_amount_pct, decimals
+            SELECT mint, entry_price, amount_token, timestamp, highest_price_reached, timeout_extensions, amount_sol, partial_exit_executed, remaining_amount_pct, decimals, entry_1m_move
             FROM trades 
             WHERE action = 'BUY' AND exit_price IS NULL
             ORDER BY timestamp DESC
@@ -346,6 +351,7 @@ impl Database {
             let partial_exit_executed: Option<i32> = row.get("partial_exit_executed");
             let remaining_amount_pct: Option<f64> = row.get("remaining_amount_pct");
             let decimals: i32 = row.get("decimals");
+            let entry_1m_move: Option<f64> = row.get("entry_1m_move");
 
             let amt = amount_token_str.parse::<u64>().unwrap_or(0);
             (
@@ -358,7 +364,8 @@ impl Database {
                 amount_sol as u64,
                 partial_exit_executed.unwrap_or(0) != 0,  // Convert to bool
                 remaining_amount_pct.unwrap_or(100.0),
-                decimals as u8
+                decimals as u8,
+                entry_1m_move.unwrap_or(0.0)
             )
         }).collect();
         

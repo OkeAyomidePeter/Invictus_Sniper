@@ -13,6 +13,7 @@ use crate::db::Database;
 use solana_sdk::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
 use crate::rate_limiter::RateLimiter;
+use crate::moralis_client::MoralisClient;
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 /// Represents an active trading position
@@ -28,6 +29,7 @@ pub struct Position {
     pub partial_exit_executed: bool,    // Track if partial exit done
     pub remaining_amount_pct: f64,      // Track remaining position size
     pub timeout_extensions: u32,        // Count timeout extensions
+    pub entry_1m_move: f64,             // Momentum at entry for adaptive exits
 }
 
 /// Reason for triggering a sell
@@ -78,6 +80,7 @@ pub struct PositionTracker {
     price_check_interval_ms: u64,
     rpc_url: String,
     birdeye_limiter: Arc<RateLimiter>,
+    moralis_client: Arc<MoralisClient>,
 }
 
 impl PositionTracker {
@@ -92,6 +95,11 @@ impl PositionTracker {
             "BirdeyePositionTracker",
         ));
 
+        let moralis_client = Arc::new(MoralisClient::new(
+            config.moralis_api_key.clone(),
+            "mainnet".to_string(),
+        ));
+
         Self {
             client,
             config: config.clone(),
@@ -103,6 +111,7 @@ impl PositionTracker {
             price_check_interval_ms: config.auto_sell_price_check_interval_ms,
             rpc_url: config.rpc_url.clone(),
             birdeye_limiter,
+            moralis_client,
         }
     }
 
@@ -149,6 +158,7 @@ impl PositionTracker {
         let config = self.config.clone();
         let client = self.client.clone();
         let birdeye_limiter = self.birdeye_limiter.clone();
+        let moralis_client = self.moralis_client.clone();
         let mint_clone = position.mint.clone();
 
         tokio::spawn(async move {
@@ -167,7 +177,7 @@ impl PositionTracker {
                 // Check timeout
                 if position.entry_time.elapsed() >= timeout {
                     // Fetch price to make intelligent decision
-                    let current_price = match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter).await {
+                    let current_price = match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter, &moralis_client).await {
                         Ok(p) => p,
                         Err(e) => {
                             warn!("Failed to fetch price at timeout check for {}: {}. Assuming entry price.", position.mint, e);
@@ -232,7 +242,7 @@ impl PositionTracker {
                 }
 
                 // Fetch current price
-                match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter).await {
+                match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter, &moralis_client).await {
                     Ok(current_price) => {
                         check_count += 1;
                         let pnl_pct = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
@@ -259,13 +269,19 @@ impl PositionTracker {
                             );
                         }
 
-                        // CHECK 1: Partial Exit (if enabled and not yet executed)
+                        // CHECK 1: Partial Exit (Adaptive or Fixed)
+                        let partial_exit_threshold = if position.entry_1m_move > 0.0 {
+                            (1.5 * position.entry_1m_move).max(config.partial_exit_target_pct)
+                        } else {
+                            config.partial_exit_target_pct
+                        };
+
                         if config.partial_exit_enabled 
                             && !position.partial_exit_executed 
-                            && pnl_pct >= config.partial_exit_target_pct {
+                            && pnl_pct >= partial_exit_threshold {
                             
-                            info!("💰 Partial profit target hit for {}: +{:.2}% - Selling {}%", 
-                                position.mint, pnl_pct, config.partial_exit_amount_pct);
+                            info!("💰 Adaptive partial profit target hit for {}: +{:.2}% (Threshold: {:.1}%) - Selling {}%", 
+                                position.mint, pnl_pct, partial_exit_threshold, config.partial_exit_amount_pct);
                             
                             position.partial_exit_executed = true;
                             position.remaining_amount_pct = 100.0 - config.partial_exit_amount_pct;
@@ -320,15 +336,25 @@ impl PositionTracker {
 
                         // CHECK 3: Trailing Stop Loss (if enabled)
                         if config.trailing_stop_enabled {
-                            let trail_distance = config.trailing_stop_distance_pct / 100.0;
+                            // Rule: After 90s without new high, tighten trail stop distance
+                            let mut trail_distance_pct = config.trailing_stop_distance_pct;
+                            if position.entry_time.elapsed() > Duration::from_secs(90) {
+                                // Dynamic peak check: if highest_price_reached hasn't moved in a while?
+                                // Simplified: if we've been in trade > 90s, tighten from 25% to 12.5% (example)
+                                if trail_distance_pct > 15.0 {
+                                    trail_distance_pct = 12.5;
+                                }
+                            }
+                            
+                            let trail_distance = trail_distance_pct / 100.0;
                             let trailing_stop_price = position.highest_price_reached * (1.0 - trail_distance);
                             
                             if current_price <= trailing_stop_price {
                                 let pnl_from_entry = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
                                 let drop_from_peak = ((position.highest_price_reached - current_price) / position.highest_price_reached) * 100.0;
                                 
-                                warn!("🛑 Trailing stop triggered for {}: Peak {:.10} → {:.10} (-{:.1}% from peak, {:.2}% from entry)", 
-                                    position.mint, position.highest_price_reached, current_price, drop_from_peak, pnl_from_entry);
+                                warn!("🛑 Trailing stop triggered for {}: Peak {:.10} → {:.10} (-{:.1}% from peak, {:.2}% from entry, Trail: {:.1}%)", 
+                                    position.mint, position.highest_price_reached, current_price, drop_from_peak, pnl_from_entry, trail_distance_pct);
                                 
                                 let signal = SellSignal {
                                     position: position.clone(),
@@ -403,12 +429,20 @@ async fn fetch_current_price(
     config: &Config,
     token_mint: &str,
     limiter: &RateLimiter,
+    moralis: &MoralisClient,
 ) -> Result<f64> {
     let mint = token_mint.to_string();
     let api_key = config.birdeye_api_key.clone();
 
-    // Fetch from Birdeye directly (native SOL price)
-    fetch_price_from_birdeye(client, &api_key, &mint, limiter).await
+    // 1. Try Birdeye (Primary)
+    match fetch_price_from_birdeye(client, &api_key, &mint, limiter).await {
+        Ok(price) => Ok(price),
+        Err(e) => {
+            warn!("⚠️ Birdeye price fetch failed for {}: {}. Falling back to Moralis...", token_mint, e);
+            // 2. Try Moralis (Fallback)
+            moralis.get_token_price(&mint).await
+        }
+    }
 }
 
 

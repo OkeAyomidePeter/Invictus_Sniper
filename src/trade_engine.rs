@@ -12,6 +12,7 @@ use crate::trade_logger::{
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use crate::tele::TelegramInterface;
@@ -26,6 +27,7 @@ pub struct TradeEngine {
     tx_manager: Arc<TransactionManager>,
     position_tracker: Arc<PositionTracker>,
     tele: Option<Arc<TelegramInterface>>,
+    consecutive_losses: Arc<AtomicU32>,
 }
 
 impl TradeEngine {
@@ -44,6 +46,7 @@ impl TradeEngine {
             tx_manager,
             position_tracker,
             tele,
+            consecutive_losses: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -82,15 +85,8 @@ impl TradeEngine {
             // STEP 3a: Sign and Send Standard Transaction
             let start_step = Instant::now();
             
-            // SIMULATION CHECK (Standard)
-            let sim_res = self.presigner.simulate_transaction(&buy_tx).await?;
-            if sim_res.err.is_some() {
-                log_pipeline_step(&token.mint, "Simulate Buy (Standard)", start_step.elapsed().as_millis(), false);
-                error!("❌ BUY Simulation FAILED for {}: {:?}", token.mint, sim_res.err);
-                return Err(anyhow::anyhow!("Buy simulation failed: {:?}", sim_res.err));
-            }
-            log_pipeline_step(&token.mint, "Simulate Buy (Standard)", start_step.elapsed().as_millis(), true);
-
+            // REMOVED Simulation Check for latency
+            
             // Sign the transaction first
             self.presigner.sign_versioned_tx(&mut buy_tx)?;
             
@@ -117,15 +113,7 @@ impl TradeEngine {
             let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
             buy_tx.message.set_recent_blockhash(recent_blockhash);
             
-            // SIMULATION CHECK (Jito)
-            let sim_start = Instant::now();
-            let sim_res = self.presigner.simulate_transaction(&buy_tx).await?;
-            if sim_res.err.is_some() {
-                log_pipeline_step(&token.mint, "Simulate Buy (Bundle)", sim_start.elapsed().as_millis(), false);
-                error!("❌ BUY Simulation FAILED for {}: {:?}", token.mint, sim_res.err);
-                return Err(anyhow::anyhow!("Buy simulation failed: {:?}", sim_res.err));
-            }
-            log_pipeline_step(&token.mint, "Simulate Buy (Bundle)", sim_start.elapsed().as_millis(), true);
+            // REMOVED Simulation Check for latency
 
             self.presigner.sign_versioned_tx(&mut buy_tx)?;
             self.presigner.sign_versioned_tx(&mut tip_tx)?;
@@ -215,6 +203,7 @@ impl TradeEngine {
             Some(&identifier),
             Some(amount_sol / (token_amount as f64 / 10f64.powf(token.decimals as f64))),
             token.decimals,
+            token.price_change_1m_pct.unwrap_or(0.0),
         ).await?;
 
         // Log successful buy
@@ -230,7 +219,13 @@ impl TradeEngine {
                     self.config.auto_sell_profit_target_pct,
                     self.config.auto_sell_stop_loss_pct
                 );
-                self.start_auto_sell_monitoring(token.mint.clone(), amount_sol, token_amount, token.decimals).await;
+                self.start_auto_sell_monitoring(
+                    token.mint.clone(), 
+                    amount_sol, 
+                    token_amount, 
+                    token.decimals,
+                    token.price_change_1m_pct.unwrap_or(0.0)
+                ).await;
             } else {
                 warn!("⚠️ AUTO-SELL PAUSED: Token balance is 0. Position will be tracked in DB but not actively monitored for sell.");
             }
@@ -258,13 +253,8 @@ impl TradeEngine {
                 true, // Close ATA
             ).await?;
 
-            // SIMULATION CHECK (Standard Sell)
-            let sim_res = self.presigner.simulate_transaction(&sell_tx).await?;
-            if sim_res.err.is_some() {
-                error!("❌ SELL Simulation FAILED for {}: {:?}", signal.position.mint, sim_res.err);
-                return Err(anyhow::anyhow!("Sell simulation failed: {:?}", sim_res.err));
-            }
-
+            // REMOVED Simulation Check for latency
+            
             // Sign the transaction first
             self.presigner.sign_versioned_tx(&mut sell_tx)?;
 
@@ -289,12 +279,7 @@ impl TradeEngine {
 
             sell_tx.message.set_recent_blockhash(recent_blockhash);
 
-            // SIMULATION CHECK (Jito Sell)
-            let sim_res = self.presigner.simulate_transaction(&sell_tx).await?;
-            if sim_res.err.is_some() {
-                error!("❌ SELL Simulation FAILED for {}: {:?}", signal.position.mint, sim_res.err);
-                return Err(anyhow::anyhow!("Sell simulation failed: {:?}", sim_res.err));
-            }
+            // REMOVED Simulation Check for latency
 
             self.presigner.sign_versioned_tx(&mut sell_tx)?;
             self.presigner.sign_versioned_tx(&mut tip_tx)?;
@@ -368,7 +353,7 @@ impl TradeEngine {
     }
 
     /// Start monitoring a position for auto-sell
-    async fn start_auto_sell_monitoring(&self, mint: String, entry_sol: f64, token_amount: u64, decimals: u8) {
+    async fn start_auto_sell_monitoring(&self, mint: String, entry_sol: f64, token_amount: u64, decimals: u8, entry_1m_move: f64) {
         info!("📊 Starting auto-sell monitoring for {}", mint);
         
         // Standardize Price to SOL per 1.0 Token (Fixes Unit Mismatch)
@@ -390,6 +375,7 @@ impl TradeEngine {
             partial_exit_executed: false,
             remaining_amount_pct: 100.0,
             timeout_extensions: 0,
+            entry_1m_move,
         };
 
         let mut rx = self.position_tracker.monitor_position(position).await;
@@ -422,6 +408,15 @@ impl TradeEngine {
                             error!("Failed to record trade exit: {}", e);
                         }
                         
+                        // Update Circuit Breaker logic
+                        if signal.pnl_percentage < 0.0 {
+                            let val = trade_engine.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
+                            warn!("📉 TRADING-WIDE: Consecutive loss count: {}", val);
+                        } else if signal.pnl_percentage > 5.0 { // Significant win
+                            trade_engine.consecutive_losses.store(0, Ordering::SeqCst);
+                            info!("✅ TRADING-WIDE: Consecutive losses reset to 0");
+                        }
+
                         // Log successful sell
                         log_sell(
                             &signal.position.mint, 
@@ -478,7 +473,7 @@ impl TradeEngine {
         let positions = self.db.get_open_positions_state().await?;
         info!("🔄 Resuming monitoring for {} active positions", positions.len());
         
-        for (mint, entry_price, amount, timestamp, high, ext, sol_invested, partial_exit, remaining_pct, decimals) in positions {
+        for (mint, entry_price, amount, timestamp, high, ext, sol_invested, partial_exit, remaining_pct, decimals, entry_1m_move) in positions {
             let elapsed = chrono::Utc::now().timestamp() - timestamp;
             let entry_time = Instant::now() - std::time::Duration::from_secs(elapsed as u64);
             
@@ -516,6 +511,7 @@ impl TradeEngine {
                 partial_exit_executed: partial_exit,  // Restored from DB
                 remaining_amount_pct: remaining_pct,   // Restored from DB
                 timeout_extensions: ext,
+                entry_1m_move,
             };
             
             info!("🔄 Restoring position: {} (partial_exit: {}, remaining: {:.0}%)", 
@@ -545,6 +541,15 @@ impl TradeEngine {
                                 &bundle_id.clone()
                             ).await {
                                 error!("Failed to record trade exit: {}", e);
+                            }
+
+                            // Update Circuit Breaker logic
+                            if signal.pnl_percentage < 0.0 {
+                                let val = trade_engine.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
+                                warn!("📉 TRADING-WIDE (Resumed): Consecutive loss count: {}", val);
+                            } else if signal.pnl_percentage > 5.0 { // Significant win
+                                trade_engine.consecutive_losses.store(0, Ordering::SeqCst);
+                                info!("✅ TRADING-WIDE (Resumed): Consecutive losses reset to 0");
                             }
 
                             // Log successful sell (Resumed)
@@ -594,5 +599,8 @@ impl TradeEngine {
         }
         
         Ok(())
+    }
+    pub fn get_consecutive_losses(&self) -> u32 {
+        self.consecutive_losses.load(Ordering::SeqCst)
     }
 }

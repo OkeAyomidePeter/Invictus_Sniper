@@ -48,6 +48,37 @@ async fn main() -> Result<()> {
     info!("🚀 Starting Invictus Sniper Bot");
     info!("================================================");
 
+    // 0. Check for Kill Switch (Comatose Mode)
+    const KILL_SWITCH_PATH: &str = "KILL_SWITCH";
+    if std::path::Path::new(KILL_SWITCH_PATH).exists() {
+        warn!("💀 KILL SWITCH DETECTED: Entering Comatose Mode.");
+        info!("================================================");
+        
+        // Load Minimal Config
+        let config = config::Config::load();
+        
+        // Initialize Database
+        let database = std::sync::Arc::new(Database::new(&config.database_url).await?);
+        
+        // Initialize Minimal Telegram (No Wallet Monitor)
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let tele_interface = TelegramInterface::new(
+            &config, 
+            database.clone(), 
+            shutdown_tx,
+            None 
+        );
+        
+        // Send notification
+        info!("💤 Bot is Comatose. Waiting for /revive command...");
+        
+        // Run Telegram Interface directly
+        tele_interface.run().await;
+        
+        info!("💀 Comatose Mode Ended (Process Exiting)");
+        return Ok(());
+    }
+
     // 1. Load Configuration
     let config = config::Config::load();
     info!("✅ Configuration loaded successfully");
@@ -97,10 +128,7 @@ async fn main() -> Result<()> {
     info!("⚡ System Operational - Waiting for opportunities");
     info!("================================================");
 
-    // Initialize Scorer
-    let scorer = TokenScorer::new();
-    
-    // Initialize Risk Engine
+
 
 
     // Initialize Presigner (Fast Tx Builder)
@@ -216,8 +244,18 @@ async fn main() -> Result<()> {
                 // Thresholds (adjusted for new 150-point scale)
                 // Buy: ~67% of max (high-conviction only)
                 // Watchlist: ~47% of max (moderate potential)
-                let buy_threshold = 100.0;
-                let watchlist_threshold = 70.0;
+                let mut buy_threshold = 100.0;
+                let mut watchlist_threshold = 70.0;
+
+                // CIRCUIT BREAKER: Raise thresholds if on a losing streak
+                let consecutive_losses = trade_engine.get_consecutive_losses();
+                if consecutive_losses >= 3 {
+                    buy_threshold += 20.0;
+                    watchlist_threshold += 15.0;
+                    warn!("📉 CIRCUIT BREAKER ACTIVE: {} consecutive losses. Raising thresholds (Buy: {:.1}, WL: {:.1})", 
+                        consecutive_losses, buy_threshold, watchlist_threshold);
+                }
+
 
                 if score >= buy_threshold {
                     // RISK CHECK: Max Open Positions

@@ -34,8 +34,11 @@ enum Command {
     Start,
     Stats,
     Kill,
+    Revive,
     Help,
 }
+
+const KILL_SWITCH_PATH: &str = "KILL_SWITCH";
 
 #[derive(Clone)]
 pub struct TelegramInterface {
@@ -242,12 +245,29 @@ Use the buttons below for quick access:
                 .resize_keyboard(true),
             );
             
-            bot.send_message(msg.chat.id, "⚠️ <b>Are you sure you want to shutdown the bot?</b>")
+            bot.send_message(msg.chat.id, "⚠️ <b>Are you sure you want to shutdown the bot?</b>\n\nThis will activate the <b>Kill Switch</b>. The bot will NOT resume trading upon restart until you use /revive.")
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .send()
                 .await
                 .map(|_| ())
+        }
+        Command::Revive => {
+             info!("Processing /revive command");
+             if std::path::Path::new(KILL_SWITCH_PATH).exists() {
+                 match std::fs::remove_file(KILL_SWITCH_PATH) {
+                     Ok(_) => {
+                         let _ = bot.send_message(msg.chat.id, "✅ <b>Kill Switch Deactivated!</b>\n\nRestarting bot to resume operations...").parse_mode(ParseMode::Html).send().await;
+                         // Exit so systemd restarts us
+                         std::process::exit(0);
+                     },
+                     Err(e) => {
+                         bot.send_message(msg.chat.id, format!("❌ Failed to remove Kill Switch: {}", e)).send().await.map(|_| ())
+                     }
+                 }
+             } else {
+                 bot.send_message(msg.chat.id, "ℹ️ <b>Kill Switch is not active.</b> Bot is already running normally.").parse_mode(ParseMode::Html).send().await.map(|_| ())
+             }
         }
         Command::Help => {
             info!("Processing /help command");
@@ -436,14 +456,21 @@ async fn message_handler(
             }
             "✅ Confirm Kill" => {
                 info!("Processing Confirm Kill button");
-                let result = bot.send_message(msg.chat.id, "💀 <b>SHUTTING DOWN...</b>")
-                    .parse_mode(ParseMode::Html)
-                    .send()
-                    .await
-                    .map(|_| ());
-                info!("💀 Kill signal from Telegram!");
-                let _ = shutdown_tx.send(()).await;
-                result
+                
+                // Create Kill Switch File
+                if let Err(e) = std::fs::File::create(KILL_SWITCH_PATH) {
+                     error!("Failed to create Kill Switch file: {}", e);
+                     bot.send_message(msg.chat.id, format!("❌ Failed to activate Kill Switch: {}", e)).send().await.map(|_| ())
+                } else {
+                    let result = bot.send_message(msg.chat.id, "💀 <b>KILL SWITCH ACTIVATED</b>\n\nBot will enter Comatose Mode upon restart. Use /revive to restore operations.")
+                        .parse_mode(ParseMode::Html)
+                        .send()
+                        .await
+                        .map(|_| ());
+                    info!("💀 Kill signal from Telegram! Switch activated.");
+                    let _ = shutdown_tx.send(()).await;
+                    result
+                }
             }
             "❌ Cancel" => {
                 info!("Processing Cancel button");

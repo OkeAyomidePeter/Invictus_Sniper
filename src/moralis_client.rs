@@ -297,6 +297,57 @@ impl MoralisClient {
             .await
             .context("Failed to parse Moralis PnL breakdown response")
     }
+
+    // ========================================================================
+    // Price Endpoints
+    // ========================================================================
+
+    /// Get token price in native SOL
+    /// Endpoint: GET /token/:network/:address/price
+    pub async fn get_token_price(&self, token_address: &str) -> Result<f64> {
+        let url = format!(
+            "{}/token/{}/{}/price",
+            MORALIS_BASE_URL, self.network, token_address
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("Failed to send request to Moralis")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Moralis API error {}: {}",
+                status,
+                body
+            ));
+        }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse Moralis price response")?;
+
+        // Parse nativePrice value and decimals
+        let value_str = json["nativePrice"]["value"]
+            .as_str()
+            .context("Missing nativePrice.value in Moralis response")?;
+        
+        let decimals = json["nativePrice"]["decimals"]
+            .as_u64()
+            .unwrap_or(9); // Default to SOL decimals
+
+        let value = value_str
+            .parse::<f64>()
+            .context("Failed to parse Moralis price value string")?;
+        
+        Ok(value / 10f64.powf(decimals as f64))
+    }
 }
 
 #[cfg(test)]
