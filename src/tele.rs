@@ -151,18 +151,23 @@ impl TelegramInterface {
             backoff_multiplier: 2.0,
         };
 
-        match retry_with_backoff(
-            "Telegram Connection",
-            verify_conn,
-            &retry_config,
-            is_network_error
-        ).await {
-            Ok(me) => info!("✅ Connected to Telegram as @{}", me.username.clone().unwrap_or_default()),
-            Err(e) => {
-                error!("❌ Failed to connect to Telegram after retries: {}", e);
-                // Continue anyway? Or return? 
-                // If we can't connect, the dispatcher might fail too. 
-                // But let's try to run dispatcher anyway as it might recover.
+        // Infinite retry loop for connection
+        loop {
+            match retry_with_backoff(
+                "Telegram Connection",
+                verify_conn,
+                &retry_config,
+                is_network_error
+            ).await {
+                Ok(me) => {
+                    info!("✅ Connected to Telegram as @{}", me.username.clone().unwrap_or_default());
+                    break; // Connected! Proceed to start dispatcher
+                },
+                Err(e) => {
+                    error!("❌ Failed to connect to Telegram after attempts: {}. Retrying in 60s...", e);
+                    // Critical for Comatose Mode: meaningful delay before next batch of retries
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                }
             }
         }
 

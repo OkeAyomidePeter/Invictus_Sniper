@@ -335,7 +335,11 @@ impl PositionTracker {
                         }
 
                         // CHECK 3: Trailing Stop Loss (if enabled)
-                        if config.trailing_stop_enabled {
+                        // GRACE PERIOD: Disable trailing stop for first 45s to survive initial volatility/latency
+                        let grace_period = Duration::from_secs(45);
+                        let in_grace_period = position.entry_time.elapsed() < grace_period;
+
+                        if config.trailing_stop_enabled && !in_grace_period {
                             // Rule: After 90s without new high, tighten trail stop distance
                             let mut trail_distance_pct = config.trailing_stop_distance_pct;
                             if position.entry_time.elapsed() > Duration::from_secs(90) {
@@ -372,6 +376,9 @@ impl PositionTracker {
                                 sleep(Duration::from_secs(5)).await; 
                                 continue;
                             }
+                        } else if in_grace_period && config.trailing_stop_enabled {
+                             // Optional: Log once that we are in grace period? (Maybe too spammy)
+                             // info!("🛡️ Grace Period active for {}: Skipping trailing stop", position.mint);
                         }
 
                         // CHECK 4: Fixed Stop Loss (Safety Floor)
