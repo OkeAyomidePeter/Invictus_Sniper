@@ -117,11 +117,26 @@ pub async fn refresh_jito_tip_accounts() -> Result<()> {
 }
 
 
-/// Get a random Jito tip account from cache
+/// Get a random Jito tip account from cache with validation
 fn get_random_tip_account() -> String {
     let accounts = JITO_TIP_ACCOUNTS_CACHE.read().unwrap();
-    let idx = rand::rng().random_range(0..accounts.len());
-    accounts[idx].clone()
+    
+    // Try up to 5 times to get a valid account
+    for _ in 0..5 {
+        let idx = rand::rng().random_range(0..accounts.len());
+        let candidate = accounts[idx].trim().to_string(); // Trim whitespace
+        
+        // Validate before returning
+        if Pubkey::from_str(&candidate).is_ok() {
+            return candidate;
+        } else {
+             warn!("⚠️ Jito Cache contained invalid Base58: '{}'", candidate);
+        }
+    }
+    
+    // Fallback if cache is corrupted
+    warn!("⚠️ Failed to find valid tip account in cache after 5 attempts. Using hardcoded fallback.");
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5".to_string()
 }
 
 /// DEX Router for swap instructions
