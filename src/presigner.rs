@@ -1,5 +1,6 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use log::{error, info, warn};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -19,7 +20,8 @@ use reqwest::Client; // For Jito Bundle API
 use crate::moralis_client::MoralisClient;
 use solana_client::rpc_response::RpcSimulateTransactionResult;
 
-const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+// Frankfurt regional endpoint for EU servers (lower latency)
+const JITO_BLOCK_ENGINE_URL: &str = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
 
 /// Bundle confirmation status from Jito
 #[derive(Debug, Clone, PartialEq)]
@@ -311,48 +313,74 @@ impl Presigner {
     }
 
     /// Send a Jito Bundle (Swap Tx + Tip Tx)
+    /// Includes retry logic with exponential backoff for rate limit errors
     pub async fn send_jito_bundle(&self, transactions: Vec<VersionedTransaction>) -> Result<String> {
         if transactions.is_empty() {
             return Err(anyhow::anyhow!("Cannot send empty bundle"));
         }
 
-        // Serialize transactions to base58
+        // Serialize transactions to base64 (base58 is deprecated per Jito docs)
         let encoded_txs: Vec<String> = transactions.iter()
             .map(|tx| {
                 let serialized = bincode::serialize(tx).unwrap();
-                bs58::encode(serialized).into_string()
+                BASE64_STANDARD.encode(serialized)
             })
             .collect();
 
-        // Construct JSON-RPC request
+        // Construct JSON-RPC request with base64 encoding specification
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendBundle",
-            "params": [encoded_txs]
+            "params": [encoded_txs, {"encoding": "base64"}]
         });
 
         info!("🚀 Sending Jito Bundle with {} transactions...", transactions.len());
 
-        let response = self.http_client.post(JITO_BLOCK_ENGINE_URL)
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send Jito bundle request")?;
+        // Retry logic with exponential backoff for rate limits
+        let max_retries = 3;
+        let mut last_error = String::new();
+        
+        for attempt in 1..=max_retries {
+            let response = self.http_client.post(JITO_BLOCK_ENGINE_URL)
+                .json(&request)
+                .send()
+                .await
+                .context("Failed to send Jito bundle request")?;
 
-        let response_json: serde_json::Value = response.json().await
-            .context("Failed to parse Jito bundle response")?;
+            let response_json: serde_json::Value = response.json().await
+                .context("Failed to parse Jito bundle response")?;
 
-        if let Some(result) = response_json.get("result") {
-            let bundle_id = result.as_str().unwrap_or("unknown").to_string();
-            info!("✅ Jito Bundle sent! ID: {}", bundle_id);
-            Ok(bundle_id)
-        } else {
-            let error = response_json.get("error")
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "Unknown error".to_string());
-            Err(anyhow::anyhow!("Jito Bundle failed: {}", error))
+            if let Some(result) = response_json.get("result") {
+                let bundle_id = result.as_str().unwrap_or("unknown").to_string();
+                info!("✅ Jito Bundle sent! ID: {}", bundle_id);
+                return Ok(bundle_id);
+            } else if let Some(error) = response_json.get("error") {
+                let error_str = error.to_string();
+                last_error = error_str.clone();
+                
+                // Check for rate limit error (code -32097 or "rate limited" message)
+                let is_rate_limited = error.get("code")
+                    .and_then(|c| c.as_i64())
+                    .map(|c| c == -32097)
+                    .unwrap_or(false)
+                    || error_str.to_lowercase().contains("rate limit")
+                    || error_str.to_lowercase().contains("congested");
+                
+                if is_rate_limited && attempt < max_retries {
+                    let backoff_ms = 500 * (1 << (attempt - 1)); // 500ms, 1000ms, 2000ms
+                    warn!("⚠️ Jito rate limited (attempt {}/{}). Retrying in {}ms...", attempt, max_retries, backoff_ms);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                
+                return Err(anyhow::anyhow!("Jito Bundle failed: {}", error_str));
+            } else {
+                return Err(anyhow::anyhow!("Jito Bundle failed: Unknown error"));
+            }
         }
+        
+        Err(anyhow::anyhow!("Jito Bundle failed after {} retries: {}", max_retries, last_error))
     }
 
     /// Wait for Jito bundle confirmation with timeout

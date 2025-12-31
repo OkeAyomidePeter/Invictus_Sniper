@@ -58,14 +58,30 @@ pub async fn refresh_jito_tip_accounts() -> Result<()> {
     match client.get(JITO_TIP_ACCOUNTS_URL).send().await {
         Ok(response) => {
             if let Ok(accounts) = response.json::<Vec<String>>().await {
-                if !accounts.is_empty() {
+                // Validate each account is a valid Base58 pubkey before caching
+                let valid_accounts: Vec<String> = accounts
+                    .into_iter()
+                    .filter(|acc| {
+                        match Pubkey::from_str(acc) {
+                            Ok(_) => true,
+                            Err(_) => {
+                                warn!("⚠️ Invalid tip account from API (not valid Base58): {}", acc);
+                                false
+                            }
+                        }
+                    })
+                    .collect();
+                
+                if !valid_accounts.is_empty() {
                     if let Ok(mut cache) = JITO_TIP_ACCOUNTS_CACHE.write() {
-                        *cache = accounts.clone();
-                        info!("✅ Refreshed Jito tip accounts: {} accounts", cache.len());
+                        *cache = valid_accounts.clone();
+                        info!("✅ Refreshed Jito tip accounts: {} valid accounts", cache.len());
                     }
                     if let Ok(mut last_refresh) = LAST_TIP_REFRESH.write() {
                         *last_refresh = Some(std::time::Instant::now());
                     }
+                } else {
+                    warn!("⚠️ No valid tip accounts from API. Using cached/default.");
                 }
             }
         }
@@ -76,6 +92,7 @@ pub async fn refresh_jito_tip_accounts() -> Result<()> {
     
     Ok(())
 }
+
 
 /// Get a random Jito tip account from cache
 fn get_random_tip_account() -> String {
