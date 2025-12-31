@@ -147,6 +147,25 @@ async fn main() -> Result<()> {
         config.min_liquidity_usd
     );
 
+    // 🚀 Start Jito Tip Account Refresh Loop
+    if let crate::config::TransactionMode::Jito = config.transaction_mode {
+        info!("🔄 Starting Jito Tip Account Refresh Loop...");
+        tokio::spawn(async {
+            // Initial refresh
+            if let Err(e) = tx::refresh_jito_tip_accounts().await {
+                 warn!("⚠️ Initial Jito tip refresh failed: {}", e);
+            }
+            
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600)); // 10 minutes
+            loop {
+                interval.tick().await;
+                if let Err(e) = tx::refresh_jito_tip_accounts().await {
+                    warn!("⚠️ Periodic Jito tip refresh failed: {}", e);
+                }
+            }
+        });
+    }
+
     // Initialize Wallet Monitor
     let wallet_monitor = std::sync::Arc::new(wallet_monitor::WalletMonitor::new(
         format!("https://mainnet.helius-rpc.com/?api-key={}", config.helius_api_key),
