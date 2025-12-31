@@ -25,7 +25,9 @@ use tokio::sync::OnceCell;
 const JUPITER_QUOTE_API: &str = "https://api.jup.ag/swap/v1/quote";
 const JUPITER_SWAP_API: &str = "https://api.jup.ag/swap/v1/swap";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const JITO_TIP_ACCOUNTS_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_accounts";
+
+// Global endpoint (Frankfurt was 429ing)
+const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
 // Default fallback Jito tip accounts (used if API fails)
 const DEFAULT_JITO_TIP_ACCOUNTS: [&str; 8] = [
@@ -50,39 +52,60 @@ lazy_static! {
 }
 
 /// Refresh Jito tip accounts from API (call periodically)
+
 pub async fn refresh_jito_tip_accounts() -> Result<()> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
     
-    match client.get(JITO_TIP_ACCOUNTS_URL).send().await {
+    // Use JSON-RPC method getTipAccounts
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTipAccounts",
+        "params": []
+    });
+
+    // Note: We use the generic bundles endpoint for this RPC call
+    match client.post(JITO_BLOCK_ENGINE_URL) // Reusing the valid Frankfurt/Global URL
+        .json(&request)
+        .send()
+        .await 
+    {
         Ok(response) => {
-            if let Ok(accounts) = response.json::<Vec<String>>().await {
-                // Validate each account is a valid Base58 pubkey before caching
-                let valid_accounts: Vec<String> = accounts
-                    .into_iter()
-                    .filter(|acc| {
-                        match Pubkey::from_str(acc) {
-                            Ok(_) => true,
-                            Err(_) => {
-                                warn!("⚠️ Invalid tip account from API (not valid Base58): {}", acc);
-                                false
+            let response_json: serde_json::Value = response.json().await?;
+            
+            if let Some(result) = response_json.get("result") {
+                if let Some(accounts) = result.as_array() {
+                     let valid_accounts: Vec<String> = accounts
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .filter(|acc| {
+                            match Pubkey::from_str(acc) {
+                                Ok(_) => true,
+                                Err(_) => {
+                                    warn!("⚠️ Invalid tip account from API (not valid Base58): {}", acc);
+                                    false
+                                }
                             }
+                        })
+                        .collect();
+
+                    if !valid_accounts.is_empty() {
+                        if let Ok(mut cache) = JITO_TIP_ACCOUNTS_CACHE.write() {
+                            *cache = valid_accounts.clone();
+                            info!("✅ Refreshed Jito tip accounts: {} valid accounts", cache.len());
                         }
-                    })
-                    .collect();
-                
-                if !valid_accounts.is_empty() {
-                    if let Ok(mut cache) = JITO_TIP_ACCOUNTS_CACHE.write() {
-                        *cache = valid_accounts.clone();
-                        info!("✅ Refreshed Jito tip accounts: {} valid accounts", cache.len());
+                        if let Ok(mut last_refresh) = LAST_TIP_REFRESH.write() {
+                            *last_refresh = Some(std::time::Instant::now());
+                        }
+                    } else {
+                        warn!("⚠️ No valid tip accounts from API. Using cached/default.");
                     }
-                    if let Ok(mut last_refresh) = LAST_TIP_REFRESH.write() {
-                        *last_refresh = Some(std::time::Instant::now());
-                    }
-                } else {
-                    warn!("⚠️ No valid tip accounts from API. Using cached/default.");
                 }
+            } else {
+                warn!("⚠️ Jito getTipAccounts response missing 'result': {:?}", response_json);
             }
         }
         Err(e) => {

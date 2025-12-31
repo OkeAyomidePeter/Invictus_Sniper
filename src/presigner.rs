@@ -20,8 +20,8 @@ use reqwest::Client; // For Jito Bundle API
 use crate::moralis_client::MoralisClient;
 use solana_client::rpc_response::RpcSimulateTransactionResult;
 
-// Frankfurt regional endpoint for EU servers (lower latency)
-const JITO_BLOCK_ENGINE_URL: &str = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
+// Global endpoint (Frankfurt was 429ing)
+const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
 /// Bundle confirmation status from Jito
 #[derive(Debug, Clone, PartialEq)]
