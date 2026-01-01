@@ -72,6 +72,60 @@ impl TelegramInterface {
         }
     }
 
+    /// Send buy notification
+    pub async fn notify_buy(
+        &self,
+        mint: &str,
+        amount_sol: f64,
+        token_amount: f64,
+        entry_price: f64,
+        signature: &str,
+    ) {
+        if self.allowed_chat_id == 0 {
+            return; // Telegram not configured
+        }
+
+        let message = format!(
+            "🟢 <b>BUY EXECUTED</b>\n\n\
+            Mint: <code>{}</code>\n\
+            Amount: {:.4} SOL\n\
+            Received: {:.2} tokens\n\
+            Entry: {:.10} SOL/token\n\n\
+            <a href=\"https://solscan.io/tx/{}\">Solscan Link</a>",
+            &mint[..16.min(mint.len())],
+            amount_sol,
+            token_amount,
+            entry_price,
+            signature
+        );
+
+        // Send to primary chat
+        if let Err(e) = self
+            .bot
+            .send_message(ChatId(self.allowed_chat_id), &message)
+            .parse_mode(ParseMode::Html)
+            .disable_web_page_preview(true)
+            .send()
+            .await
+        {
+            warn!("Failed to send buy notification to primary chat: {}", e);
+        }
+        
+        // Send to alternate chat if configured
+        if let Some(alt_chat_id) = self.alternate_chat_id {
+            if let Err(e) = self
+                .bot
+                .send_message(ChatId(alt_chat_id), &message)
+                .parse_mode(ParseMode::Html)
+                .disable_web_page_preview(true)
+                .send()
+                .await
+            {
+                warn!("Failed to send buy notification to alternate chat: {}", e);
+            }
+        }
+    }
+
     /// Send auto-sell notification
     pub async fn notify_auto_sell(
         &self,

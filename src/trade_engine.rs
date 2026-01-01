@@ -212,6 +212,26 @@ impl TradeEngine {
         log_buy(&token.mint, amount_sol, &identifier);
         log_pipeline_step(&token.mint, "Total Buy Flow", start_total.elapsed().as_millis(), true);
 
+        // Send Telegram Notification
+        if let Some(tele) = &self.tele {
+            let tele = tele.clone();
+            let mint = token.mint.clone();
+            let amt_sol = amount_sol;
+            let amt_token_whole = token_amount as f64 / 10f64.powf(token.decimals as f64);
+            let entry = if token_amount > 0 { amt_sol / amt_token_whole } else { 0.0 };
+            let sig = identifier.clone();
+            
+            tokio::spawn(async move {
+                tele.notify_buy(
+                    &mint,
+                    amt_sol,
+                    amt_token_whole,
+                    entry,
+                    &sig
+                ).await;
+            });
+        }
+
         // 7. Start Monitoring (if auto-sell enabled)
         if self.config.auto_sell_enabled {
             if token_amount > 0 {
