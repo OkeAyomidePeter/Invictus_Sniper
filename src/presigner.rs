@@ -20,8 +20,7 @@ use reqwest::Client; // For Jito Bundle API
 use crate::moralis_client::MoralisClient;
 use solana_client::rpc_response::RpcSimulateTransactionResult;
 
-// Global endpoint (Frankfurt was 429ing)
-const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+// (Removed redundant constant, using JITO_ENDPOINTS[0] instead)
 
 /// Bundle confirmation status from Jito
 #[derive(Debug, Clone, PartialEq)]
@@ -311,34 +310,46 @@ impl Presigner {
         }
         Ok(())
     }
+}
 
+// Jito Block Engine Endpoints
+const JITO_ENDPOINTS: &[&str] = &[
+    "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles",
+];
+
+impl Presigner {
     /// Send a Jito Bundle (Swap Tx + Tip Tx)
-    /// Includes retry logic with exponential backoff for rate limit errors
-    pub async fn send_jito_bundle(&self, mut transactions: Vec<VersionedTransaction>) -> Result<String> {
+    /// Returns (Bundle ID, Transaction Signatures)
+    pub async fn send_jito_bundle(&self, mut transactions: Vec<VersionedTransaction>) -> Result<(String, Vec<solana_sdk::signature::Signature>)> {
         if transactions.is_empty() {
             return Err(anyhow::anyhow!("Cannot send empty bundle"));
         }
 
-        // Retry logic with exponential backoff for rate limits
-        let max_retries = 3;
+        // Capture signatures before encoding
+        let signatures: Vec<solana_sdk::signature::Signature> = transactions.iter()
+            .map(|tx| tx.signatures.get(0).copied().unwrap_or_default())
+            .collect();
+
+        // Retry logic with endpoint cycling and exponential backoff
+        let max_attempts = 10; // More attempts since we cycle endpoints
         let mut last_error = String::new();
+        let mut endpoint_index = 0;
         
-        for attempt in 1..=max_retries {
+        for attempt in 1..=max_attempts {
+            let current_endpoint = JITO_ENDPOINTS[endpoint_index % JITO_ENDPOINTS.len()];
+
             // 💡 Loophole Fix: Refresh blockhash and re-sign on every attempt (especially retries)
-            // This ensures the transactions are always "fresh" and won't be dropped for expiration.
             let current_hash = self.get_blockhash();
             for tx in transactions.iter_mut() {
-                // Update blockhash
                 match &mut tx.message {
                     solana_sdk::message::VersionedMessage::Legacy(m) => m.recent_blockhash = current_hash,
                     solana_sdk::message::VersionedMessage::V0(m) => m.recent_blockhash = current_hash,
                 }
-                // Re-sign with our keypair
                 self.sign_versioned_tx(tx)?;
-            }
-
-            if attempt > 1 {
-                crate::trade_logger::log_jito_debug("RE-SIGN", &format!("Re-signed bundle with fresh blockhash: {}", current_hash));
             }
 
             // Serialize transactions to base64
@@ -349,7 +360,6 @@ impl Presigner {
                 })
                 .collect();
 
-            // Construct JSON-RPC request
             let request = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -358,27 +368,32 @@ impl Presigner {
             });
 
             if attempt == 1 {
-                info!("🚀 Sending Jito Bundle with {} transactions (hash: {})...", transactions.len(), current_hash);
+                info!("🚀 Sending Jito Bundle (hash: {}) to {}...", current_hash, current_endpoint);
             }
 
-            let response = self.http_client.post(JITO_BLOCK_ENGINE_URL)
+            let response = match self.http_client.post(current_endpoint)
                 .json(&request)
                 .send()
-                .await
-                .context("Failed to send Jito bundle request")?;
+                .await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        warn!("⚠️ Jito request failed for {}: {}. Trying next endpoint...", current_endpoint, e);
+                        endpoint_index += 1;
+                        continue;
+                    }
+                };
 
             let response_json: serde_json::Value = response.json().await
                 .context("Failed to parse Jito bundle response")?;
 
             if let Some(result) = response_json.get("result") {
                 let bundle_id = result.as_str().unwrap_or("unknown").to_string();
-                info!("✅ Jito Bundle sent! ID: {}", bundle_id);
-                return Ok(bundle_id);
+                info!("✅ Jito Bundle sent! ID: {} (via {})", bundle_id, current_endpoint);
+                return Ok((bundle_id, signatures));
             } else if let Some(error) = response_json.get("error") {
                 let error_str = error.to_string();
                 last_error = error_str.clone();
                 
-                // Check for rate limit error (code -32097 or "rate limited" message)
                 let is_rate_limited = error.get("code")
                     .and_then(|c| c.as_i64())
                     .map(|c| c == -32097)
@@ -386,11 +401,18 @@ impl Presigner {
                     || error_str.to_lowercase().contains("rate limit")
                     || error_str.to_lowercase().contains("congested");
                 
-                if is_rate_limited && attempt < max_retries {
-                    let backoff_ms = 2000 * (1 << (attempt - 1)); // 2000ms, 4000ms, 8000ms
-                    warn!("⚠️ Jito rate limited (attempt {}/{}). Retrying in {}ms...", attempt, max_retries, backoff_ms);
-                    crate::trade_logger::log_jito_debug("RATE_LIMIT", &format!("Backoff {}ms (Attempt {}/{})", backoff_ms, attempt, max_retries));
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                if is_rate_limited && attempt < max_attempts {
+                    // 💡 Multi-Endpoint logic: Cycle endpoint immediately
+                    endpoint_index += 1;
+                    
+                    // Only sleep if we have exhausted all endpoints in this attempt cycle
+                    if endpoint_index % JITO_ENDPOINTS.len() == 0 {
+                        let backoff_ms = 1000 * (1 << (attempt / JITO_ENDPOINTS.len()));
+                        warn!("⚠️ All Jito endpoints rate limited. Backoff {}ms...", backoff_ms);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    } else {
+                        crate::trade_logger::log_jito_debug("RATE_LIMIT", &format!("Cycling to {} (Attempt {})", JITO_ENDPOINTS[endpoint_index % JITO_ENDPOINTS.len()], attempt));
+                    }
                     continue;
                 }
                 
@@ -400,12 +422,17 @@ impl Presigner {
             }
         }
         
-        Err(anyhow::anyhow!("Jito Bundle failed after {} retries: {}", max_retries, last_error))
+        Err(anyhow::anyhow!("Jito Bundle failed after {} attempts: {}", max_attempts, last_error))
     }
 
     /// Wait for Jito bundle confirmation with timeout
-    /// Polls getBundleStatuses endpoint every 500ms
-    pub async fn wait_for_bundle_confirmation(&self, bundle_id: &str, timeout_secs: u64) -> Result<BundleStatus> {
+    /// Polls getBundleStatuses endpoint AND standard RPC for signature confirmation
+    pub async fn wait_for_bundle_confirmation(
+        &self, 
+        bundle_id: &str, 
+        timeout_secs: u64,
+        expected_signatures: &[solana_sdk::signature::Signature]
+    ) -> Result<BundleStatus> {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
         let poll_interval = std::time::Duration::from_millis(500);
@@ -413,11 +440,12 @@ impl Presigner {
         info!("⏳ Waiting for bundle confirmation: {} (timeout: {}s)", bundle_id, timeout_secs);
 
         while start.elapsed() < timeout {
+            // 1. Check Jito Bundle Status
             match self.get_bundle_status(bundle_id).await {
                 Ok(status) => {
                     match status {
                         BundleStatus::Landed => {
-                            info!("✅ Bundle {} confirmed on-chain!", bundle_id);
+                            info!("✅ Bundle {} confirmed on-chain via Jito!", bundle_id);
                             return Ok(status);
                         }
                         BundleStatus::Failed(ref reason) => {
@@ -437,8 +465,22 @@ impl Presigner {
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to get bundle status: {}", e);
-                    // Continue polling on transient errors
+                    warn!("Failed to get bundle status from Jito: {}", e);
+                }
+            }
+
+            // 2. 💡 Fallback Check: Check RPC for actual signature confirmation
+            // This catches cases where Jito API is lagging but the TX actually landed.
+            if !expected_signatures.is_empty() {
+                for sig in expected_signatures {
+                    match self.check_signature_success(&sig.to_string()).await {
+                        Ok(true) => {
+                            info!("🎯 Transaction confirmed on-chain via RPC! (Sig: {})", sig);
+                            crate::trade_logger::log_jito_debug("FALLBACK", &format!("Landed via RPC fallback: {}", sig));
+                            return Ok(BundleStatus::Landed);
+                        },
+                        _ => {} // Continue polling
+                    }
                 }
             }
 
@@ -458,7 +500,7 @@ impl Presigner {
             "params": [[bundle_id]]
         });
 
-        let response = self.http_client.post(JITO_BLOCK_ENGINE_URL)
+        let response = self.http_client.post(JITO_ENDPOINTS[0])
             .json(&request)
             .send()
             .await

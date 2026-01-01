@@ -119,10 +119,10 @@ impl TradeEngine {
             self.presigner.sign_versioned_tx(&mut tip_tx)?;
 
             let start_step = Instant::now();
-            let id = match self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await {
-                Ok(id) => {
+            let (bundle_id, bundle_sigs) = match self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await {
+                Ok(res) => {
                     log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), true);
-                    id
+                    res
                 },
                 Err(e) => {
                     log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), false);
@@ -131,17 +131,19 @@ impl TradeEngine {
                 }
             };
             
-            info!("🚀 Buy Bundle Sent! ID: {}", id);
-            log_bundle_sent(&id, 2);
+            info!("🚀 Buy Bundle Sent! Jito IDs: {} | Main Tx: {}", bundle_id, bundle_sigs.get(0).map(|s| s.to_string()).unwrap_or_default());
+            log_bundle_sent(&bundle_id, 2);
 
             // Wait for confirmation (Jito Only)
             let start_confirm = Instant::now();
-            let status = self.presigner.wait_for_bundle_confirmation(&id, 30).await?;
+            let status = self.presigner.wait_for_bundle_confirmation(&bundle_id, 30, &bundle_sigs).await?;
             if !status.is_success() {
-                 return Err(anyhow::anyhow!("Bundle failed: {:?}", status));
+                 return Err(anyhow::anyhow!("Bundle failed to confirm: {:?}", status));
             }
             log_pipeline_step(&token.mint, "Confirm Bundle", start_confirm.elapsed().as_millis(), true);
-            id
+            
+            // Use the actual swap transaction signature as the identifier (NOT the bundle_id)
+            bundle_sigs.get(0).map(|s| s.to_string()).unwrap_or(bundle_id)
         };
 
         // STEP 7: Verify Position & Record to DB
@@ -284,10 +286,12 @@ impl TradeEngine {
             self.presigner.sign_versioned_tx(&mut sell_tx)?;
             self.presigner.sign_versioned_tx(&mut tip_tx)?;
 
-            let id = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
-            info!("🚀 Sell Bundle Sent! ID: {}", id);
+            let (id, sigs) = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
+            info!("🚀 Sell Bundle Sent! Jito IDs: {} | Main Tx: {}", id, sigs.get(0).map(|s| s.to_string()).unwrap_or_default());
             log_bundle_sent(&id, 2);
-            id
+            
+            // Use the actual swap transaction signature as the identifier
+            sigs.get(0).map(|s| s.to_string()).unwrap_or(id)
         };
         
         Ok(identifier)
