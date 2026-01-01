@@ -368,8 +368,9 @@ impl Presigner {
                     || error_str.to_lowercase().contains("congested");
                 
                 if is_rate_limited && attempt < max_retries {
-                    let backoff_ms = 500 * (1 << (attempt - 1)); // 500ms, 1000ms, 2000ms
+                    let backoff_ms = 2000 * (1 << (attempt - 1)); // 2000ms, 4000ms, 8000ms
                     warn!("⚠️ Jito rate limited (attempt {}/{}). Retrying in {}ms...", attempt, max_retries, backoff_ms);
+                    crate::trade_logger::log_jito_debug("RATE_LIMIT", &format!("Backoff {}ms (Attempt {}/{})", backoff_ms, attempt, max_retries));
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     continue;
                 }
@@ -409,7 +410,10 @@ impl Presigner {
                             return Ok(status);
                         }
                         BundleStatus::Pending | BundleStatus::NotFound => {
-                            // Continue polling
+                            // detailed polling logs (every 4th poll = every 2s)
+                            if (start.elapsed().as_millis() / 500) % 4 == 0 {
+                                crate::trade_logger::log_jito_debug("POLL", &format!("Bundle {} status: {:?}", bundle_id, status));
+                            }
                         }
                     }
                 }

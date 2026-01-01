@@ -252,6 +252,11 @@ pub fn log_bundle_confirmed(bundle_id: &str, status: &str) {
     ));
 }
 
+/// Log detailed Jito debug info
+pub fn log_jito_debug(action: &str, details: &str) {
+    TradeLogger::log(&format!("🌩️ JITO DEBUG: {} | {}", action, details));
+}
+
 // ============================================================================
 // POSITION MONITORING
 // ============================================================================

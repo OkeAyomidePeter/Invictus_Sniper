@@ -96,6 +96,7 @@ pub async fn refresh_jito_tip_accounts() -> Result<()> {
                         if let Ok(mut cache) = JITO_TIP_ACCOUNTS_CACHE.write() {
                             *cache = valid_accounts.clone();
                             info!("✅ Refreshed Jito tip accounts: {} valid accounts", cache.len());
+                            crate::trade_logger::log_jito_debug("REFRESH", &format!("Updated cache with {} accounts", cache.len()));
                         }
                         if let Ok(mut last_refresh) = LAST_TIP_REFRESH.write() {
                             *last_refresh = Some(std::time::Instant::now());
@@ -222,6 +223,7 @@ impl TransactionManager {
 
     /// Build Jito Tip Transaction (Separate Transaction)
     pub fn build_tip_transaction(&self, tip_lamports: u64, _recent_blockhash: solana_sdk::hash::Hash) -> Result<VersionedTransaction> {
+        crate::trade_logger::log_jito_debug("BUILD_TIP", &format!("Creating tip tx for {} lamports ({:.6} SOL)", tip_lamports, tip_lamports as f64 / 1e9));
         let tip_ix = self.create_tip_instruction(tip_lamports)?;
         let msg = solana_sdk::message::Message::new(&[tip_ix], Some(&self.payer_pubkey));
         let versioned_msg = VersionedMessage::Legacy(msg);
