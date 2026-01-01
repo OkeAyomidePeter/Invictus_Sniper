@@ -314,34 +314,53 @@ impl Presigner {
 
     /// Send a Jito Bundle (Swap Tx + Tip Tx)
     /// Includes retry logic with exponential backoff for rate limit errors
-    pub async fn send_jito_bundle(&self, transactions: Vec<VersionedTransaction>) -> Result<String> {
+    pub async fn send_jito_bundle(&self, mut transactions: Vec<VersionedTransaction>) -> Result<String> {
         if transactions.is_empty() {
             return Err(anyhow::anyhow!("Cannot send empty bundle"));
         }
-
-        // Serialize transactions to base64 (base58 is deprecated per Jito docs)
-        let encoded_txs: Vec<String> = transactions.iter()
-            .map(|tx| {
-                let serialized = bincode::serialize(tx).unwrap();
-                BASE64_STANDARD.encode(serialized)
-            })
-            .collect();
-
-        // Construct JSON-RPC request with base64 encoding specification
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [encoded_txs, {"encoding": "base64"}]
-        });
-
-        info!("🚀 Sending Jito Bundle with {} transactions...", transactions.len());
 
         // Retry logic with exponential backoff for rate limits
         let max_retries = 3;
         let mut last_error = String::new();
         
         for attempt in 1..=max_retries {
+            // 💡 Loophole Fix: Refresh blockhash and re-sign on every attempt (especially retries)
+            // This ensures the transactions are always "fresh" and won't be dropped for expiration.
+            let current_hash = self.get_blockhash();
+            for tx in transactions.iter_mut() {
+                // Update blockhash
+                match &mut tx.message {
+                    solana_sdk::message::VersionedMessage::Legacy(m) => m.recent_blockhash = current_hash,
+                    solana_sdk::message::VersionedMessage::V0(m) => m.recent_blockhash = current_hash,
+                }
+                // Re-sign with our keypair
+                self.sign_versioned_tx(tx)?;
+            }
+
+            if attempt > 1 {
+                crate::trade_logger::log_jito_debug("RE-SIGN", &format!("Re-signed bundle with fresh blockhash: {}", current_hash));
+            }
+
+            // Serialize transactions to base64
+            let encoded_txs: Vec<String> = transactions.iter()
+                .map(|tx| {
+                    let serialized = bincode::serialize(tx).unwrap();
+                    BASE64_STANDARD.encode(serialized)
+                })
+                .collect();
+
+            // Construct JSON-RPC request
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendBundle",
+                "params": [encoded_txs, {"encoding": "base64"}]
+            });
+
+            if attempt == 1 {
+                info!("🚀 Sending Jito Bundle with {} transactions (hash: {})...", transactions.len(), current_hash);
+            }
+
             let response = self.http_client.post(JITO_BLOCK_ENGINE_URL)
                 .json(&request)
                 .send()

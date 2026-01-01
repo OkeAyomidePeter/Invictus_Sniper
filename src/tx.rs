@@ -413,7 +413,12 @@ impl TransactionManager {
 
         let multiplier = if high_priority { 2.0 } else { 1.0 };
         let tip = (self.base_tip_lamports as f64 * multiplier) as u64;
-        tip.clamp(self.min_tip_lamports, self.max_tip_lamports)
+        
+        // Enforce hard minimum of 0.0005 SOL (500k lamports) for testing/mainnet viability
+        let hard_min = 500_000;
+        let effective_tip = tip.clamp(self.min_tip_lamports.max(hard_min), self.max_tip_lamports);
+        
+        effective_tip
     }
 
     pub fn transaction_mode(&self) -> crate::config::TransactionMode {

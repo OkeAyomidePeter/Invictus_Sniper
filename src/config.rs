@@ -376,7 +376,7 @@ impl Config {
         };
 
         format!(
-            "Config loaded: mode={}, helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_usd={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}",
+            "Config loaded: mode={}, helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_usd={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}, jito_base_tip={}",
             self.transaction_mode,
             Self::mask_secret(&self.helius_api_key),
             Self::mask_secret(&self.birdeye_api_key),
@@ -393,7 +393,8 @@ impl Config {
             self.honeypot_check_enabled,
             self.auto_sell_enabled,
             self.rate_limiting_enabled,
-            self.max_concurrent_trades
+            self.max_concurrent_trades,
+            self.jito_base_tip_lamports
         )
     }
 }
