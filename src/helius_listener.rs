@@ -566,11 +566,11 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     // Extract token mints first
     let (token_mint, pair_token) = match extract_pool_tokens(transaction, meta) {
         Some(tokens) => {
-            crate::trade_logger::log_pipeline_event(&tokens.0, "TOKENS_EXTRACTED", &format!("Pair: {}", tokens.1));
+            // crate::trade_logger::log_pipeline_event(&tokens.0, "TOKENS_EXTRACTED", &format!("Pair: {}", tokens.1));
             tokens
         },
         None => {
-            crate::trade_logger::log_error_detailed(&event.signature, "EXTRACT_TOKENS", "Failed to extract token pair");
+            // crate::trade_logger::log_error_detailed(&event.signature, "EXTRACT_TOKENS", "Failed to extract token pair");
             return None;
         }
     };
@@ -585,7 +585,7 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     let token_platform = detect_token_platform(transaction, logs_array, &token_mint);
     let is_graduated = token_platform.is_graduated();
     
-    crate::trade_logger::log_pipeline_event(&token_mint, "PLATFORM_DETECTED", &format!("{:?}", token_platform));
+    // crate::trade_logger::log_pipeline_event(&token_mint, "PLATFORM_DETECTED", &format!("{:?}", token_platform));
 
     // ========== SNIPER BOT: GRADUATED TOKENS ONLY ==========
     // CRITICAL: Reject ALL non-graduated tokens
@@ -633,7 +633,7 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
 
     // Detect DEX
     let dex = detect_dex_from_logs(logs_array)?;
-    crate::trade_logger::log_pipeline_event(&token_mint, "DEX_DETECTED", &dex);
+    // crate::trade_logger::log_pipeline_event(&token_mint, "DEX_DETECTED", &dex);
 
 
     // ========== GRADUATION VERIFICATION (BONK.FUN & LAUNCHLAB) ==========
@@ -651,7 +651,7 @@ fn detect_pool_creation_event(event: &RawTxEvent) -> Option<PoolCreationEvent> {
     // Extract pool address (Priority: Exhaustive Instruction Scan -> Known Account Indices -> Writable Fallback)
     let pool_address = match extract_pool_address(transaction, meta, logs_array, &token_mint) {
         Some(addr) => {
-            crate::trade_logger::log_pipeline_event(&token_mint, "POOL_EXTRACTED", &addr);
+            // crate::trade_logger::log_pipeline_event(&token_mint, "POOL_EXTRACTED", &addr);
             addr
         },
         None => {
@@ -792,7 +792,7 @@ fn extract_pool_address(
     if let Some(instructions) = message.and_then(|m| m.get("instructions")).and_then(|i| i.as_array()) {
         for ix in instructions {
             if let Some(pool) = find_pool_in_instruction(ix, keys, &amm_programs, token_mint) {
-                crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Top-level: {}", pool));
+                // crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Top-level: {}", pool));
                 return Some(pool);
             }
         }
@@ -805,7 +805,7 @@ fn extract_pool_address(
                 if let Some(instructions) = inner.get("instructions").and_then(|i| i.as_array()) {
                     for ix in instructions {
                         if let Some(pool) = find_pool_in_instruction(ix, keys, &amm_programs, token_mint) {
-                            crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Inner: {}", pool));
+                            // crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Inner: {}", pool));
                             return Some(pool);
                         }
                     }
@@ -845,7 +845,7 @@ fn extract_pool_address(
                 let end_idx = addr.find(|c: char| c.is_whitespace()).unwrap_or(addr.len());
                 let pool_addr = &addr[..end_idx];
                 if pool_addr.len() == 44 && !is_program_id(pool_addr) {
-                    crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Logs: {}", pool_addr));
+                    // crate::trade_logger::log_pipeline_event(token_mint, "EXTRACT_POOL", &format!("Logs: {}", pool_addr));
                     return Some(pool_addr.to_string());
                 }
             }

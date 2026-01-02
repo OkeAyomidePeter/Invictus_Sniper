@@ -101,6 +101,7 @@ pub struct ConfigData {
     // Trailing Stop Loss
     pub trailing_stop_enabled: bool,
     pub trailing_stop_distance_pct: String,
+    pub trailing_stop_activation_pct: String,
     
     // Partial Exits
     pub partial_exit_enabled: bool,
@@ -172,6 +173,7 @@ impl Default for ConfigData {
             // Trailing Stop Loss
             trailing_stop_enabled: true,
             trailing_stop_distance_pct: "15.0".to_string(),
+            trailing_stop_activation_pct: "10.0".to_string(),
             // Partial Exits
             partial_exit_enabled: true,
             partial_exit_target_pct: "30.0".to_string(),
@@ -244,6 +246,7 @@ impl ConfigData {
             // Trailing Stop Loss
             trailing_stop_enabled: self.trailing_stop_enabled,
             trailing_stop_distance_pct: self.trailing_stop_distance_pct.parse().map_err(|_| "Invalid trailing_stop_distance_pct")?,
+            trailing_stop_activation_pct: self.trailing_stop_activation_pct.parse().map_err(|_| "Invalid trailing_stop_activation_pct")?,
             // Partial Exits
             partial_exit_enabled: self.partial_exit_enabled,
             partial_exit_target_pct: self.partial_exit_target_pct.parse().map_err(|_| "Invalid partial_exit_target_pct")?,

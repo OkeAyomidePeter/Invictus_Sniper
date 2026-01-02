@@ -663,6 +663,7 @@ mod tests {
             min_holder_retention_pct: 0.0,
             trailing_stop_enabled: false,
             trailing_stop_distance_pct: 0.0,
+            trailing_stop_activation_pct: 0.0,
             partial_exit_enabled: false,
             partial_exit_target_pct: 0.0,
             partial_exit_amount_pct: 0.0,

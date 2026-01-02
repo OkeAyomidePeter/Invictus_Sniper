@@ -61,16 +61,16 @@ impl TradeEngine {
         
         // STEP 2: Build Buy Transaction
         let start_step = Instant::now();
-        let mut buy_tx = match self.tx_manager.build_buy_transaction(
+        let (mut buy_tx, expected_out_amount) = match self.tx_manager.build_buy_transaction(
             &token.mint,
             amount_lamports,
             slippage_bps,
             DexRouter::Jupiter, // Default to Jupiter for now
             0, // Tip lamports not needed here anymore
         ).await {
-            Ok(tx) => {
+            Ok(res) => {
                 log_pipeline_step(&token.mint, "Build Buy Tx", start_step.elapsed().as_millis(), true);
-                tx
+                res
             },
             Err(e) => {
                 log_pipeline_step(&token.mint, "Build Buy Tx", start_step.elapsed().as_millis(), false);
@@ -146,112 +146,74 @@ impl TradeEngine {
             bundle_sigs.get(0).map(|s| s.to_string()).unwrap_or(bundle_id)
         };
 
-        // STEP 7: Verify Position & Record to DB
-        let start_step = Instant::now();
-        
-        // Fetch actual token balance - adding RETRIES to handle RPC lag
-        let mut token_amount = 0;
-        let mut verified = false;
-        
-        for attempt in 1..=5 {
-            match self.presigner.get_token_balance(&token.mint).await {
-                Ok(amount) if amount > 0 => {
-                    token_amount = amount;
-                    verified = true;
-                    info!("✅ Balance verified on attempt {}: {} tokens", attempt, token_amount);
-                    break;
-                }
-                Ok(_) => {
-                    warn!("⚠️ Balance check attempt {} returned 0. Transaction may still be landing or RPC is lagging.", attempt);
-                }
-                Err(e) => {
-                    warn!("⚠️ Balance check attempt {} failed: {}. Retrying...", attempt, e);
-                }
-            }
-            // Wait 2 seconds between retries
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-
-        if !verified {
-            log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), false);
-            
-            // If balance check failed, check if the transaction actually succeeded
-            match self.presigner.check_signature_success(&identifier).await {
-                Ok(true) => {
-                     error!("❌ CRITICAL: Transaction {} CONFIRMED but balance is 0. Likely RPC/Moralis lag.", identifier);
-                     // We proceed to record, but we MUST NOT start auto-sell with 0 tokens.
-                },
-                Ok(false) => {
-                    error!("❌ TRANSACTION FAILED/DROPPED: {}. Aborting trade record.", identifier);
-                    return Err(anyhow::anyhow!("Transaction failed or dropped: {}", identifier));
-                },
-                Err(e) => {
-                    error!("❌ Failed to verify transaction status: {}", e);
-                    // Assume failed to be safe
-                    return Err(anyhow::anyhow!("Failed to verify transaction status: {}", e));
-                }
-            }
-        } else {
-            log_pipeline_step(&token.mint, "Verify Balance", start_step.elapsed().as_millis(), true);
-        }
-        
-        // Record Trade (even if verified is false, we try to record what we have)
-        self.db.record_trade(
-            &token.mint,
-            "BUY",
-            token_amount,
-            amount_lamports,
-            &identifier,
-            Some(&identifier),
-            Some(amount_sol / (token_amount as f64 / 10f64.powf(token.decimals as f64))),
-            token.decimals,
-            token.price_change_1m_pct.unwrap_or(0.0),
-        ).await?;
-
-        // Log successful buy
-        log_buy(&token.mint, amount_sol, &identifier);
-        log_pipeline_step(&token.mint, "Total Buy Flow", start_total.elapsed().as_millis(), true);
-
-        // Send Telegram Notification
-        if let Some(tele) = &self.tele {
-            let tele = tele.clone();
-            let mint = token.mint.clone();
-            let amt_sol = amount_sol;
-            let amt_token_whole = token_amount as f64 / 10f64.powf(token.decimals as f64);
-            let entry = if token_amount > 0 { amt_sol / amt_token_whole } else { 0.0 };
-            let sig = identifier.clone();
-            
-            tokio::spawn(async move {
-                tele.notify_buy(
-                    &mint,
-                    amt_sol,
-                    amt_token_whole,
-                    entry,
-                    &sig
-                ).await;
-            });
-        }
-
-        // 7. Start Monitoring (if auto-sell enabled)
+        // STEP 7: Start Optimistic Monitoring (ASAP!)
         if self.config.auto_sell_enabled {
-            if token_amount > 0 {
-                log_position_started(
-                    &token.mint, 
-                    amount_sol / (token_amount as f64 / 10f64.powf(token.decimals as f64)),  // Entry price per token
-                    self.config.auto_sell_profit_target_pct,
-                    self.config.auto_sell_stop_loss_pct
-                );
-                self.start_auto_sell_monitoring(
-                    token.mint.clone(), 
-                    amount_sol, 
-                    token_amount, 
-                    token.decimals,
-                    token.price_change_1m_pct.unwrap_or(0.0)
-                ).await;
-            } else {
-                warn!("⚠️ AUTO-SELL PAUSED: Token balance is 0. Position will be tracked in DB but not actively monitored for sell.");
-            }
+            info!("🛡️  OPTIMISTIC: Starting monitoring immediately for {} with expected {} tokens", token.mint, expected_out_amount);
+            self.start_auto_sell_monitoring(
+                token.mint.clone(), 
+                amount_sol, 
+                expected_out_amount, 
+                token.decimals,
+                token.price_change_1m_pct.unwrap_or(0.0)
+            ).await;
         }
+
+        // STEP 8: Background Verification & DB Recording
+        let engine_clone = self.clone();
+        let token_clone = token.clone();
+        let id_clone = identifier.clone();
+        
+        tokio::spawn(async move {
+            let start_bg = Instant::now();
+            let mut final_token_amount = expected_out_amount;
+            let mut verified = false;
+
+            // Faster Polling: 500ms instead of 2.0s
+            for attempt in 1..=10 {
+                match engine_clone.presigner.get_token_balance(&token_clone.mint).await {
+                    Ok(amount) if amount > 0 => {
+                        final_token_amount = amount;
+                        verified = true;
+                        info!("✅ BG-VERIFY: Balance confirmed for {} after {} attempts: {} tokens", token_clone.mint, attempt, final_token_amount);
+                        
+                        // Update the optimistic monitoring with the real amount
+                        engine_clone.position_tracker.update_position_amount(&token_clone.mint, final_token_amount).await;
+                        break;
+                    }
+                    _ => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+
+            if verified {
+                log_pipeline_step(&token_clone.mint, "Verify Balance (BG)", start_bg.elapsed().as_millis(), true);
+            } else {
+                warn!("⚠️  BG-VERIFY: Failed to verify exact balance for {} within 5s. Sticking with optimistic amount.", token_clone.mint);
+            }
+
+            // Record Trade in DB
+            if let Err(e) = engine_clone.db.record_trade(
+                &token_clone.mint,
+                "BUY",
+                final_token_amount,
+                amount_lamports,
+                &id_clone,
+                Some(&id_clone),
+                Some(amount_sol / (final_token_amount as f64 / 10f64.powf(token_clone.decimals as f64))),
+                token_clone.decimals,
+                token_clone.price_change_1m_pct.unwrap_or(0.0),
+            ).await {
+                error!("❌ BG-DB: Failed to record trade for {}: {}", token_clone.mint, e);
+            }
+
+            // Telegram Notification
+            if let Some(tele) = &engine_clone.tele {
+                let amt_token_whole = final_token_amount as f64 / 10f64.powf(token_clone.decimals as f64);
+                let entry = if final_token_amount > 0 { amount_sol / amt_token_whole } else { 0.0 };
+                tele.notify_buy(&token_clone.mint, amount_sol, amt_token_whole, entry, &id_clone).await;
+            }
+        });
 
         Ok(())
     }
@@ -395,7 +357,7 @@ impl TradeEngine {
             amount_token_raw: token_amount,
             amount_sol_invested: (entry_sol * 1e9) as u64,
             decimals,
-            highest_price_reached: 0.0,
+            highest_price_reached: entry_price,
             partial_exit_executed: false,
             remaining_amount_pct: 100.0,
             timeout_extensions: 0,
@@ -418,8 +380,8 @@ impl TradeEngine {
                          sell_success = true;
                          // Calculate P/L in SOL (Cleaned units)
                         let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
-                        let pnl_sol = (token_amount_whole * signal.current_price_sol_per_token
-                            - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0));
+                        let pnl_sol = token_amount_whole * signal.current_price_sol_per_token
+                            - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0);
 
                         // Record exit in DB
                         if let Err(e) = trade_engine.db.update_trade_exit(
@@ -482,8 +444,9 @@ impl TradeEngine {
                 
                 
                 // Only stop monitoring if the sell was successfully sent
-                if sell_success && matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout) {
+                if sell_success && matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout | SellTrigger::ExtendedTimeout(_)) {
                     info!("✅ Trade lifecycle complete for {}. Stopping monitoring.", signal.position.mint);
+                    trade_engine.position_tracker.remove_position(&signal.position.mint).await;
                     break; // Stop monitoring after full exit
                 } else if !sell_success {
                     warn!("🔄 Sell failed for {}. Continuing to monitor/retry...", signal.position.mint);
@@ -554,8 +517,8 @@ impl TradeEngine {
                         Ok(bundle_id) => {
                              // Calculate P/L in SOL (Cleaned units)
                              let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
-                             let pnl_sol = (token_amount_whole * signal.current_price_sol_per_token
-                                - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0));
+                             let pnl_sol = token_amount_whole * signal.current_price_sol_per_token
+                                - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0);
 
                              if let Err(e) = trade_engine.db.update_trade_exit(
                                 &signal.position.mint,
@@ -608,15 +571,17 @@ impl TradeEngine {
                                     ).await;
                                 });
                             }
+                            
+                             // 💡 Zombie Fix: Remove position after successful full exit (Resumed trades)
+                             if matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout | SellTrigger::ExtendedTimeout(_)) {
+                                 trade_engine.position_tracker.remove_position(&signal.position.mint).await;
+                                 break;
+                             }
                         },
                         Err(e) => {
                              error!("❌ Failed to execute SELL (Resumed) for {}: {}", signal.position.mint, e);
                              log_sell_failed(&signal.position.mint, &signal.trigger.to_string(), &e.to_string());
                         }
-                    }
-
-                    if matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout) {
-                        break;
                     }
                 }
             });

@@ -340,41 +340,47 @@ impl PositionTracker {
                         let in_grace_period = position.entry_time.elapsed() < grace_period;
 
                         if config.trailing_stop_enabled && !in_grace_period {
-                            // Rule: After 90s without new high, tighten trail stop distance
-                            let mut trail_distance_pct = config.trailing_stop_distance_pct;
-                            if position.entry_time.elapsed() > Duration::from_secs(90) {
-                                // Dynamic peak check: if highest_price_reached hasn't moved in a while?
-                                // Simplified: if we've been in trade > 90s, tighten from 25% to 12.5% (example)
-                                if trail_distance_pct > 15.0 {
-                                    trail_distance_pct = 12.5;
-                                }
-                            }
-                            
-                            let trail_distance = trail_distance_pct / 100.0;
-                            let trailing_stop_price = position.highest_price_reached * (1.0 - trail_distance);
-                            
-                            if current_price <= trailing_stop_price {
-                                let pnl_from_entry = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
-                                let drop_from_peak = ((position.highest_price_reached - current_price) / position.highest_price_reached) * 100.0;
-                                
-                                warn!("🛑 Trailing stop triggered for {}: Peak {:.10} → {:.10} (-{:.1}% from peak, {:.2}% from entry, Trail: {:.1}%)", 
-                                    position.mint, position.highest_price_reached, current_price, drop_from_peak, pnl_from_entry, trail_distance_pct);
-                                
-                                let signal = SellSignal {
-                                    position: position.clone(),
-                                    trigger: SellTrigger::TrailingStopLoss(pnl_from_entry),
-                                    current_price_sol_per_token: current_price,
-                                    pnl_percentage: pnl_from_entry,
-                                };
-                                
-                                if tx.send(signal).await.is_err() {
-                                    warn!("Failed to send trailing stop signal for {}", position.mint);
-                                    break;
+                            // Rule: Only activate trailing stop after a minimum profit threshold is reached
+                            if pnl_pct < config.trailing_stop_activation_pct {
+                                // info!("🛡️ Trailing stop not yet active for {}: PnL {:.2}% < {:.1}% threshold", 
+                                //     position.mint, pnl_pct, config.trailing_stop_activation_pct);
+                            } else {
+                                // Rule: After 90s without new high, tighten trail stop distance
+                                let mut trail_distance_pct = config.trailing_stop_distance_pct;
+                                if position.entry_time.elapsed() > Duration::from_secs(90) {
+                                    // Dynamic peak check: if highest_price_reached hasn't moved in a while?
+                                    // Simplified: if we've been in trade > 90s, tighten from 25% to 12.5% (example)
+                                    if trail_distance_pct > 15.0 {
+                                        trail_distance_pct = 12.5;
+                                    }
                                 }
                                 
-                                // Don't break loop, let TradeEngine confirmation remove us from map
-                                sleep(Duration::from_secs(5)).await; 
-                                continue;
+                                let trail_distance = trail_distance_pct / 100.0;
+                                let trailing_stop_price = position.highest_price_reached * (1.0 - trail_distance);
+                                
+                                if current_price <= trailing_stop_price {
+                                    let pnl_from_entry = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
+                                    let drop_from_peak = ((position.highest_price_reached - current_price) / position.highest_price_reached) * 100.0;
+                                    
+                                    warn!("🛑 Trailing stop triggered for {}: Peak {:.10} → {:.10} (-{:.1}% from peak, {:.2}% from entry, Trail: {:.1}%)", 
+                                        position.mint, position.highest_price_reached, current_price, drop_from_peak, pnl_from_entry, trail_distance_pct);
+                                    
+                                    let signal = SellSignal {
+                                        position: position.clone(),
+                                        trigger: SellTrigger::TrailingStopLoss(pnl_from_entry),
+                                        current_price_sol_per_token: current_price,
+                                        pnl_percentage: pnl_from_entry,
+                                    };
+                                    
+                                    if tx.send(signal).await.is_err() {
+                                        warn!("Failed to send trailing stop signal for {}", position.mint);
+                                        break;
+                                    }
+                                    
+                                    // Don't break loop, let TradeEngine confirmation remove us from map
+                                    sleep(Duration::from_secs(5)).await; 
+                                    continue;
+                                }
                             }
                         } else if in_grace_period && config.trailing_stop_enabled {
                              // Optional: Log once that we are in grace period? (Maybe too spammy)
@@ -428,6 +434,23 @@ impl PositionTracker {
         });
 
         rx
+    }
+
+    /// Remove a position from tracking (safely stops monitoring loop)
+    pub async fn remove_position(&self, mint: &str) {
+        let mut guard = self.active_positions.lock().await;
+        if guard.remove(mint).is_some() {
+            info!("🏁 Position tracker: Removed {} from active map.", mint);
+        }
+    }
+
+    /// Update the token amount for a position (used after background verification)
+    pub async fn update_position_amount(&self, mint: &str, new_amount: u64) {
+        let mut guard = self.active_positions.lock().await;
+        if let Some(pos) = guard.get_mut(mint) {
+            info!("⚖️  Position tracker: Updating amount for {} from {} to {}", mint, pos.amount_token_raw, new_amount);
+            pos.amount_token_raw = new_amount;
+        }
     }
 }
 

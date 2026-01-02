@@ -97,6 +97,7 @@ pub struct Config {
     // Trailing Stop Loss
     pub trailing_stop_enabled: bool,
     pub trailing_stop_distance_pct: f64,
+    pub trailing_stop_activation_pct: f64,
     // Partial Exits
     pub partial_exit_enabled: bool,
     pub partial_exit_target_pct: f64,
@@ -173,7 +174,7 @@ impl Config {
                 .parse()
                 .expect("AUTO_SELL_PROFIT_TARGET_PCT must be a valid number"),
             auto_sell_stop_loss_pct: env::var("AUTO_SELL_STOP_LOSS_PCT")
-                .unwrap_or("20.0".to_string())
+                .unwrap_or("35.0".to_string())
                 .parse()
                 .expect("AUTO_SELL_STOP_LOSS_PCT must be a valid number"),
             auto_sell_timeout_seconds: env::var("AUTO_SELL_TIMEOUT_SECONDS")
@@ -312,6 +313,10 @@ impl Config {
                 .unwrap_or("15.0".to_string())
                 .parse()
                 .expect("TRAILING_STOP_DISTANCE_PCT must be a valid number"),
+            trailing_stop_activation_pct: env::var("TRAILING_STOP_ACTIVATION_PCT")
+                .unwrap_or("15.0".to_string())
+                .parse()
+                .expect("TRAILING_STOP_ACTIVATION_PCT must be a valid number"),
             // Partial Exits
             partial_exit_enabled: env::var("PARTIAL_EXIT_ENABLED")
                 .unwrap_or("true".to_string())

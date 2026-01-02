@@ -1,93 +1,96 @@
-# 🎯 Invictus Sniper Bot: Strategy & Configuration Guide
+# 🎯 Invictus Sniper Bot: Detailed Strategy Guide
 
-This document provides a comprehensive breakdown of the Invictus Sniper Bot's configuration, scoring logic, and advanced trading features. Use this guide to optimize your bot for different market conditions.
-
----
-
-## 🛠️ Core Configuration (`.env`)
-
-These settings control the fundamental behavior of the bot.
-
-### 💰 Trading Limits
-
-- `MAX_TRADE_SIZE_SOL`: The amount of SOL used for each buy transaction (e.g., `0.1`).
-- `MAX_DAILY_EXPOSURE_SOL`: Cumulative limit for trades in a 24-hour window.
-- `TOTAL_EXPOSURE_LIMIT_SOL`: Maximum SOL allowed across all currently open positions.
-- `MAX_OPEN_POSITIONS`: Maximum number of tokens the bot can hold simultaneously.
-
-### ⏱️ Position Lifecycle (Hold Time)
-
-- `AUTO_SELL_TIMEOUT_SECONDS`: The base "Exposure Time". If no profit target or stop loss is hit, the bot will sell after this duration (default: `120s`).
-- `DYNAMIC_TIMEOUT_ENABLED`: Allows the bot to extend the hold time if the token is performing well but hasn't hit targets.
-- `MAX_TIMEOUT_EXTENSIONS`: How many times the timeout can be extended (e.g., `2`).
-- `TIMEOUT_EXTENSION_SECONDS`: Duration of each extension (e.g., `60s`).
+This guide provides a comprehensive "mental picture" of how Invictus operates—from the second it discovers a token to the final cleanup after a successful sell.
 
 ---
 
-## ⚖️ Token Scoring Strategy
+## 🔍 Phase 1: High-Velocity Discovery & Scoring
 
-The bot uses a "Growth Trend" scoring model (0-150 points). High scores trigger immediate buys, while moderate scores trigger the Watchlist (Dip Strategy).
+Invictus is built for **speed** and **momentum**. It focuses specifically on graduated tokens (Pump.fun to Raydium/PumpSwap migration) where the "real" volume and volatility live.
 
-### 💀 Instant Fail Conditions (Score: 0)
+### The Scoring Model (0-150 Points)
 
-The bot WILL NOT buy if any of these are true:
+Every token is graded against a "Growth Trend" model using high-frequency data (1-minute and 5-minute intervals).
 
-- **Freeze Authority**: Is active (token can be frozen).
-- **Mint Authority**: Is active (more tokens can be printed).
-- **Low Liquidity**: Below `MIN_LIQUIDITY_USD` (default: `$2500`).
-- **Ghost Token**: Fewer than 10 unique holders.
+| Category                | Max Points | Logic / Goal                                                                    |
+| :---------------------- | :--------- | :------------------------------------------------------------------------------ |
+| **Momentum (5m)**       | 50         | Detects tokens with verified price action (+15% in 5m is max score).            |
+| **Activity (5m)**       | 40         | Measures "Virality." Looks for 30+ new wallets and high transaction volume.     |
+| **Buy Pressure (5m)**   | 30         | Favors tokens where the buy/sell ratio is > 2.0 (Double the buyers vs sellers). |
+| **Ignition Bonus (1m)** | 15         | Detects a "Micro-Pump" (+3% in 60 seconds) to catch entries early.              |
+| **Socials/Safety**      | 15         | Rewards tokens with distributed holders and active Twitter/TG links.            |
 
-### 📈 Point Distribution (Max 150)
+### The "Survival Gates" (Instant Rejection)
 
-1. **Momentum (50 pts)**: Based on 30-minute price change.
-   - `Excellent (+50%)`: 50 points.
-   - `Good (+20%)`: Linear scaling.
-   - `Negative`: Penalty points.
-2. **Activity (40 pts)**: Based on unique wallets and volume in 30m.
-   - High unique wallet counts and total volume over `$10k` boost this score.
-3. **Buy Pressure (30 pts)**: Based on Buy/Sell volume ratio.
-   - Pure buying pressure (no sells) or a ratio > 2.0 grants max points.
-4. **Distribution (20 pts)**: Holder concentration.
-   - **Penalty**: Top 1 holder > 30% or Top 10 > 60%.
-   - **Bonus**: Top 10 < 30% (well-distributed).
-5. **Socials (10 pts)**: Presence of Twitter, Telegram, or Website.
+The bot acts as its own auditor. It will **never** buy if:
+
+- **Freeze/Mint Authority** is ON (Scam protection).
+- **Liquidity** is under `$2500` (Safety floor).
+- **Ghost Tokens**: Fewer than 10 unique holders.
+- **Liquidity Volatility**: High-risk filter. If liquidity is low (< $10k), it rejects tokens with extreme volatility (> 25% moves) to avoid "thin" rug-pulls.
 
 ---
 
-## 🚀 Advanced Trading Features
+## ⚡ Phase 2: High-Response Execution
 
-### 📉 Dip Strategy (Watchlist)
+Once a token scores **100+**, the execution engine kicks in with an "Optimistic" architecture.
 
-When a token scores between **70 and 99 points**, it enters the **Watchlist** instead of an immediate buy.
-
-- `DIP_ENTRY_PCT`: The % drop from discovery price required to trigger a buy (e.g., `30.0` for a -30% dip).
-- `VOLUME_TREND_ENABLED`: Validates that the dip isn't a "dead" drop by ensuring volume is stable or increasing during the dip.
-- `MIN_VOLUME_USD_5M`: Minimum 5-minute volume required to trigger a watchlist buy.
-
-### 📈 Exit Strategies (The "Money Makers")
-
-- **Profit Target (`AUTO_SELL_PROFIT_TARGET_PCT`)**: Sells the entire position at a fixed % gain (e.g., `+50%`).
-- **Stop Loss (`AUTO_SELL_STOP_LOSS_PCT`)**: Sells to protect capital at a fixed % loss (e.g., `-20%`).
-- **Trailing Stop Loss**:
-  - `TRAILING_STOP_ENABLED`: Tracks the peak price reached after the buy.
-  - `TRAILING_STOP_DISTANCE_PCT`: Sells if the price drops by this % from the **peak** (e.g., `15.0`). This "locks in" profits during a run.
-- **Partial Exits**:
-  - `PARTIAL_EXIT_ENABLED`: Sells a portion of the position early.
-  - `PARTIAL_EXIT_TARGET_PCT`: Gain % to trigger the partial sell (e.g., `+30%`).
-  - `PARTIAL_EXIT_AMOUNT_PCT`: What % of the bag to sell (e.g., `50%`). The rest continues to run until a full target or stop is hit.
+1. **Jito Bundle Routing**: The bot builds a bundle with your swap and a "Jito Tip" (min 500,000 lamports). It cycles through **Global, NY, Amsterdam, Frankfurt, and Tokyo** block engines to ensure your transaction lands even during peak congestion.
+2. **Optimistic Monitoring**: Standard bots wait for the blockchain to "confirm" your balance (taking 10-15 seconds). **Invictus doesn't wait.**
+   - It assumes the buy worked and starts monitoring the price **immediately** using the "Expected Amount" from the swap quote.
+   - This removes the "13-second blind spot" where you could lose money before the bot even starts tracking.
+3. **Background Verification**: While the price tracker is already running, a background task quietly polls the node every 500ms. Once the real balance is confirmed, it updates the "Optimistic" position with the exact numbers.
 
 ---
 
-## 💡 Optimization Tips
+## 📊 Phase 3: Real-Time Monitoring & Profit Tracking
 
-| Market Vibe          | Strategy Adjustment                                                                 |
-| :------------------- | :---------------------------------------------------------------------------------- |
-| **Bullish/Moonshot** | Increase `AUTO_SELL_PROFIT_TARGET_PCT` to `100%+`, enable `TRAILING_STOP` at `20%`. |
-| **Volatile/Choppy**  | Enable `PARTIAL_EXIT` at `+25%` to secure initial investment quickly.               |
-| **Conservative**     | Increase `MIN_LIQUIDITY_USD` to `$5000` and `MIN_HOLDERS` to `50`.                  |
-| **Sniper Mode**      | Set `DIP_STRATEGY_ENABLED=false` for instant execution on high scores.              |
+The Monitoring Loop is the heartbeat of the bot. It runs a dedicated task for every open position.
+
+- **Price Aggregation**: It queries **Birdeye** first (for maximum speed) and falls back to **Moralis** if needed.
+- **P/L Calculation**: It tracks Profit/Loss relative to your **Entry Price (SOL per Token)**. Every move is recorded in the `invictus.db`.
+- **The Highest Price (Peak)**: The bot continuously updates the `highest_price_reached`. This is the reference point for the Trailing Stop.
 
 ---
 
-> [!TIP]
-> Always check your `invictus.log` to see the **Scoring Breakdown**. If the bot is rejecting tokens you like, adjust the thresholds in `src/main.rs` (default: 100 for Buy, 70 for Watchlist).
+## 💰 Phase 4: Dynamic Exit Strategies
+
+Invictus uses a multi-layered exit system to secure profits and protect capital.
+
+### 1. The Safety Floor (Fixed Stop Loss)
+
+If the token drops to your `AUTO_SELL_STOP_LOSS_PCT` (e.g., -20%), the bot exits immediately. This is your insurance policy.
+
+### 2. securing the Initial (Partial Exit)
+
+Once the token hits a target (e.g., +30% gain), the bot can sell a portion (e.g., 50%) of the position.
+
+- **Goal**: secures your initial SOL investment so the remaining bag is "risk-free" profit.
+
+### 3. The Smart Trailing Stop (Gain Protection)
+
+This is the most advanced part of the strategy.
+
+- **Activation Threshold**: The trailing stop stays **OFF** until you hit a certain profit (e.g., +10%). This survives initial "chop" and noisy price action.
+- **Trailing Distance**: Once active, if the price drops by `TRAILING_STOP_DISTANCE_PCT` from the absolute peak, it sells.
+- **Tightening Logic**: If the trade lasts more than 90 seconds without a new peak, the bot tightens the trail distance (e.g., from 15% to 12.5%) to lock in whatever is left.
+
+### 4. Timeouts (Exposure Time)
+
+- **Exposure Limit**: If a token doesn't hit a target or stop within your `AUTO_SELL_TIMEOUT_SECONDS`, the bot exits anyway to free up SOL for better plays.
+- **Dynamic Extensions**: If the token is currently at its **Peak Price** when the timer runs out, the bot grants an "Extension" because the momentum is still alive.
+
+---
+
+## 🏁 Phase 5: Cleanup (Zombie Protection)
+
+Once a sell is confirmed, the position is **purged** from the tracker. This prevents "Zombie Positions"—broken loops that try to sell tokens you no longer own.
+
+---
+
+## 💡 How to Read the Logs
+
+- `🛡️ OPTIMISTIC`: Monitoring started before the balance was even confirmed.
+- `🎯 BUY ATTEMPT`: The bot has found a winner and is hitting the "buy" button.
+- `🚨 SELL SIGNAL`: A target (Profit/Stop/Trail) was hit, and the exit is being sent.
+- `🏁 Position tracker: Removed`: The trade lifecycle is 100% complete.

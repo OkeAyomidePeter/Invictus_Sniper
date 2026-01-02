@@ -327,10 +327,10 @@ async fn enrichment_loop(
                 // Check if we've seen this mint recently
                 if seen_mints.contains_key(&pool_event.token_mint) {
                     info!("⏭️ Skipping duplicate mint (seen in last 60s): {}", pool_event.token_mint);
-                    TradeLogger::log(&format!(
-                        "⏭️ DEDUP: {} skipped (seen recently)", 
-                        &pool_event.token_mint[..12.min(pool_event.token_mint.len())]
-                    ));
+                    // TradeLogger::log(&format!(
+                    //     "⏭️ DEDUP: {} skipped (seen recently)", 
+                    //     &pool_event.token_mint[..12.min(pool_event.token_mint.len())]
+                    // ));
                     continue;
                 }
                 
@@ -677,7 +677,7 @@ fn assemble_enriched_token(
     );
     
     // NEW: Log the full struct for deep debugging as requested by user
-    TradeLogger::log_enriched_token(&enriched);
+    // TradeLogger::log_enriched_token(&enriched);
 
     Ok(enriched)
 }

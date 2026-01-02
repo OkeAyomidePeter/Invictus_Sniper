@@ -204,7 +204,7 @@ impl TransactionManager {
         slippage_bps: u16,
         router: DexRouter,
         _tip_lamports: u64, // Tip is now handled via Jito Bundle (separate tx)
-    ) -> Result<VersionedTransaction> {
+    ) -> Result<(VersionedTransaction, u64)> {
         info!("🔨 Building BUY transaction for {} via {:?}", mint, router);
 
         // 1. Get swap transaction from router (Jupiter)
@@ -246,7 +246,7 @@ impl TransactionManager {
         info!("🔨 Building SELL transaction for {} via {:?}", mint, router);
 
         // 1. Get swap transaction from router
-        let versioned_tx = self.get_swap_transaction(
+        let (versioned_tx, _expected_sol) = self.get_swap_transaction(
             mint,
             SOL_MINT,
             amount_token_raw,
@@ -258,7 +258,6 @@ impl TransactionManager {
         Ok(versioned_tx)
     }
 
-    /// Route to correct DEX and get swap transaction
     async fn get_swap_transaction(
         &self,
         input_mint: &str,
@@ -266,7 +265,7 @@ impl TransactionManager {
         amount: u64,
         slippage_bps: u16,
         router: DexRouter,
-    ) -> Result<VersionedTransaction> {
+    ) -> Result<(VersionedTransaction, u64)> {
         match router {
             DexRouter::PumpSwap => {
                 warn!("⚠️ PumpSwap routing not yet implemented, falling back to Jupiter");
@@ -289,7 +288,7 @@ impl TransactionManager {
         output_mint: &str,
         amount: u64,
         slippage_bps: u16,
-    ) -> Result<VersionedTransaction> {
+    ) -> Result<(VersionedTransaction, u64)> {
         // 1. Get quote
         let quote = self.get_jupiter_quote(input_mint, output_mint, amount, slippage_bps).await?;
 
@@ -335,7 +334,13 @@ impl TransactionManager {
         let versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
             .context("Failed to deserialize Jupiter VersionedTransaction")?;
             
-        Ok(versioned_tx)
+        // Extract expected output amount from quote for optimistic monitoring
+        let expected_out_amount = quote.get("outAmount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+            
+        Ok((versioned_tx, expected_out_amount))
     }
 
     async fn get_jupiter_quote(
