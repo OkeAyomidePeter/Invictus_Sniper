@@ -2,25 +2,7 @@ use crate::enrichment::EnrichedToken;
 use log::{info, warn};
 use crate::trade_logger::TradeLogger;
 
-/// Scorer for enriched tokens - FRESH PUMP FOCUSED
-/// GRADUATED TOKENS ONLY (Pump.fun/Bonk.fun)
-/// 
-/// NEW SCORING PHILOSOPHY (User Directed):
-/// - Focus on HIGH FREQUENCY data (5m / 1m)
-/// - "Jump on Pumps" strategy
-/// - Liquidity is just a safety filter
-/// 
-/// MAX SCORE: 150 points
-/// - Momentum (5m): 50 points (price change, velocity)
-/// - Activity (5m): 40 points (wallets, volume)
-/// - Buy Pressure (5m): 30 points (buy/sell ratio)
-/// - Ignition Bonus (1m): 15 points (instant pump detection)
-/// - Distribution: 15 points (safety)
-/// 
-/// PENALTIES:
-/// - Authorities (freeze/mint): Instant fail
-/// - Low liquidity: Instant fail
-/// - Ghost town: Instant fail
+
 
 // Liquidity thresholds (minimum requirements in USD)
 const LIQUIDITY_MIN_THRESHOLD_USD: f64 = 2500.0; // Minimal filter
@@ -77,7 +59,7 @@ impl TokenScorer {
 
     /// Calculate score for a token (0-150)
     /// FRESH PUMP FOCUSED (5m/1m data)
-    pub fn score(&self, token: &EnrichedToken) -> f64 {
+    pub fn score(&self, token: &EnrichedToken, config: &crate::config::Config) -> f64 {
         let mut score = 0.0;
         let mut breakdown = ScoringBreakdown::default();
 
@@ -97,20 +79,28 @@ impl TokenScorer {
         }
         
         let liquidity_usd = token.liquidity_usd.unwrap_or(0.0);
-        if liquidity_usd < LIQUIDITY_MIN_THRESHOLD_USD {
+        if liquidity_usd < config.min_liquidity_usd {
             warn!("💀 SCORING: {} has insufficient liquidity (${:.0} < ${})", 
-                token.mint, liquidity_usd, LIQUIDITY_MIN_THRESHOLD_USD);
+                token.mint, liquidity_usd, config.min_liquidity_usd);
             TradeLogger::log(&format!("💀 SCORING REJECTED: {} insufficient liquidity", token.mint));
             return 0.0;
         }
 
         if let Some(holders) = &token.holders {
             if let Some(unique) = holders.unique_holders {
-                 if unique < UNIQUE_HOLDERS_CRITICAL_LOW {
-                    warn!("💀 SCORING: {} has only {} holders (ghost token)", token.mint, unique);
-                    TradeLogger::log(&format!("💀 SCORING REJECTED: {} ghost token", token.mint));
+                 if unique < config.min_holders as u64 {
+                    warn!("💀 SCORING: {} has only {} holders (below min {})", token.mint, unique, config.min_holders);
+                    TradeLogger::log(&format!("💀 SCORING REJECTED: {} ghost token ({} holders)", token.mint, unique));
                     return 0.0;
                 }
+            }
+            
+            // WHALE GUARD: Reject if top 10 hold too much
+            if holders.top_10_pct > config.max_top_10_pct {
+                warn!("💀 SCORING: {} REJECTED - High whale concentration ({:.1}% > {:.1}%)", 
+                    token.mint, holders.top_10_pct, config.max_top_10_pct);
+                crate::trade_logger::log_whale_rejected(&token.mint, holders.top_10_pct);
+                return 0.0;
             }
         }
 
@@ -124,6 +114,16 @@ impl TokenScorer {
                     TradeLogger::log(&format!("💀 SCORING REJECTED: {} extreme vol/low liq", token.mint));
                     return 0.0;
                 }
+            }
+        }
+        
+        // VOLATILITY GUARD: Reject tokens with extreme short-term swings (30%+)
+        if let Some(pct_5m) = token.price_change_5m_pct {
+            if pct_5m.abs() > config.volatility_max_5m_pct {
+                warn!("💀 SCORING: {} REJECTED - Extreme 5m volatility ({:.1}% > {:.1}%)", 
+                    token.mint, pct_5m, config.volatility_max_5m_pct);
+                crate::trade_logger::log_volatility_rejected(&token.mint, pct_5m);
+                return 0.0;
             }
         }
 

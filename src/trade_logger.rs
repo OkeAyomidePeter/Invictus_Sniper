@@ -261,6 +261,14 @@ pub fn log_jito_debug(action: &str, details: &str) {
 // POSITION MONITORING
 // ============================================================================
 
+/// Log optimistic monitoring start (before balance verification)
+pub fn log_optimistic_start(mint: &str, expected_tokens: u64) {
+    TradeLogger::log(&format!(
+        "🛡️  OPTIMISTIC: Starting monitoring immediately for {} with expected {} tokens", 
+        &mint[..12.min(mint.len())], expected_tokens
+    ));
+}
+
 /// Log position monitoring started
 pub fn log_position_started(mint: &str, entry_price: f64, target_pct: f64, stop_pct: f64) {
     TradeLogger::log(&format!(
@@ -357,4 +365,22 @@ pub fn log_health_status(ws_age: i64, enrich_age: i64, is_healthy: bool) {
         "🏥 HEALTH: {} | WS: {}s ago | Enrich: {}s ago", 
         status, ws_age, enrich_age
     ));
+}
+
+/// Log rejection due to price instability
+pub fn log_price_stability_failed(mint: &str, drop_pct: f64) {
+    TradeLogger::log(&format!("🥀 STABILITY FAILED: {} | Drop: {:.2}% | Trade Aborted", 
+        &mint[..12.min(mint.len())], drop_pct));
+}
+
+/// Log rejection due to high volatility
+pub fn log_volatility_rejected(mint: &str, pct: f64) {
+    TradeLogger::log(&format!("💀 VOLATILITY REJECTED: {} | 5m Swing: {:.1}% | Risk too high", 
+        &mint[..12.min(mint.len())], pct));
+}
+
+/// Log rejection due to whale concentration
+pub fn log_whale_rejected(mint: &str, top10: f64) {
+    TradeLogger::log(&format!("💀 WHALE REJECTED: {} | Top10: {:.1}% | Concentration too high", 
+        &mint[..12.min(mint.len())], top10));
 }

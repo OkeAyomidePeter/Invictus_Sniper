@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
             }
             Some(enriched_token) = enriched_rx.recv() => {
                 // Low latency scoring
-                let score = scorer.score(&enriched_token);
+                let score = scorer.score(&enriched_token, &config);
 
                 info!(
                     "✨ ENRICHED: {} | Liq: ${:.0} | Score: {:.1}/150",

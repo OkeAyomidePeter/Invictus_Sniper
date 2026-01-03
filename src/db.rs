@@ -10,6 +10,19 @@ pub struct Database {
     pub(crate) pool: Pool<Sqlite>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TradeAnalytics {
+    pub mint: String,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub pnl_sol: f64,
+    pub pnl_pct: f64,
+    pub liquidity_usd: f64,
+    pub top_10_pct: f64,
+    pub holder_count: u64,
+    pub socials: u32,
+}
+
 impl Database {
     pub async fn new(database_url: &str) -> Result<Self> {
         // Ensure database file exists
@@ -96,6 +109,27 @@ impl Database {
         // Migration for entry_1m_move
         let _ = sqlx::query("ALTER TABLE trades ADD COLUMN entry_1m_move REAL DEFAULT 0.0")
             .execute(&self.pool).await;
+
+        // Table: Trade Analytics (Snapshot for model training)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS trade_analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mint TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                pnl_sol REAL,
+                pnl_pct REAL,
+                liquidity_usd REAL,
+                top_10_pct REAL,
+                holder_count INTEGER,
+                socials INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         info!("✅ Database schema initialized");
         Ok(())
@@ -457,5 +491,31 @@ impl Database {
             win_rate,
             active_positions.0,
         ))
+    }
+
+    /// Record snapshot data for AI/ML training and analysis
+    pub async fn record_trade_analytics(&self, analytics: &TradeAnalytics) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO trade_analytics (
+                mint, entry_price, exit_price, pnl_sol, pnl_pct, 
+                liquidity_usd, top_10_pct, holder_count, socials
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&analytics.mint)
+        .bind(analytics.entry_price)
+        .bind(analytics.exit_price)
+        .bind(analytics.pnl_sol)
+        .bind(analytics.pnl_pct)
+        .bind(analytics.liquidity_usd)
+        .bind(analytics.top_10_pct)
+        .bind(analytics.holder_count as i64)
+        .bind(analytics.socials as i32)
+        .execute(&self.pool)
+        .await?;
+        
+        info!("💾 Trade analytics recorded for {}", analytics.mint);
+        Ok(())
     }
 }

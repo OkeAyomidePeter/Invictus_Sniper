@@ -30,6 +30,12 @@ pub struct Position {
     pub remaining_amount_pct: f64,      // Track remaining position size
     pub timeout_extensions: u32,        // Count timeout extensions
     pub entry_1m_move: f64,             // Momentum at entry for adaptive exits
+    
+    // Analytics Snapshots
+    pub liquidity_usd: f64,
+    pub top_10_pct: f64,
+    pub holder_count: u64,
+    pub socials: u32,
 }
 
 /// Reason for triggering a sell
@@ -340,10 +346,10 @@ impl PositionTracker {
                         let in_grace_period = position.entry_time.elapsed() < grace_period;
 
                         if config.trailing_stop_enabled && !in_grace_period {
-                            // Rule: Only activate trailing stop after a minimum profit threshold is reached
-                            if pnl_pct < config.trailing_stop_activation_pct {
-                                // info!("🛡️ Trailing stop not yet active for {}: PnL {:.2}% < {:.1}% threshold", 
-                                //     position.mint, pnl_pct, config.trailing_stop_activation_pct);
+                            // Rule: Only activate trailing stop after both profit threshold AND minimum absolute price move are reached
+                            let absolute_move = (current_price - position.entry_price_sol_per_token).abs();
+                            if pnl_pct < config.trailing_stop_activation_pct || absolute_move < config.trailing_stop_min_price_move_sol {
+                                // Trailing stop not yet active
                             } else {
                                 // Rule: After 90s without new high, tighten trail stop distance
                                 let mut trail_distance_pct = config.trailing_stop_distance_pct;

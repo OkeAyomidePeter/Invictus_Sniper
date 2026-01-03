@@ -24,7 +24,7 @@ use tokio::sync::OnceCell;
 // Jupiter API endpoints (authenticated with API key)
 const JUPITER_QUOTE_API: &str = "https://api.jup.ag/swap/v1/quote";
 const JUPITER_SWAP_API: &str = "https://api.jup.ag/swap/v1/swap";
-const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 // Global endpoint (Frankfurt was 429ing)
 const JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
@@ -343,7 +343,7 @@ impl TransactionManager {
         Ok((versioned_tx, expected_out_amount))
     }
 
-    async fn get_jupiter_quote(
+    pub async fn get_jupiter_quote(
         &self,
         input_mint: &str,
         output_mint: &str,

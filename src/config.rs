@@ -98,6 +98,7 @@ pub struct Config {
     pub trailing_stop_enabled: bool,
     pub trailing_stop_distance_pct: f64,
     pub trailing_stop_activation_pct: f64,
+    pub trailing_stop_min_price_move_sol: f64,
     // Partial Exits
     pub partial_exit_enabled: bool,
     pub partial_exit_target_pct: f64,
@@ -106,6 +107,11 @@ pub struct Config {
     pub dynamic_timeout_enabled: bool,
     pub timeout_extension_seconds: u64,
     pub max_timeout_extensions: u32,
+    // Decision Layer Guards
+    pub price_stability_window_secs: u64,
+    pub price_stability_max_drop_pct: f64,
+    pub volatility_max_5m_pct: f64,
+    pub max_top_10_pct: f64,
 }
 
 impl Config {
@@ -124,7 +130,7 @@ impl Config {
             alternate_telegram_chat_id: env::var("ALTERNATE_TELEGRAM_CHAT_ID").ok().filter(|s| !s.is_empty()),
             database_url: env::var("DATABASE_URL").unwrap_or("sqlite://invictus.db".to_string()),
             min_liquidity_usd: env::var("MIN_LIQUIDITY_USD")
-                .unwrap_or("2500.0".to_string())
+                .unwrap_or("7000.0".to_string())
                 .parse()
                 .expect("MIN_LIQUIDITY_USD must be a valid number"),
             min_holders: env::var("MIN_HOLDERS")
@@ -317,6 +323,10 @@ impl Config {
                 .unwrap_or("15.0".to_string())
                 .parse()
                 .expect("TRAILING_STOP_ACTIVATION_PCT must be a valid number"),
+            trailing_stop_min_price_move_sol: env::var("TRAILING_STOP_MIN_PRICE_MOVE_SOL")
+                .unwrap_or("0.0000001".to_string())
+                .parse()
+                .expect("TRAILING_STOP_MIN_PRICE_MOVE_SOL must be a valid number"),
             // Partial Exits
             partial_exit_enabled: env::var("PARTIAL_EXIT_ENABLED")
                 .unwrap_or("true".to_string())
@@ -343,6 +353,23 @@ impl Config {
                 .unwrap_or("2".to_string())
                 .parse()
                 .expect("MAX_TIMEOUT_EXTENSIONS must be a valid number"),
+            // Decision Layer Guards
+            price_stability_window_secs: env::var("PRICE_STABILITY_WINDOW_SECS")
+                .unwrap_or("5".to_string())
+                .parse()
+                .expect("PRICE_STABILITY_WINDOW_SECS must be a valid number"),
+            price_stability_max_drop_pct: env::var("PRICE_STABILITY_MAX_DROP_PCT")
+                .unwrap_or("2.0".to_string())
+                .parse()
+                .expect("PRICE_STABILITY_MAX_DROP_PCT must be a valid number"),
+            volatility_max_5m_pct: env::var("VOLATILITY_MAX_5M_PCT")
+                .unwrap_or("30.0".to_string())
+                .parse()
+                .expect("VOLATILITY_MAX_5M_PCT must be a valid number"),
+            max_top_10_pct: env::var("MAX_TOP_10_PCT")
+                .unwrap_or("40.0".to_string())
+                .parse()
+                .expect("MAX_TOP_10_PCT must be a valid number"),
         }
     }
 

@@ -102,6 +102,7 @@ pub struct ConfigData {
     pub trailing_stop_enabled: bool,
     pub trailing_stop_distance_pct: String,
     pub trailing_stop_activation_pct: String,
+    pub trailing_stop_min_price_move_sol: String,
     
     // Partial Exits
     pub partial_exit_enabled: bool,
@@ -112,6 +113,12 @@ pub struct ConfigData {
     pub dynamic_timeout_enabled: bool,
     pub timeout_extension_seconds: String,
     pub max_timeout_extensions: String,
+    
+    // Decision Layer Guards
+    pub price_stability_window_secs: String,
+    pub price_stability_max_drop_pct: String,
+    pub volatility_max_5m_pct: String,
+    pub max_top_10_pct: String,
 }
 
 impl Default for ConfigData {
@@ -174,6 +181,7 @@ impl Default for ConfigData {
             trailing_stop_enabled: true,
             trailing_stop_distance_pct: "15.0".to_string(),
             trailing_stop_activation_pct: "10.0".to_string(),
+            trailing_stop_min_price_move_sol: "0.0000001".to_string(),
             // Partial Exits
             partial_exit_enabled: true,
             partial_exit_target_pct: "30.0".to_string(),
@@ -182,6 +190,12 @@ impl Default for ConfigData {
             dynamic_timeout_enabled: true,
             timeout_extension_seconds: "60".to_string(),
             max_timeout_extensions: "2".to_string(),
+            
+            // Decision Layer Guards
+            price_stability_window_secs: "5".to_string(),
+            price_stability_max_drop_pct: "2.0".to_string(),
+            volatility_max_5m_pct: "30.0".to_string(),
+            max_top_10_pct: "40.0".to_string(),
         }
     }
 }
@@ -247,6 +261,7 @@ impl ConfigData {
             trailing_stop_enabled: self.trailing_stop_enabled,
             trailing_stop_distance_pct: self.trailing_stop_distance_pct.parse().map_err(|_| "Invalid trailing_stop_distance_pct")?,
             trailing_stop_activation_pct: self.trailing_stop_activation_pct.parse().map_err(|_| "Invalid trailing_stop_activation_pct")?,
+            trailing_stop_min_price_move_sol: self.trailing_stop_min_price_move_sol.parse().map_err(|_| "Invalid trailing_stop_min_price_move_sol")?,
             // Partial Exits
             partial_exit_enabled: self.partial_exit_enabled,
             partial_exit_target_pct: self.partial_exit_target_pct.parse().map_err(|_| "Invalid partial_exit_target_pct")?,
@@ -255,6 +270,12 @@ impl ConfigData {
             dynamic_timeout_enabled: self.dynamic_timeout_enabled,
             timeout_extension_seconds: self.timeout_extension_seconds.parse().map_err(|_| "Invalid timeout_extension_seconds")?,
             max_timeout_extensions: self.max_timeout_extensions.parse().map_err(|_| "Invalid max_timeout_extensions")?,
+            
+            // Decision Layer Guards
+            price_stability_window_secs: self.price_stability_window_secs.parse().map_err(|_| "Invalid price_stability_window_secs")?,
+            price_stability_max_drop_pct: self.price_stability_max_drop_pct.parse().map_err(|_| "Invalid price_stability_max_drop_pct")?,
+            volatility_max_5m_pct: self.volatility_max_5m_pct.parse().map_err(|_| "Invalid volatility_max_5m_pct")?,
+            max_top_10_pct: self.max_top_10_pct.parse().map_err(|_| "Invalid max_top_10_pct")?,
         })
     }
 }

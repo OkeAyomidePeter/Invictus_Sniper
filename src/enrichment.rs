@@ -670,7 +670,7 @@ fn assemble_enriched_token(
 
     TradeLogger::log_enrichment_data(
         &enriched.mint,
-        enriched.initial_liquidity_sol.unwrap_or(0.0),
+        enriched.liquidity_usd.unwrap_or(0.0),
         top_10_pct,
         unique_holders,
         socials_count

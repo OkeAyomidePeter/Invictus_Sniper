@@ -304,7 +304,7 @@ async fn run_bot_logic(
                 break;
             }
             Some(enriched_token) = enriched_rx.recv() => {
-                let score = scorer.score(&enriched_token);
+                let score = scorer.score(&enriched_token, &config);
 
                 let log_msg = format!(
                     "✨ ENRICHED: {} | Liq: ${:.0} | Score: {:.1}/150",

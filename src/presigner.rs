@@ -664,12 +664,17 @@ mod tests {
             trailing_stop_enabled: false,
             trailing_stop_distance_pct: 0.0,
             trailing_stop_activation_pct: 0.0,
+            trailing_stop_min_price_move_sol: 0.0,
             partial_exit_enabled: false,
             partial_exit_target_pct: 0.0,
             partial_exit_amount_pct: 0.0,
             dynamic_timeout_enabled: false,
             timeout_extension_seconds: 0,
             max_timeout_extensions: 0,
+            price_stability_window_secs: 5,
+            price_stability_max_drop_pct: 2.0,
+            volatility_max_5m_pct: 30.0,
+            max_top_10_pct: 40.0,
         }
     }
 

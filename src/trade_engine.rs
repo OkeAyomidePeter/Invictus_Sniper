@@ -59,6 +59,12 @@ impl TradeEngine {
         let amount_lamports = (amount_sol * 1_000_000_000.0) as u64;
         let slippage_bps = 200; // Default 2%
         
+        // --- PRICE STABILITY GUARD ---
+        if !self.ensure_price_stability(&token.mint, amount_lamports).await? {
+            warn!("🥀 BUY ABORTED: {} failed price stability check", token.mint);
+            return Ok(());
+        }
+        
         // STEP 2: Build Buy Transaction
         let start_step = Instant::now();
         let (mut buy_tx, expected_out_amount) = match self.tx_manager.build_buy_transaction(
@@ -148,13 +154,28 @@ impl TradeEngine {
 
         // STEP 7: Start Optimistic Monitoring (ASAP!)
         if self.config.auto_sell_enabled {
-            info!("🛡️  OPTIMISTIC: Starting monitoring immediately for {} with expected {} tokens", token.mint, expected_out_amount);
+            crate::trade_logger::log_optimistic_start(&token.mint, expected_out_amount);
+            
+            let top_10_pct = token.holders.as_ref().map(|h| h.top_10_pct).unwrap_or(0.0);
+            let holder_count = token.holders.as_ref().and_then(|h| h.unique_holders).unwrap_or(0);
+            let socials_count = token.metadata.as_ref().and_then(|m| m.socials.as_ref()).map(|s| {
+                let mut count = 0;
+                if s.twitter.is_some() { count += 1; }
+                if s.telegram.is_some() { count += 1; }
+                if s.website.is_some() { count += 1; }
+                count
+            }).unwrap_or(0);
+
             self.start_auto_sell_monitoring(
                 token.mint.clone(), 
                 amount_sol, 
                 expected_out_amount, 
                 token.decimals,
-                token.price_change_1m_pct.unwrap_or(0.0)
+                token.price_change_1m_pct.unwrap_or(0.0),
+                token.liquidity_usd.unwrap_or(0.0),
+                top_10_pct,
+                holder_count,
+                socials_count
             ).await;
         }
 
@@ -216,6 +237,63 @@ impl TradeEngine {
         });
 
         Ok(())
+    }
+
+    /// Pre-buy price stability check to avoid buying the top of a candle or a dumping token
+    async fn ensure_price_stability(&self, mint: &str, in_amount_lamports: u64) -> Result<bool> {
+        info!("⚖️  Checking price stability for {} ({}s window)...", &mint[..12], self.config.price_stability_window_secs);
+        
+        // Sample 1: Initial quote
+        let quote1 = match self.tx_manager.get_jupiter_quote(crate::tx::SOL_MINT, mint, in_amount_lamports, 200).await {
+            Ok(q) => q,
+            Err(e) => {
+                warn!("⚠️ Stability check Sample 1 failed: {}. Proceeding anyway.", e);
+                return Ok(true);
+            }
+        };
+        
+        let out_amount1: u64 = quote1["outAmount"].as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+            
+        if out_amount1 == 0 { return Ok(true); }
+
+        // Wait for stability window
+        tokio::time::sleep(std::time::Duration::from_secs(self.config.price_stability_window_secs)).await;
+
+        // Sample 2: Final quote
+        let quote2 = match self.tx_manager.get_jupiter_quote(crate::tx::SOL_MINT, mint, in_amount_lamports, 200).await {
+            Ok(q) => q,
+            Err(e) => {
+                warn!("⚠️ Stability check Sample 2 failed: {}. Proceeding anyway.", e);
+                return Ok(true);
+            }
+        };
+
+        let out_amount2: u64 = quote2["outAmount"].as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if out_amount2 == 0 { return Ok(true); }
+
+        // Compare out amounts (more tokens for same SOL = lower price)
+        // price1 = SOL / out1
+        // price2 = SOL / out2
+        // drop = (price1 - price2) / price1 = (1/out1 - 1/out2) / (1/out1) = 1 - out1/out2
+        // If out2 < out1, price2 > price1 (Pumping) -> 1 - out1/out2 is negative
+        // If out2 > out1, price2 < price1 (Dumping) -> 1 - out1/out2 is positive
+        
+        let drop_pct = (1.0 - (out_amount1 as f64 / out_amount2 as f64)) * 100.0;
+        
+        if drop_pct > self.config.price_stability_max_drop_pct {
+            warn!("🥀 STABILITY FAILED: {} dropped {:.2}% in {}s (Max: {:.1}%)", 
+                &mint[..12], drop_pct, self.config.price_stability_window_secs, self.config.price_stability_max_drop_pct);
+            crate::trade_logger::log_price_stability_failed(mint, drop_pct);
+            return Ok(false);
+        }
+
+        info!("✅ Price stable: {} delta: {:.2}%", &mint[..12], drop_pct);
+        Ok(true)
     }
 
     /// Execute a sell transaction
@@ -339,9 +417,18 @@ impl TradeEngine {
     }
 
     /// Start monitoring a position for auto-sell
-    async fn start_auto_sell_monitoring(&self, mint: String, entry_sol: f64, token_amount: u64, decimals: u8, entry_1m_move: f64) {
-        info!("📊 Starting auto-sell monitoring for {}", mint);
-        
+    async fn start_auto_sell_monitoring(
+        &self, 
+        mint: String, 
+        entry_sol: f64, 
+        token_amount: u64, 
+        decimals: u8, 
+        entry_1m_move: f64,
+        liquidity_usd: f64,
+        top_10_pct: f64,
+        holder_count: u64,
+        socials: u32
+    ) {
         // Standardize Price to SOL per 1.0 Token (Fixes Unit Mismatch)
         let entry_price = if token_amount > 0 {
             let token_amount_whole = token_amount as f64 / 10f64.powf(decimals as f64);
@@ -349,6 +436,8 @@ impl TradeEngine {
         } else {
             0.0
         };
+
+        crate::trade_logger::log_position_started(&mint, entry_price, self.config.auto_sell_profit_target_pct, self.config.auto_sell_stop_loss_pct);
 
         let position = Position {
             mint: mint.clone(),
@@ -362,6 +451,10 @@ impl TradeEngine {
             remaining_amount_pct: 100.0,
             timeout_extensions: 0,
             entry_1m_move,
+            liquidity_usd,
+            top_10_pct,
+            holder_count,
+            socials,
         };
 
         let mut rx = self.position_tracker.monitor_position(position).await;
@@ -393,6 +486,26 @@ impl TradeEngine {
                         ).await {
                             error!("Failed to record trade exit: {}", e);
                         }
+
+                        // NEW: Record Post-Trade Analytics for AI training
+                        let analytics = crate::db::TradeAnalytics {
+                            mint: signal.position.mint.clone(),
+                            entry_price: signal.position.entry_price_sol_per_token,
+                            exit_price: signal.current_price_sol_per_token,
+                            pnl_sol,
+                            pnl_pct: signal.pnl_percentage,
+                            liquidity_usd: signal.position.liquidity_usd,
+                            top_10_pct: signal.position.top_10_pct,
+                            holder_count: signal.position.holder_count,
+                            socials: signal.position.socials,
+                        };
+                        
+                        let db_for_analytics = trade_engine.db.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = db_for_analytics.record_trade_analytics(&analytics).await {
+                                error!("Failed to record trade analytics for {}: {}", analytics.mint, e);
+                            }
+                        });
                         
                         // Update Circuit Breaker logic
                         if signal.pnl_percentage < 0.0 {
@@ -499,6 +612,10 @@ impl TradeEngine {
                 remaining_amount_pct: remaining_pct,   // Restored from DB
                 timeout_extensions: ext,
                 entry_1m_move,
+                liquidity_usd: 0.0,
+                top_10_pct: 0.0,
+                holder_count: 0,
+                socials: 0,
             };
             
             info!("🔄 Restoring position: {} (partial_exit: {}, remaining: {:.0}%)", 
@@ -529,6 +646,24 @@ impl TradeEngine {
                             ).await {
                                 error!("Failed to record trade exit: {}", e);
                             }
+
+                            // Record Post-Trade Analytics (Partial data for resumed)
+                            let analytics = crate::db::TradeAnalytics {
+                                mint: signal.position.mint.clone(),
+                                entry_price: signal.position.entry_price_sol_per_token,
+                                exit_price: signal.current_price_sol_per_token,
+                                pnl_sol,
+                                pnl_pct: signal.pnl_percentage,
+                                liquidity_usd: signal.position.liquidity_usd,
+                                top_10_pct: signal.position.top_10_pct,
+                                holder_count: signal.position.holder_count,
+                                socials: signal.position.socials,
+                            };
+                            
+                            let db_for_analytics = trade_engine.db.clone();
+                            tokio::spawn(async move {
+                                let _ = db_for_analytics.record_trade_analytics(&analytics).await;
+                            });
 
                             // Update Circuit Breaker logic
                             if signal.pnl_percentage < 0.0 {
