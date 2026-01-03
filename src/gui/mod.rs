@@ -74,6 +74,8 @@ pub struct ConfigData {
     pub helius_max_requests_per_second: String,
     pub jupiter_max_requests_per_second: String,
     pub birdeye_max_requests_per_second: String,
+    pub moralis_max_requests_per_second: String,
+    pub price_source_priority: crate::config::PriceSourcePriority,
     
     // Wallet Monitoring
     pub wallet_low_balance_alert_sol: String,
@@ -160,7 +162,9 @@ impl Default for ConfigData {
             rate_limiting_enabled: true,
             helius_max_requests_per_second: "10.0".to_string(),
             jupiter_max_requests_per_second: "5.0".to_string(),
-            birdeye_max_requests_per_second: "5.0".to_string(),
+            birdeye_max_requests_per_second: "1.0".to_string(),
+            moralis_max_requests_per_second: "10.0".to_string(),
+            price_source_priority: crate::config::PriceSourcePriority::MoralisFirst,
             wallet_low_balance_alert_sol: "0.5".to_string(),
             wallet_monitor_interval_secs: "60".to_string(),
             wallet_reserve_for_fees_sol: "0.1".to_string(),
@@ -240,6 +244,8 @@ impl ConfigData {
             tx_retry_backoff_multiplier: self.tx_retry_backoff_multiplier.parse().map_err(|_| "Invalid tx_retry_backoff_multiplier")?,
             helius_max_requests_per_second: self.helius_max_requests_per_second.parse().map_err(|_| "Invalid helius_max_requests_per_second")?,
             jupiter_max_requests_per_second: self.jupiter_max_requests_per_second.parse().map_err(|_| "Invalid jupiter_max_requests_per_second")?,
+            moralis_max_requests_per_second: self.moralis_max_requests_per_second.parse().map_err(|_| "Invalid moralis_max_requests_per_second")?,
+            price_source_priority: self.price_source_priority,
             rate_limiting_enabled: self.rate_limiting_enabled,
             wallet_low_balance_alert_sol: self.wallet_low_balance_alert_sol.parse().map_err(|_| "Invalid wallet_low_balance_alert_sol")?,
             wallet_monitor_interval_secs: self.wallet_monitor_interval_secs.parse().map_err(|_| "Invalid wallet_monitor_interval_secs")?,
@@ -541,6 +547,14 @@ impl InvictusGUI {
         load_bool(&mut self.config.rate_limiting_enabled, "RATE_LIMITING_ENABLED");
         load_str(&mut self.config.helius_max_requests_per_second, "HELIUS_MAX_REQUESTS_PER_SECOND");
         load_str(&mut self.config.jupiter_max_requests_per_second, "JUPITER_MAX_REQUESTS_PER_SECOND");
+        load_str(&mut self.config.birdeye_max_requests_per_second, "BIRDEYE_MAX_REQUESTS_PER_SECOND");
+        load_str(&mut self.config.moralis_max_requests_per_second, "MORALIS_MAX_REQUESTS_PER_SECOND");
+        
+        if let Ok(val) = std::env::var("PRICE_SOURCE_PRIORITY") {
+            if let Ok(p) = val.parse() {
+                self.config.price_source_priority = p;
+            }
+        }
         
         load_str(&mut self.config.wallet_low_balance_alert_sol, "WALLET_LOW_BALANCE_ALERT_SOL");
         load_str(&mut self.config.wallet_monitor_interval_secs, "WALLET_MONITOR_INTERVAL_SECS");

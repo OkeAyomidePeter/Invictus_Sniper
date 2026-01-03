@@ -45,9 +45,9 @@ Once a token scores **100+**, the execution engine kicks in with an "Optimistic"
 
 ## 📊 Phase 3: Real-Time Monitoring & Profit Tracking
 
-The Monitoring Loop is the heartbeat of the bot. It runs a dedicated task for every open position.
+The Monitoring Loop is the heartbeat of the bot. It runs a dedicated task for every open position with a default check interval of **5 seconds** to optimize API usage.
 
-- **Price Aggregation**: It queries **Birdeye** first (for maximum speed) and falls back to **Moralis** if needed.
+- **Price Aggregation**: It queries **Moralis** first (for credit efficiency) and falls back to **Birdeye** if needed. This prioritization can be toggled via `PRICE_SOURCE_PRIORITY`.
 - **P/L Calculation**: It tracks Profit/Loss relative to your **Entry Price (SOL per Token)**. Every move is recorded in the `invictus.db`.
 - **The Highest Price (Peak)**: The bot continuously updates the `highest_price_reached`. This is the reference point for the Trailing Stop.
 

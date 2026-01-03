@@ -30,6 +30,32 @@ impl std::str::FromStr for TransactionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PriceSourcePriority {
+    BirdeyeFirst,
+    MoralisFirst,
+}
+
+impl std::fmt::Display for PriceSourcePriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PriceSourcePriority::BirdeyeFirst => write!(f, "BirdeyeFirst"),
+            PriceSourcePriority::MoralisFirst => write!(f, "MoralisFirst"),
+        }
+    }
+}
+
+impl std::str::FromStr for PriceSourcePriority {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "birdeyefirst" | "birdeye" => Ok(PriceSourcePriority::BirdeyeFirst),
+            "moralisfirst" | "moralis" => Ok(PriceSourcePriority::MoralisFirst),
+            _ => Err(format!("Invalid price source priority: {}", s)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub helius_api_key: String,
@@ -74,6 +100,8 @@ pub struct Config {
     pub helius_max_requests_per_second: f64,
     pub jupiter_max_requests_per_second: f64,
     pub birdeye_max_requests_per_second: f64,
+    pub moralis_max_requests_per_second: f64,
+    pub price_source_priority: PriceSourcePriority,
     pub rate_limiting_enabled: bool,
     // Wallet monitoring
     pub wallet_low_balance_alert_sol: f64,
@@ -130,11 +158,11 @@ impl Config {
             alternate_telegram_chat_id: env::var("ALTERNATE_TELEGRAM_CHAT_ID").ok().filter(|s| !s.is_empty()),
             database_url: env::var("DATABASE_URL").unwrap_or("sqlite://invictus.db".to_string()),
             min_liquidity_usd: env::var("MIN_LIQUIDITY_USD")
-                .unwrap_or("7000.0".to_string())
+                .unwrap_or("5000.0".to_string())
                 .parse()
                 .expect("MIN_LIQUIDITY_USD must be a valid number"),
             min_holders: env::var("MIN_HOLDERS")
-                .unwrap_or("10".to_string())
+                .unwrap_or("67".to_string())
                 .parse()
                 .expect("MIN_HOLDERS must be a valid number"),
             max_trade_size_sol: env::var("MAX_TRADE_SIZE_SOL")
@@ -192,7 +220,7 @@ impl Config {
                 .parse()
                 .expect("AUTO_SELL_SLIPPAGE_BPS must be a valid number"),
             auto_sell_price_check_interval_ms: env::var("AUTO_SELL_PRICE_CHECK_INTERVAL_MS")
-                .unwrap_or("2000".to_string())
+                .unwrap_or("3500".to_string())
                 .parse()
                 .expect("AUTO_SELL_PRICE_CHECK_INTERVAL_MS must be a valid number"),
             // Dynamic Jito tip configuration
@@ -239,9 +267,17 @@ impl Config {
                 .parse()
                 .expect("JUPITER_MAX_REQUESTS_PER_SECOND must be a valid number"),
             birdeye_max_requests_per_second: env::var("BIRDEYE_MAX_REQUESTS_PER_SECOND")
-                .unwrap_or("5.0".to_string())
+                .unwrap_or("2.0".to_string())
                 .parse()
                 .expect("BIRDEYE_MAX_REQUESTS_PER_SECOND must be a valid number"),
+            moralis_max_requests_per_second: env::var("MORALIS_MAX_REQUESTS_PER_SECOND")
+                .unwrap_or("10.0".to_string())
+                .parse()
+                .expect("MORALIS_MAX_REQUESTS_PER_SECOND must be a valid number"),
+            price_source_priority: env::var("PRICE_SOURCE_PRIORITY")
+                .unwrap_or("MoralisFirst".to_string())
+                .parse()
+                .unwrap_or(PriceSourcePriority::MoralisFirst),
             rate_limiting_enabled: env::var("RATE_LIMITING_ENABLED")
                 .unwrap_or("true".to_string())
                 .parse()

@@ -86,6 +86,7 @@ pub struct PositionTracker {
     price_check_interval_ms: u64,
     rpc_url: String,
     birdeye_limiter: Arc<RateLimiter>,
+    moralis_limiter: Arc<RateLimiter>,
     moralis_client: Arc<MoralisClient>,
 }
 
@@ -99,6 +100,11 @@ impl PositionTracker {
         let birdeye_limiter = Arc::new(RateLimiter::new(
             config.birdeye_max_requests_per_second,
             "BirdeyePositionTracker",
+        ));
+
+        let moralis_limiter = Arc::new(RateLimiter::new(
+            config.moralis_max_requests_per_second,
+            "MoralisPositionTracker",
         ));
 
         let moralis_client = Arc::new(MoralisClient::new(
@@ -117,6 +123,7 @@ impl PositionTracker {
             price_check_interval_ms: config.auto_sell_price_check_interval_ms,
             rpc_url: config.rpc_url.clone(),
             birdeye_limiter,
+            moralis_limiter,
             moralis_client,
         }
     }
@@ -164,6 +171,7 @@ impl PositionTracker {
         let config = self.config.clone();
         let client = self.client.clone();
         let birdeye_limiter = self.birdeye_limiter.clone();
+        let moralis_limiter = self.moralis_limiter.clone();
         let moralis_client = self.moralis_client.clone();
         let mint_clone = position.mint.clone();
 
@@ -183,7 +191,7 @@ impl PositionTracker {
                 // Check timeout
                 if position.entry_time.elapsed() >= timeout {
                     // Fetch price to make intelligent decision
-                    let current_price = match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter, &moralis_client).await {
+                    let current_price = match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter, &moralis_limiter, &moralis_client).await {
                         Ok(p) => p,
                         Err(e) => {
                             warn!("Failed to fetch price at timeout check for {}: {}. Assuming entry price.", position.mint, e);
@@ -248,7 +256,7 @@ impl PositionTracker {
                 }
 
                 // Fetch current price
-                match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter, &moralis_client).await {
+                match fetch_current_price(&client, &config, &position.mint, &birdeye_limiter, &moralis_limiter, &moralis_client).await {
                     Ok(current_price) => {
                         check_count += 1;
                         let pnl_pct = ((current_price - position.entry_price_sol_per_token) / position.entry_price_sol_per_token) * 100.0;
@@ -464,19 +472,37 @@ async fn fetch_current_price(
     client: &Client,
     config: &Config,
     token_mint: &str,
-    limiter: &RateLimiter,
+    birdeye_limiter: &RateLimiter,
+    moralis_limiter: &RateLimiter,
     moralis: &MoralisClient,
 ) -> Result<f64> {
     let mint = token_mint.to_string();
     let api_key = config.birdeye_api_key.clone();
 
-    // 1. Try Birdeye (Primary)
-    match fetch_price_from_birdeye(client, &api_key, &mint, limiter).await {
-        Ok(price) => Ok(price),
-        Err(e) => {
-            warn!("⚠️ Birdeye price fetch failed for {}: {}. Falling back to Moralis...", token_mint, e);
-            // 2. Try Moralis (Fallback)
-            moralis.get_token_price(&mint).await
+    match config.price_source_priority {
+        crate::config::PriceSourcePriority::MoralisFirst => {
+            // 1. Try Moralis (Primary)
+            moralis_limiter.acquire().await;
+            match moralis.get_token_price(&mint).await {
+                Ok(price) => Ok(price),
+                Err(e) => {
+                    warn!("⚠️ Moralis price fetch failed for {}: {}. Falling back to Birdeye...", token_mint, e);
+                    // 2. Try Birdeye (Fallback)
+                    fetch_price_from_birdeye(client, &api_key, &mint, birdeye_limiter).await
+                }
+            }
+        }
+        crate::config::PriceSourcePriority::BirdeyeFirst => {
+            // 1. Try Birdeye (Primary)
+            match fetch_price_from_birdeye(client, &api_key, &mint, birdeye_limiter).await {
+                Ok(price) => Ok(price),
+                Err(e) => {
+                    warn!("⚠️ Birdeye price fetch failed for {}: {}. Falling back to Moralis...", token_mint, e);
+                    // 2. Try Moralis (Fallback)
+                    moralis_limiter.acquire().await;
+                    moralis.get_token_price(&mint).await
+                }
+            }
         }
     }
 }
