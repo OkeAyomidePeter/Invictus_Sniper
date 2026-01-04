@@ -46,6 +46,8 @@ pub struct ConfigData {
     
     // Transaction Mode
     pub transaction_mode: crate::config::TransactionMode,
+    pub sell_transaction_mode: crate::config::TransactionMode,
+    pub sell_fallback_enabled: bool,
     pub priority_fee_lamports: String,
     pub compute_unit_limit: String,
     
@@ -143,6 +145,8 @@ impl Default for ConfigData {
             honeypot_check_enabled: true,
             jupiter_api_timeout_ms: "5000".to_string(),
             transaction_mode: crate::config::TransactionMode::Standard,
+            sell_transaction_mode: crate::config::TransactionMode::Standard,
+            sell_fallback_enabled: false,
             priority_fee_lamports: "100000".to_string(),
             compute_unit_limit: "200000".to_string(),
             auto_sell_enabled: true,
@@ -226,6 +230,8 @@ impl ConfigData {
             honeypot_check_enabled: self.honeypot_check_enabled,
             jupiter_api_timeout_ms: self.jupiter_api_timeout_ms.parse().map_err(|_| "Invalid jupiter_api_timeout_ms")?,
             transaction_mode: self.transaction_mode,
+            sell_transaction_mode: self.sell_transaction_mode,
+            sell_fallback_enabled: self.sell_fallback_enabled,
             priority_fee_lamports: self.priority_fee_lamports.parse().map_err(|_| "Invalid priority_fee_lamports")?,
             compute_unit_limit: self.compute_unit_limit.parse().map_err(|_| "Invalid compute_unit_limit")?,
             auto_sell_enabled: self.auto_sell_enabled,
@@ -524,6 +530,12 @@ impl InvictusGUI {
                 self.config.transaction_mode = m;
             }
         }
+        if let Ok(val) = std::env::var("SELL_TRANSACTION_MODE") {
+            if let Ok(m) = val.parse() {
+                self.config.sell_transaction_mode = m;
+            }
+        }
+        load_bool(&mut self.config.sell_fallback_enabled, "SELL_FALLBACK_ENABLED");
         load_str(&mut self.config.priority_fee_lamports, "PRIORITY_FEE_LAMPORTS");
         load_str(&mut self.config.compute_unit_limit, "COMPUTE_UNIT_LIMIT");
         

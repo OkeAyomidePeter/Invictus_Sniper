@@ -77,6 +77,8 @@ pub struct Config {
     pub jupiter_api_timeout_ms: u64,
     // Transaction Mode
     pub transaction_mode: TransactionMode,
+    pub sell_transaction_mode: TransactionMode,
+    pub sell_fallback_enabled: bool,
     pub priority_fee_lamports: u64,
     pub compute_unit_limit: u32,
     // Auto-sell configuration
@@ -198,6 +200,15 @@ impl Config {
                 .unwrap_or("200000".to_string())
                 .parse()
                 .expect("COMPUTE_UNIT_LIMIT must be a valid number"),
+            // Sell Transaction Mode
+            sell_transaction_mode: env::var("SELL_TRANSACTION_MODE")
+                .unwrap_or("Standard".to_string())
+                .parse()
+                .unwrap_or(TransactionMode::Standard),
+            sell_fallback_enabled: env::var("SELL_FALLBACK_ENABLED")
+                .unwrap_or("true".to_string())
+                .parse()
+                .unwrap_or(true),
             // Auto-sell configuration
             auto_sell_enabled: env::var("AUTO_SELL_ENABLED")
                 .unwrap_or("true".to_string())
@@ -444,8 +455,10 @@ impl Config {
         };
 
         format!(
-            "Config loaded: mode={}, helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_usd={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}, jito_base_tip={}",
+            "Config loaded: mode={}, sell_mode={}, fallback={}, helius_key={}, birdeye_key={}, jupiter_key={}, rpc_url={}, private_key={}, telegram_token={}, telegram_chat_id={}, database_url={}, min_liquidity_usd={}, min_holders={}, max_trade_size_sol={}, max_daily_exposure_sol={}, honeypot_check_enabled={}, auto_sell_enabled={}, rate_limiting_enabled={}, max_concurrent_trades={}, jito_base_tip={}",
             self.transaction_mode,
+            self.sell_transaction_mode,
+            self.sell_fallback_enabled,
             Self::mask_secret(&self.helius_api_key),
             Self::mask_secret(&self.birdeye_api_key),
             Self::mask_secret(&self.jupiter_api_key),

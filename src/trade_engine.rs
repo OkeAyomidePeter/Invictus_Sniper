@@ -297,64 +297,89 @@ impl TradeEngine {
     }
 
     /// Execute a sell transaction
+    /// Execute a sell transaction with confirmation wait and optional fallback
     async fn execute_sell(&self, signal: &SellSignal) -> Result<String> {
         info!("🤖 TradeEngine: Initiating SELL for {} (Trigger: {})", signal.position.mint, signal.trigger);
 
+        let mode = self.config.sell_transaction_mode;
+        
+        // 1. Try Primary Mode
+        let res = match mode {
+            crate::config::TransactionMode::Standard => self.execute_sell_standard(signal).await,
+            crate::config::TransactionMode::Jito => self.execute_sell_jito(signal).await,
+        };
+
+        // 2. Automatic Fallback if enabled and primary failed
+        match res {
+            Ok(sig) => Ok(sig),
+            Err(e) => {
+                if self.config.sell_fallback_enabled && mode == crate::config::TransactionMode::Jito {
+                    warn!("⚠️ Jito SELL failed: {}. Falling back to Standard transaction...", e);
+                    self.execute_sell_standard(signal).await
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Execute sell via Standard Transaction (Confirmed)
+    async fn execute_sell_standard(&self, signal: &SellSignal) -> Result<String> {
         let amount_token = signal.position.amount_token_raw;
         let slippage_bps = self.config.auto_sell_slippage_bps;
 
-        // 1. Send (Standard vs Jito)
-        let mode = self.tx_manager.transaction_mode();
-        let identifier = if mode == crate::config::TransactionMode::Standard {
-            // 1a. Build, Sign & Send Standard Transaction
-            let mut sell_tx = self.tx_manager.build_sell_transaction(
-                &signal.position.mint,
-                amount_token,
-                slippage_bps,
-                DexRouter::Jupiter,
-                true, // Close ATA
-            ).await?;
+        let mut sell_tx = self.tx_manager.build_sell_transaction(
+            &signal.position.mint,
+            amount_token,
+            slippage_bps,
+            DexRouter::Jupiter,
+            true, // Close ATA
+        ).await?;
 
-            // REMOVED Simulation Check for latency
-            
-            // Sign the transaction first
-            self.presigner.sign_versioned_tx(&mut sell_tx)?;
+        self.presigner.sign_versioned_tx(&mut sell_tx)?;
 
-            let sig = self.presigner.send_versioned_transaction(&sell_tx).await?;
-            info!("🚀 Standard SELL Sent! Sig: {}", sig);
-            crate::trade_logger::log_priority_fees(&signal.position.mint, self.config.priority_fee_lamports);
-            sig
-        } else {
-            // 1b. Jito Bundle Mode
-            let tip_lamports = self.tx_manager.calculate_tip(false);
-            
-            let mut sell_tx = self.tx_manager.build_sell_transaction(
-                &signal.position.mint,
-                amount_token,
-                slippage_bps,
-                DexRouter::Jupiter,
-                true, // Close ATA
-            ).await?;
+        let sig = self.presigner.send_versioned_transaction(&sell_tx).await?;
+        info!("🚀 Standard SELL Confirmed! Sig: {}", sig);
+        crate::trade_logger::log_priority_fees(&signal.position.mint, self.config.priority_fee_lamports);
+        Ok(sig)
+    }
 
-            let recent_blockhash = self.presigner.get_blockhash();
-            let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
-
-            sell_tx.message.set_recent_blockhash(recent_blockhash);
-
-            // REMOVED Simulation Check for latency
-
-            self.presigner.sign_versioned_tx(&mut sell_tx)?;
-            self.presigner.sign_versioned_tx(&mut tip_tx)?;
-
-            let (id, sigs) = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
-            info!("🚀 Sell Bundle Sent! Jito IDs: {} | Main Tx: {}", id, sigs.get(0).map(|s| s.to_string()).unwrap_or_default());
-            log_bundle_sent(&id, 2);
-            
-            // Use the actual swap transaction signature as the identifier
-            sigs.get(0).map(|s| s.to_string()).unwrap_or(id)
-        };
+    /// Execute sell via Jito Bundle (Wait for confirmation)
+    async fn execute_sell_jito(&self, signal: &SellSignal) -> Result<String> {
+        let amount_token = signal.position.amount_token_raw;
+        let slippage_bps = self.config.auto_sell_slippage_bps;
+        let tip_lamports = self.tx_manager.calculate_tip(false);
         
-        Ok(identifier)
+        let mut sell_tx = self.tx_manager.build_sell_transaction(
+            &signal.position.mint,
+            amount_token,
+            slippage_bps,
+            DexRouter::Jupiter,
+            true, // Close ATA
+        ).await?;
+
+        let recent_blockhash = self.presigner.get_blockhash();
+        let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
+
+        sell_tx.message.set_recent_blockhash(recent_blockhash);
+
+        self.presigner.sign_versioned_tx(&mut sell_tx)?;
+        self.presigner.sign_versioned_tx(&mut tip_tx)?;
+
+        let (id, sigs) = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
+        info!("🚀 Sell Bundle Sent! Jito IDs: {} | Main Tx: {}", id, sigs.get(0).map(|s| s.to_string()).unwrap_or_default());
+        log_bundle_sent(&id, 2);
+        
+        let tx_sig = sigs.get(0).ok_or_else(|| anyhow::anyhow!("No signatures in bundle"))?.to_string();
+
+        // Wait for confirmation (Fixed "lying" logs)
+        let status = self.presigner.wait_for_bundle_confirmation(&id, 20, &sigs).await?;
+        if status.is_success() {
+            info!("✅ Jito SELL Confirmed! ID: {}", id);
+            Ok(tx_sig)
+        } else {
+            Err(anyhow::anyhow!("Jito bundle failed to land: {:?}", status))
+        }
     }
 
     /// Close all open positions (graceful shutdown)
