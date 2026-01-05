@@ -7,6 +7,7 @@ const MORALIS_BASE_URL: &str = "https://solana-gateway.moralis.io";
 const MORALIS_DEEP_INDEX_URL: &str = "https://deep-index.moralis.io/api/v2.2";
 
 /// Moralis API client for Solana wallet operations
+#[derive(Clone)]
 pub struct MoralisClient {
     client: Client,
     api_key: String,

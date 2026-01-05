@@ -214,31 +214,11 @@ pub async fn start(
     
     info!("🔍 Starting Token Enrichment Pipeline");
 
-    // Initialize SOL price cache
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    
-    // Initial price fetch
-    if let Err(e) = update_sol_price_cache(&client, config).await {
-        warn!("Failed to initialize SOL price cache: {}. Using default price.", e);
-    }
-
-    // Spawn background task to update SOL price every 30 seconds
-    let price_client = client.clone();
-    let price_config = config.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if let Err(e) = update_sol_price_cache(&price_client, &price_config).await {
-                warn!("Failed to update SOL price cache: {}", e);
-            }
-        }
-    });
-
     // Initialize Birdeye rate limiter (1 req/sec for free plan)
-    let birdeye_limiter = Arc::new(RateLimiter::new(1.0, "Birdeye"));
+    let birdeye_limiter = Arc::new(RateLimiter::new(config.birdeye_max_requests_per_second, "Birdeye"));
+    
+    // Initialize Moralis rate limiter
+    let moralis_limiter = Arc::new(RateLimiter::new(config.moralis_max_requests_per_second, "Moralis"));
     
     // Pending token queue for when Birdeye is rate-limited
     let pending_tokens: Arc<Mutex<VecDeque<PoolCreationEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -248,11 +228,16 @@ pub async fn start(
     
     // Spawn background task to process pending tokens
     let pending_clone = pending_tokens.clone();
-    let limiter_clone = birdeye_limiter.clone();
+    let birdeye_limiter_clone = birdeye_limiter.clone();
+    let moralis_limiter_clone = moralis_limiter.clone();
     let enriched_tx_clone = enriched_tx.clone();
     let config_clone = loop_config.clone();
     tokio::spawn(async move {
         let client = Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let moralis = crate::moralis_client::MoralisClient::new(
+            config_clone.moralis_api_key.clone(),
+            "mainnet".to_string(),
+        );
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
             interval.tick().await;
@@ -265,11 +250,10 @@ pub async fn start(
             
             if let Some(event) = pool_event {
                 // Try to acquire rate limit token (non-blocking)
-                if limiter_clone.try_acquire().await {
+                if birdeye_limiter_clone.try_acquire().await {
                     info!("📤 Processing pending token from queue: {}", event.token_mint);
-                    let start_time = std::time::Instant::now();
                     
-                    match enrich_token(&client, &config_clone, event.clone()).await {
+                    match enrich_token(&client, &config_clone, event.clone(), &birdeye_limiter_clone, &moralis_limiter_clone, &moralis).await {
                         Ok(enriched) => {
                             if let Err(e) = enriched_tx_clone.send(enriched).await {
                                 warn!("Failed to send enriched token from queue: {}", e);
@@ -290,7 +274,7 @@ pub async fn start(
 
     let loop_config_final = loop_config.clone();
     tokio::spawn(async move {
-        if let Err(e) = enrichment_loop(loop_config_final, classified_rx, enriched_tx, birdeye_limiter, pending_tokens).await {
+        if let Err(e) = enrichment_loop(loop_config_final, classified_rx, enriched_tx, birdeye_limiter, moralis_limiter, pending_tokens).await {
             error!("Enrichment pipeline error: {}", e);
         }
     });
@@ -303,11 +287,17 @@ async fn enrichment_loop(
     mut classified_rx: mpsc::Receiver<ClassifiedEvent>,
     enriched_tx: mpsc::Sender<EnrichedToken>,
     birdeye_limiter: Arc<RateLimiter>,
+    moralis_limiter: Arc<RateLimiter>,
     pending_tokens: Arc<Mutex<VecDeque<PoolCreationEvent>>>,
 ) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
+
+    let moralis = crate::moralis_client::MoralisClient::new(
+        config.moralis_api_key.clone(),
+        "mainnet".to_string(),
+    );
 
     // Deduplication: Track recently processed mints to avoid duplicates
     let mut seen_mints: HashMap<String, std::time::Instant> = HashMap::new();
@@ -342,99 +332,68 @@ async fn enrichment_loop(
                 // ====== RATE LIMIT CHECK ======
                 // Try to acquire Birdeye rate limit token (non-blocking)
                 if !birdeye_limiter.try_acquire().await {
-                    // Rate limited - add to pending queue
-                    let queue_size = {
-                        let mut queue = pending_tokens.lock();
-                        queue.push_back(pool_event.clone());
-                        queue.len()
-                    };
-                    warn!("⚠️ Birdeye rate limited - queued token {} (queue size: {})", pool_event.token_mint, queue_size);
-                    TradeLogger::log(&format!("📥 QUEUED: {} | Rate limited", &pool_event.token_mint[..12.min(pool_event.token_mint.len())]));
+                    let mut queue = pending_tokens.lock();
+                    queue.push_back(pool_event.clone());
+                    warn!("⚠️ Birdeye rate limited - queued token {} (queue size: {})", pool_event.token_mint, queue.len());
                     continue;
                 }
                 
-                // ====== GRADUATION DELAY ======
-                // Wait 2 seconds for pool liquidity to settle after graduation event
-                info!("⏳ Waiting 2s for pool to settle: {}", pool_event.pool_address);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                
-                // ====== RETRY LOGIC WITH BACKOFF ======
-                let max_retries: u8 = 3;
-                let mut attempt: u8 = 1;
-                let mut last_result: Result<EnrichedToken> = Err(anyhow::anyhow!("No attempts made"));
-                
-                while attempt <= max_retries {
-                    match enrich_token(&client, &config, pool_event.clone()).await {
-                        Ok(enriched) => {
-                            let liq = enriched.initial_liquidity_sol.unwrap_or(0.0);
-                            
-                            // Log debug info for every attempt
-                            log_enrichment_debug(
-                                &enriched.mint,
-                                &enriched.pool_address,
-                                liq,
-                                attempt
-                            );
-                            
-                            // Check if liquidity is valid
-                            if liq > 0.1 || attempt == max_retries {
-                                // Success or final attempt - proceed
-                                last_result = Ok(enriched);
-                                break;
-                            } else {
-                                // Zero liquidity - retry with backoff
-                                let msg = format!("⚠️ Zero liquidity on attempt {}/{}, retrying...", attempt, max_retries);
-                                warn!("{}", msg);
-                                TradeLogger::log(&format!("🔎 ENRICH_RETRY: {} | {}", pool_event.token_mint, msg));
-                                let backoff = Duration::from_secs(attempt as u64 * 2);
-                                tokio::time::sleep(backoff).await;
+                // Spawn the enrichment task
+                let client_clone = client.clone();
+                let config_clone = config.clone();
+                let tx_clone = enriched_tx.clone();
+                let b_limiter = birdeye_limiter.clone();
+                let m_limiter = moralis_limiter.clone();
+                let m_client = moralis.clone();
+
+                tokio::spawn(async move {
+                    let task_start = std::time::Instant::now();
+                    info!("🔍 Enrichment task started: {}", pool_event.token_mint);
+                    
+                    // Wait for liquidity settle
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+
+                    let max_retries: u8 = 3;
+                    let mut attempt: u8 = 1;
+                    let mut last_result: Result<EnrichedToken> = Err(anyhow::anyhow!("No attempts made"));
+
+                    while attempt <= max_retries {
+                        match enrich_token(&client_clone, &config_clone, pool_event.clone(), &b_limiter, &m_limiter, &m_client).await {
+                            Ok(enriched) => {
+                                let liq = enriched.initial_liquidity_sol.unwrap_or(0.0);
+                                log_enrichment_debug(&enriched.mint, &enriched.pool_address, liq, attempt);
+                                
+                                if liq > 0.1 || attempt == max_retries {
+                                    last_result = Ok(enriched);
+                                    break;
+                                } else {
+                                    warn!("⚠️ Zero liquidity on attempt {}/{}, retrying...", attempt, max_retries);
+                                    tokio::time::sleep(Duration::from_secs(attempt as u64 * 2)).await;
+                                    attempt += 1;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("⚠️ Enrichment failed on attempt {}/{}: {}", attempt, max_retries, e);
+                                last_result = Err(e);
+                                tokio::time::sleep(Duration::from_secs(attempt as u64 * 2)).await;
                                 attempt += 1;
                             }
                         }
+                    }
+
+                    match last_result {
+                        Ok(enriched) => {
+                            let duration = task_start.elapsed().as_millis();
+                            info!("✅ Enrichment success: {} ({}ms, {} attempts)", enriched.mint, duration, attempt);
+                            if tx_clone.send(enriched).await.is_err() {
+                                warn!("Failed to send enriched token (receiver dropped)");
+                            }
+                        }
                         Err(e) => {
-                            let msg = format!("⚠️ Enrichment attempt {}/{} failed: {}", attempt, max_retries, e);
-                            warn!("{}", msg);
-                            TradeLogger::log(&format!("🔎 ENRICH_RETRY: {} | {}", pool_event.token_mint, msg));
-                            last_result = Err(e);
-                            let backoff = Duration::from_secs(attempt as u64 * 2);
-                            tokio::time::sleep(backoff).await;
-                            attempt += 1;
+                            error!("❌ Enrichment failed for {}: {}", pool_event.token_mint, e);
                         }
                     }
-                }
-                
-                // Process final result
-                match last_result {
-                    Ok(enriched) => {
-                        let duration = start_time.elapsed().as_millis();
-                        info!("✅ Enrichment complete: {} (took {}ms, {} attempts)", enriched.mint, duration, attempt);
-    
-                        // Simplified logging - only show key fields
-                        info!("📊 Token: {} | Liq: {} SOL | Auth: freeze={}, mint={} | Platform: Graduated",
-                            enriched.mint,
-                            enriched.initial_liquidity_sol.unwrap_or(0.0),
-                            enriched.has_freeze_authority,
-                            enriched.has_mint_authority
-                        );
-                        
-                        TradeLogger::log(&format!(
-                            "✨ ENRICHMENT SUCCESS: {} | Liq: {:.2} SOL | Platform: {:?}",
-                            enriched.mint,
-                            enriched.initial_liquidity_sol.unwrap_or(0.0),
-                            enriched.platform
-                        ));
-                        
-                        if enriched_tx.send(enriched).await.is_err() {
-                            warn!("Failed to send enriched token (receiver dropped)");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to enrich token after {} attempts: {}", max_retries, e);
-                        TradeLogger::log(&format!("❌ ENRICHMENT FAILED: {} | Error: {} | Attempts: {}", pool_event.token_mint, e, max_retries));
-                        // Don't stop the pipeline - continue processing
-                    }
-                }
+                });
             }
         }
     }
@@ -442,12 +401,14 @@ async fn enrichment_loop(
     Ok(())
 }
 
-/// Main enrichment function - TIERED APPROACH
-/// Fast path for graduated tokens, full path for standard tokens
-async fn enrich_token(
-    client: &Client,
+/// Optimized enrichment for graduated tokens
+pub async fn enrich_token(
+    client: &reqwest::Client,
     config: &Config,
     pool_event: PoolCreationEvent,
+    birdeye_limiter: &RateLimiter,
+    moralis_limiter: &RateLimiter,
+    moralis: &crate::moralis_client::MoralisClient,
 ) -> Result<EnrichedToken> {
     let start_time = std::time::Instant::now();
     
@@ -465,15 +426,13 @@ async fn enrich_token(
         birdeye_overview,
         helius_holders_raw,
         metadata_data,
-        sol_price_data
+        token_price_sol
     ) = tokio::join!(
         fetch_birdeye_overview(client, &config.birdeye_api_key, &pool_event.token_mint),
         fetch_holder_analysis(client, &config.helius_api_key, &pool_event.token_mint),
         fetch_token_metadata(client, &config.helius_api_key, &pool_event.token_mint),
-        get_or_fetch_sol_price(client, config)
+        fetch_native_price(client, config, &pool_event.token_mint, birdeye_limiter, moralis_limiter, moralis)
     );
-
-    let sol_price = sol_price_data.unwrap_or(150.0);
 
     assemble_enriched_token(
         pool_event,
@@ -481,7 +440,7 @@ async fn enrich_token(
         birdeye_overview.ok(),
         helius_holders_raw.ok(),
         metadata_data.ok(),
-        sol_price,
+        token_price_sol.ok(), // This is now the token's price in SOL
         start_time,
     )
 }
@@ -494,7 +453,7 @@ fn assemble_enriched_token(
     birdeye_ov: Option<BirdeyeTokenOverview>,
     helius_holders: Option<RawHolderData>,
     metadata: Option<TokenMetadata>,
-    sol_price: f64,
+    token_price_sol: Option<f64>, // This is now the token's price in SOL
     start_time: std::time::Instant,
 ) -> Result<EnrichedToken> {
     // Extract decimals (CRITICAL)
@@ -520,16 +479,24 @@ fn assemble_enriched_token(
         .is_some();
 
     // 1. LIQUIDITY PRIORITIZATION
-    // 1. LIQUIDITY PRIORITIZATION
     let liquidity_usd = birdeye_ov.as_ref().and_then(|b| b.liquidity);
-    let initial_liquidity_sol = liquidity_usd.map(|usd| usd / sol_price);
+    // initial_liquidity_sol is now derived from liquidity_usd and token_price_sol
+    let initial_liquidity_sol = if let (Some(liq_usd), Some(price_usd), Some(price_sol)) = (liquidity_usd, birdeye_ov.as_ref().and_then(|b| b.price), token_price_sol) {
+        if price_usd > 0.0 {
+            Some(liq_usd / price_usd * price_sol)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // 2. PRICE PRIORITIZATION
     let price_usd = birdeye_ov.as_ref()
         .and_then(|b| b.price)
         .or_else(|| metadata.as_ref().and_then(|m| m.price));
     
-    let price_sol = price_usd.map(|p| p / sol_price);
+    let price_sol = token_price_sol; // This is the token's price in SOL
 
     // 3. MARKET CAP / FDV
     let market_cap = birdeye_ov.as_ref().and_then(|b| b.market_cap);
@@ -768,19 +735,6 @@ async fn fetch_mint_account_info(
     }
 }
 
-// SOL Price cache
-
-
-// SOL Price cache
-#[derive(Debug, Clone)]
-struct SolPriceCache {
-    price: f64,
-    timestamp: i64,
-}
-
-lazy_static! {
-    static ref SOL_PRICE_CACHE: Arc<Mutex<Option<SolPriceCache>>> = Arc::new(Mutex::new(None));
-}
 
 /// Fetch liquidity data from pool by querying token account balances
 
@@ -873,100 +827,74 @@ async fn fetch_token_metadata(
 // ========== HELPER FUNCTIONS ==========
 
 
+/// Fetch the token's native price (SOL/token) directly
+async fn fetch_native_price(
+    client: &Client,
+    config: &Config,
+    token_mint: &str,
+    birdeye_limiter: &RateLimiter,
+    moralis_limiter: &RateLimiter,
+    moralis: &crate::moralis_client::MoralisClient,
+) -> Result<f64> {
+    let api_key = config.birdeye_api_key.clone();
 
-
-/// Get cached SOL price or fetch new one if expired (async)
-async fn get_or_fetch_sol_price(client: &Client, config: &Config) -> Result<f64> {
-    const CACHE_TTL_SECONDS: i64 = 30;
-
-    let now = chrono::Utc::now().timestamp();
-    
-    // Check cache first
-    {
-        let cache = SOL_PRICE_CACHE.lock();
-        if let Some(cached) = cache.as_ref() {
-            if now - cached.timestamp < CACHE_TTL_SECONDS {
-                return Ok(cached.price);
+    match config.price_source_priority {
+        crate::config::PriceSourcePriority::MoralisFirst => {
+            // 1. Try Moralis (Primary)
+            moralis_limiter.acquire().await;
+            match moralis.get_token_price(token_mint).await {
+                Ok(price) => {
+                    info!("📈 Enrichment Price (Moralis): {} = {:.8} SOL", token_mint, price);
+                    Ok(price)
+                },
+                Err(e) => {
+                    warn!("⚠️ Enrichment: Moralis price fetch failed for {}: {}. Falling back to Birdeye...", token_mint, e);
+                    fetch_native_price_birdeye(client, &api_key, token_mint, birdeye_limiter).await
+                }
+            }
+        }
+        crate::config::PriceSourcePriority::BirdeyeFirst => {
+            // 1. Try Birdeye (Primary)
+            match fetch_native_price_birdeye(client, &api_key, token_mint, birdeye_limiter).await {
+                Ok(price) => {
+                    info!("📈 Enrichment Price (Birdeye): {} = {:.8} SOL", token_mint, price);
+                    Ok(price)
+                },
+                Err(e) => {
+                    warn!("⚠️ Enrichment: Birdeye price fetch failed for {}: {}. Falling back to Moralis...", token_mint, e);
+                    moralis_limiter.acquire().await;
+                    moralis.get_token_price(token_mint).await
+                }
             }
         }
     }
-
-    // Cache expired or empty, fetch new price
-    update_sol_price_cache(client, config).await
 }
 
-/// Fetch real-time SOL price from multiple sources with fallback
-pub async fn update_sol_price_cache(client: &Client, config: &Config) -> Result<f64> {
-    // Try multiple sources in order of preference
-    let price = match fetch_sol_price_jupiter_v6(client, &config.jupiter_api_key).await {
-        Ok(p) => p,
-        Err(_) => match fetch_sol_price_birdeye_with_key(client, &config.birdeye_api_key).await {
-            Ok(p) => p,
-            Err(_) => fetch_sol_price_coingecko(client).await.unwrap_or(150.0),
-        },
-    };
-
-    // Update cache
-    {
-        let mut cache = SOL_PRICE_CACHE.lock();
-        *cache = Some(SolPriceCache {
-            price,
-            timestamp: chrono::Utc::now().timestamp(),
-        });
-    }
-
-    info!("✅ Updated SOL price cache: ${:.2}", price);
-    Ok(price)
-}
-
-/// Fetch SOL price from Jupiter Price API v2 (Authenticated)
-async fn fetch_sol_price_jupiter_v6(client: &Client, api_key: &str) -> Result<f64> {
-    let url = "https://api.jup.ag/price/v2/full?ids=So11111111111111111111111111111111111111112";
+async fn fetch_native_price_birdeye(
+    client: &Client,
+    api_key: &str,
+    mint: &str,
+    limiter: &RateLimiter,
+) -> Result<f64> {
+    limiter.acquire().await;
+    let url = format!("https://public-api.birdeye.so/defi/price?address={}", mint);
     
-    let response = client
-        .get(url)
-        .header("x-api-key", api_key)
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-        .context("Jupiter V6 Price API request failed")?;
-
-    let json: serde_json::Value = response.json().await?;
-    
-    // Parse response: {"data": {"So11...": {"price": "..."}}}
-    let price_str = json
-        .get("data")
-        .and_then(|d| d.get("So11111111111111111111111111111111111111112"))
-        .and_then(|p| p.get("price"))
-        .and_then(|v| v.as_str())
-        .context("Failed to parse Jupiter v6 price")?;
-
-    let price: f64 = price_str.parse().context("Failed to parse price string as f64")?;
-    Ok(price)
-}
-
-/// Fetch SOL price from Birdeye API (Authenticated)
-async fn fetch_sol_price_birdeye_with_key(client: &Client, api_key: &str) -> Result<f64> {
-    let url = "https://public-api.birdeye.so/defi/price?address=So11111111111111111111111111111111111111112";
-    
-    let response = client
-        .get(url)
+    let resp = client.get(&url)
         .header("X-API-KEY", api_key)
         .header("x-chain", "solana")
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-        .context("Birdeye Price API request failed")?;
-
-    let json: serde_json::Value = response.json().await?;
+        .header("accept", "application/json")
+        .timeout(Duration::from_secs(5))
+        .send().await?;
+        
+    let json: serde_json::Value = resp.json().await?;
     
-    let price = json
-        .get("data")
-        .and_then(|d| d.get("value"))
-        .and_then(|p| p.as_f64())
-        .context("Failed to parse Birdeye price")?;
-
-    Ok(price)
+    if let Some(price_in_native) = json.get("data").and_then(|d| d.get("priceInNative")).and_then(|v| v.as_f64()) {
+        if price_in_native > 0.0 {
+            return Ok(price_in_native);
+        }
+    }
+    
+    Err(anyhow::anyhow!("Birdeye priceInNative not found for {}", mint))
 }
 
 /// Fetch detailed token overview from Birdeye (with retry)
@@ -1080,26 +1008,4 @@ async fn fetch_holder_analysis(
     Ok(RawHolderData {
         holders,
     })
-}
-
-/// Fetch SOL price from CoinGecko API (free tier, may be rate limited)
-async fn fetch_sol_price_coingecko(client: &Client) -> Result<f64> {
-    let url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
-    
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-        .context("CoinGecko API request failed")?;
-
-    let json: serde_json::Value = response.json().await?;
-    
-    let price = json
-        .get("solana")
-        .and_then(|s| s.get("usd"))
-        .and_then(|p| p.as_f64())
-        .context("Failed to parse CoinGecko price")?;
-
-    Ok(price)
 }

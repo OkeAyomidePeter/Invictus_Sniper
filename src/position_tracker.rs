@@ -484,7 +484,10 @@ async fn fetch_current_price(
             // 1. Try Moralis (Primary)
             moralis_limiter.acquire().await;
             match moralis.get_token_price(&mint).await {
-                Ok(price) => Ok(price),
+                Ok(price) => {
+                    info!("📈 Price update (Moralis): {} = {:.8} SOL", token_mint, price);
+                    Ok(price)
+                },
                 Err(e) => {
                     warn!("⚠️ Moralis price fetch failed for {}: {}. Falling back to Birdeye...", token_mint, e);
                     // 2. Try Birdeye (Fallback)
@@ -495,7 +498,10 @@ async fn fetch_current_price(
         crate::config::PriceSourcePriority::BirdeyeFirst => {
             // 1. Try Birdeye (Primary)
             match fetch_price_from_birdeye(client, &api_key, &mint, birdeye_limiter).await {
-                Ok(price) => Ok(price),
+                Ok(price) => {
+                    info!("📈 Price update (Birdeye): {} = {:.8} SOL", token_mint, price);
+                    Ok(price)
+                },
                 Err(e) => {
                     warn!("⚠️ Birdeye price fetch failed for {}: {}. Falling back to Moralis...", token_mint, e);
                     // 2. Try Moralis (Fallback)
