@@ -172,7 +172,7 @@ impl Config {
                 .parse()
                 .expect("MAX_TRADE_SIZE_SOL must be a valid number"),
             max_daily_exposure_sol: env::var("MAX_DAILY_EXPOSURE_SOL")
-                .unwrap_or("10.0".to_string())
+                .unwrap_or("1.0".to_string())
                 .parse()
                 .expect("MAX_DAILY_EXPOSURE_SOL must be a valid number"),
             max_creator_ownership_percentage: env::var("MAX_CREATOR_OWNERSHIP_PERCENTAGE")
@@ -410,11 +410,11 @@ impl Config {
                 .parse()
                 .expect("PRICE_STABILITY_MAX_DROP_PCT must be a valid number"),
             volatility_max_5m_pct: env::var("VOLATILITY_MAX_5M_PCT")
-                .unwrap_or("30.0".to_string())
+                .unwrap_or("200.0".to_string())
                 .parse()
                 .expect("VOLATILITY_MAX_5M_PCT must be a valid number"),
             max_top_10_pct: env::var("MAX_TOP_10_PCT")
-                .unwrap_or("40.0".to_string())
+                .unwrap_or("50.0".to_string())
                 .parse()
                 .expect("MAX_TOP_10_PCT must be a valid number"),
         }
