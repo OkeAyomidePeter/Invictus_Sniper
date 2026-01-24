@@ -1,0 +1,20 @@
+[Unit]
+Description=Invictus Sniper Bot Service
+After=network.target
+
+[Service]
+Type=simple
+# Load environment variables from .env (absolute path)
+EnvironmentFile=/home/ubuntu/Invictus_Sniper/.env
+# Working directory – set to project root so invictus.log is created here
+WorkingDirectory=/home/ubuntu/Invictus_Sniper
+# Executable (absolute path)
+ExecStart=/home/ubuntu/Invictus_Sniper/target/release/invictus
+# Restart on failure / after reboot
+Restart=always
+RestartSec=5
+# Increase file descriptor limit (optional)
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
