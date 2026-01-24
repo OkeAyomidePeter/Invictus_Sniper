@@ -298,6 +298,10 @@ impl PositionTracker {
                                 position.mint, pnl_pct, partial_exit_threshold, config.partial_exit_amount_pct);
                             
                             position.partial_exit_executed = true;
+                            
+                            // Scale the local tracker's amount
+                            let sold_amount = (position.amount_token_raw as f64 * (config.partial_exit_amount_pct / 100.0)) as u64;
+                            position.amount_token_raw = position.amount_token_raw.saturating_sub(sold_amount);
                             position.remaining_amount_pct = 100.0 - config.partial_exit_amount_pct;
                             
                             // Persist partial exit state to database
@@ -322,8 +326,8 @@ impl PositionTracker {
                             }
                             
                             // Continue monitoring remaining position
-                            info!("📊 Continuing to monitor {:.0}% of position for {}", 
-                                position.remaining_amount_pct, position.mint);
+                            info!("📊 Continuing to monitor {:.0}% ({} tokens) for {}", 
+                                position.remaining_amount_pct, position.amount_token_raw, position.mint);
                             continue;
                         }
 

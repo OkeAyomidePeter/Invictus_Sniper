@@ -299,14 +299,38 @@ impl TradeEngine {
     /// Execute a sell transaction
     /// Execute a sell transaction with confirmation wait and optional fallback
     async fn execute_sell(&self, signal: &SellSignal) -> Result<String> {
-        info!("🤖 TradeEngine: Initiating SELL for {} (Trigger: {})", signal.position.mint, signal.trigger);
+        // 1. Calculate Amount to Sell
+        let total_amount = signal.position.amount_token_raw;
+        let mut amount_to_sell = total_amount;
+        let mut is_full_exit = true;
+
+        if let SellTrigger::PartialProfit(_) = signal.trigger {
+            amount_to_sell = (total_amount as f64 * (self.config.partial_exit_amount_pct / 100.0)) as u64;
+            // Prevent selling 0 due to rounding
+            if amount_to_sell == 0 && total_amount > 0 {
+                amount_to_sell = total_amount;
+            }
+            if amount_to_sell < total_amount {
+                is_full_exit = false;
+            }
+        }
+
+        // 2. Dynamic Slippage for Emergency Exits
+        let mut slippage_bps = self.config.auto_sell_slippage_bps;
+        if matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::Timeout | SellTrigger::ExtendedTimeout(_)) {
+            slippage_bps *= 2; // Double slippage to 10% (from 500 bps default)
+            warn!("⚠️ EMERGENCY EXIT: {} slippage boosted to {} bps for {}", signal.position.mint, slippage_bps, signal.trigger);
+        }
+
+        info!("🤖 TradeEngine: Initiating SELL for {} (Trigger: {}) | Amount: {} | Slippage: {} bps", 
+            signal.position.mint, signal.trigger, amount_to_sell, slippage_bps);
 
         let mode = self.config.sell_transaction_mode;
         
-        // 1. Try Primary Mode
+        // 3. Try Primary Mode
         let res = match mode {
-            crate::config::TransactionMode::Standard => self.execute_sell_standard(signal).await,
-            crate::config::TransactionMode::Jito => self.execute_sell_jito(signal).await,
+            crate::config::TransactionMode::Standard => self.execute_sell_standard(signal, amount_to_sell, slippage_bps, is_full_exit).await,
+            crate::config::TransactionMode::Jito => self.execute_sell_jito(signal, amount_to_sell, slippage_bps, is_full_exit).await,
         };
 
         // 2. Automatic Fallback if enabled and primary failed
@@ -315,7 +339,7 @@ impl TradeEngine {
             Err(e) => {
                 if self.config.sell_fallback_enabled && mode == crate::config::TransactionMode::Jito {
                     warn!("⚠️ Jito SELL failed: {}. Falling back to Standard transaction...", e);
-                    self.execute_sell_standard(signal).await
+                    self.execute_sell_standard(signal, amount_to_sell, slippage_bps, is_full_exit).await
                 } else {
                     Err(e)
                 }
@@ -324,16 +348,13 @@ impl TradeEngine {
     }
 
     /// Execute sell via Standard Transaction (Confirmed)
-    async fn execute_sell_standard(&self, signal: &SellSignal) -> Result<String> {
-        let amount_token = signal.position.amount_token_raw;
-        let slippage_bps = self.config.auto_sell_slippage_bps;
-
+    async fn execute_sell_standard(&self, signal: &SellSignal, amount_token: u64, slippage_bps: u16, close_ata: bool) -> Result<String> {
         let mut sell_tx = self.tx_manager.build_sell_transaction(
             &signal.position.mint,
             amount_token,
             slippage_bps,
             DexRouter::Jupiter,
-            true, // Close ATA
+            close_ata,
         ).await?;
 
         self.presigner.sign_versioned_tx(&mut sell_tx)?;
@@ -345,9 +366,7 @@ impl TradeEngine {
     }
 
     /// Execute sell via Jito Bundle (Wait for confirmation)
-    async fn execute_sell_jito(&self, signal: &SellSignal) -> Result<String> {
-        let amount_token = signal.position.amount_token_raw;
-        let slippage_bps = self.config.auto_sell_slippage_bps;
+    async fn execute_sell_jito(&self, signal: &SellSignal, amount_token: u64, slippage_bps: u16, close_ata: bool) -> Result<String> {
         let tip_lamports = self.tx_manager.calculate_tip(false);
         
         let mut sell_tx = self.tx_manager.build_sell_transaction(
@@ -355,7 +374,7 @@ impl TradeEngine {
             amount_token,
             slippage_bps,
             DexRouter::Jupiter,
-            true, // Close ATA
+            close_ata,
         ).await?;
 
         let recent_blockhash = self.presigner.get_blockhash();
@@ -581,14 +600,22 @@ impl TradeEngine {
                 }
                 
                 
-                // Only stop monitoring if the sell was successfully sent
-                if sell_success && matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout | SellTrigger::ExtendedTimeout(_)) {
-                    info!("✅ Trade lifecycle complete for {}. Stopping monitoring.", signal.position.mint);
-                    trade_engine.position_tracker.remove_position(&signal.position.mint).await;
-                    break; // Stop monitoring after full exit
-                } else if !sell_success {
-                    warn!("🔄 Sell failed for {}. Continuing to monitor/retry...", signal.position.mint);
-                }
+                        // Update state after success
+                        if sell_success {
+                            if matches!(signal.trigger, SellTrigger::PartialProfit(_)) {
+                                let sold_amount = (signal.position.amount_token_raw as f64 * (trade_engine.config.partial_exit_amount_pct / 100.0)) as u64;
+                                let remaining = signal.position.amount_token_raw.saturating_sub(sold_amount);
+                                info!("💵 PARTIAL EXIT SUCCESS: Updating tracking balance for {} to {} tokens", signal.position.mint, remaining);
+                                trade_engine.position_tracker.update_position_amount(&signal.position.mint, remaining).await;
+                            } else {
+                                // Full Exit
+                                info!("✅ Trade lifecycle complete for {}. Stopping monitoring.", signal.position.mint);
+                                trade_engine.position_tracker.remove_position(&signal.position.mint).await;
+                                break; 
+                            }
+                        } else {
+                            warn!("🔄 Sell failed for {}. Continuing to monitor/retry...", signal.position.mint);
+                        }
             }
         });
     }
