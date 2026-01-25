@@ -162,6 +162,7 @@ pub struct TransactionManager {
     min_tip_lamports: u64,
     max_tip_lamports: u64,
     dynamic_tips_enabled: bool,
+    helius_api_key: String,
 }
 
 impl TransactionManager {
@@ -192,6 +193,7 @@ impl TransactionManager {
             min_tip_lamports: config.jito_min_tip_lamports,
             max_tip_lamports: config.jito_max_tip_lamports,
             dynamic_tips_enabled: config.jito_dynamic_tips_enabled,
+            helius_api_key: config.helius_api_key.clone(),
         }
     }
 
@@ -424,6 +426,147 @@ impl TransactionManager {
         let effective_tip = tip.clamp(self.min_tip_lamports.max(hard_min), self.max_tip_lamports);
         
         effective_tip
+    }
+
+    /// Send a transaction to Atlas (Helius High-Reliability Sender)
+    pub async fn send_atlas_transaction(&self, tx: &VersionedTransaction) -> Result<String> {
+        let serialized = bincode::serialize(tx)?;
+        let base64_tx = BASE64_STANDARD.encode(serialized);
+        
+        let url = format!("https://mainnet.helius-rpc.com/?api-key={}", self.helius_api_key);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                base64_tx,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": true
+                }
+            ]
+        });
+
+        let resp: serde_json::Value = self.client.post(&url)
+            .json(&request)
+            .send().await?
+            .json().await?;
+
+        if let Some(err) = resp.get("error") {
+            return Err(anyhow::anyhow!("Atlas error: {}", err));
+        }
+
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("No result in Atlas response"))
+    }
+
+    /// Parallel Broadcast: Send signed tx to Jito + Atlas + Multiple RPCs
+    /// Waits for first successful response or returns error if all fail
+    pub async fn parallel_broadcast(
+        &self, 
+        presigner: Arc<Presigner>, 
+        tx: VersionedTransaction, 
+        is_jito: bool,
+        skip_preflight: bool,
+    ) -> Result<String> {
+        let sig = tx.signatures.get(0).ok_or_else(|| anyhow::anyhow!("No signature on tx"))?.to_string();
+        
+        let mut tasks = Vec::new();
+
+        // 1. Path: Helius Atlas (High Reliability)
+        let atlas_client = self.clone();
+        let atlas_tx = tx.clone();
+        let atlas_task = tokio::spawn(async move {
+            match atlas_client.send_atlas_transaction(&atlas_tx).await {
+                Ok(sig) => {
+                    info!("✅ Atlas path succeeded: {}", &sig[..12]);
+                    Ok(("Atlas", sig))
+                }
+                Err(e) => {
+                    warn!("⚠️ Atlas path failed: {}", e);
+                    Err(e)
+                }
+            }
+        });
+        tasks.push(atlas_task);
+
+        // 2. Path: Standard RPC (Native Solana)
+        let rpc_presigner = presigner.clone();
+        let rpc_tx = tx.clone();
+        let rpc_task = tokio::spawn(async move {
+            match rpc_presigner.send_versioned_transaction_with_config(&rpc_tx, skip_preflight).await {
+                Ok(sig) => {
+                    info!("✅ RPC path succeeded: {}", &sig[..12]);
+                    Ok(("RPC", sig))
+                }
+                Err(e) => {
+                    warn!("⚠️ RPC path failed: {}", e);
+                    Err(e)
+                }
+            }
+        });
+        tasks.push(rpc_task);
+
+        // 3. Path: Jito Bundle (Targeted MEV)
+        if is_jito {
+            let jito_presigner = presigner.clone();
+            let jito_tx = tx.clone();
+            let tip_lamports = self.calculate_tip(false);
+            let recent_blockhash = jito_presigner.get_blockhash();
+            let mut tip_tx = self.build_tip_transaction(tip_lamports, recent_blockhash)?;
+            
+            let jito_task = tokio::spawn(async move {
+                match (|| async {
+                    jito_presigner.sign_versioned_tx(&mut tip_tx)?;
+                    let (id, _) = jito_presigner.send_jito_bundle(vec![jito_tx, tip_tx]).await?;
+                    Ok::<String, anyhow::Error>(id)
+                })().await {
+                    Ok(bundle_id) => {
+                        info!("✅ Jito path succeeded: {}", &bundle_id[..12]);
+                        Ok(("Jito", bundle_id))
+                    }
+                    Err(e) => {
+                        warn!("⚠️ Jito path failed: {}", e);
+                        Err(e)
+                    }
+                }
+            });
+            tasks.push(jito_task);
+        }
+
+        info!("🚀 Parallel Broadcast started for {} (Paths: {})", &sig[..12], tasks.len());
+        
+        // Race all tasks - return first success or aggregate errors
+        let mut errors = Vec::new();
+        
+        while !tasks.is_empty() {
+            let (result, _index, remaining) = futures::future::select_all(tasks).await;
+            tasks = remaining;
+            
+            match result {
+                Ok(Ok((path, returned_sig))) => {
+                    info!("🎯 First success via {} path: {}", path, &returned_sig[..12]);
+                    // Cancel remaining tasks by dropping them
+                    return Ok(sig);
+                }
+                Ok(Err(e)) => {
+                    errors.push(e);
+                }
+                Err(e) => {
+                    errors.push(anyhow::anyhow!("Task panicked: {}", e));
+                }
+            }
+        }
+        
+        // All paths failed
+        error!("❌ All broadcast paths failed for {}", &sig[..12]);
+        Err(anyhow::anyhow!(
+            "All {} broadcast paths failed. Errors: {:?}", 
+            errors.len(), 
+            errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        ))
     }
 
     pub fn transaction_mode(&self) -> crate::config::TransactionMode {

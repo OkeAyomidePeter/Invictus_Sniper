@@ -235,13 +235,19 @@ impl Presigner {
         Ok(sig.to_string())
     }
 
-    /// Send a VersionedTransaction immediately
-    pub async fn send_versioned_transaction(&self, tx: &VersionedTransaction) -> Result<String> {
+    /// Send a VersionedTransaction with custom config
+    pub async fn send_versioned_transaction_with_config(&self, tx: &VersionedTransaction, skip_preflight: bool) -> Result<String> {
         let rpc = self.rpc_client.clone();
         let tx_clone = tx.clone();
         
         let res = tokio::task::spawn_blocking(move || {
-            rpc.send_and_confirm_transaction(&tx_clone)
+            use solana_client::rpc_config::{RpcSendTransactionConfig};
+            let config = RpcSendTransactionConfig {
+                skip_preflight,
+                preflight_commitment: Some(solana_sdk::commitment_config::CommitmentLevel::Confirmed),
+                ..Default::default()
+            };
+            rpc.send_transaction_with_config(&tx_clone, config)
         }).await;
 
         match res {
@@ -267,6 +273,11 @@ impl Presigner {
             }
             Err(e) => Err(anyhow::anyhow!("RPC task panicked: {}", e)),
         }
+    }
+
+    /// Send a VersionedTransaction immediately (legacy shim)
+    pub async fn send_versioned_transaction(&self, tx: &VersionedTransaction) -> Result<String> {
+        self.send_versioned_transaction_with_config(tx, false).await
     }
 
     /// Extract program logs from a Solana RPC client error

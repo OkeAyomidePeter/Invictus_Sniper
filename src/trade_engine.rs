@@ -306,100 +306,45 @@ impl TradeEngine {
 
         if let SellTrigger::PartialProfit(_) = signal.trigger {
             amount_to_sell = (total_amount as f64 * (self.config.partial_exit_amount_pct / 100.0)) as u64;
-            // Prevent selling 0 due to rounding
-            if amount_to_sell == 0 && total_amount > 0 {
-                amount_to_sell = total_amount;
-            }
-            if amount_to_sell < total_amount {
-                is_full_exit = false;
-            }
+            if amount_to_sell == 0 && total_amount > 0 { amount_to_sell = total_amount; }
+            if amount_to_sell < total_amount { is_full_exit = false; }
         }
 
-        // 2. Dynamic Slippage for Emergency Exits
+        // 2. Dynamic Slippage & Preflight Config
         let mut slippage_bps = self.config.auto_sell_slippage_bps;
+        let mut skip_preflight = false;
+
         if matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::Timeout | SellTrigger::ExtendedTimeout(_)) {
-            slippage_bps *= 2; // Double slippage to 10% (from 500 bps default)
-            warn!("⚠️ EMERGENCY EXIT: {} slippage boosted to {} bps for {}", signal.position.mint, slippage_bps, signal.trigger);
+            slippage_bps *= 2; 
+            skip_preflight = true; // Bypass simulation for emergency exits
+            warn!("⚠️ EMERGENCY EXIT: {} slippage boosted to {} bps | Preflight bypassed", signal.position.mint, slippage_bps);
         }
 
-        info!("🤖 TradeEngine: Initiating SELL for {} (Trigger: {}) | Amount: {} | Slippage: {} bps", 
+        info!("🤖 TradeEngine: Initiating MULTI-PATH SELL for {} (Trigger: {}) | Amount: {} | Slippage: {} bps", 
             signal.position.mint, signal.trigger, amount_to_sell, slippage_bps);
 
-        let mode = self.config.sell_transaction_mode;
-        
-        // 3. Try Primary Mode
-        let res = match mode {
-            crate::config::TransactionMode::Standard => self.execute_sell_standard(signal, amount_to_sell, slippage_bps, is_full_exit).await,
-            crate::config::TransactionMode::Jito => self.execute_sell_jito(signal, amount_to_sell, slippage_bps, is_full_exit).await,
-        };
-
-        // 2. Automatic Fallback if enabled and primary failed
-        match res {
-            Ok(sig) => Ok(sig),
-            Err(e) => {
-                if self.config.sell_fallback_enabled && mode == crate::config::TransactionMode::Jito {
-                    warn!("⚠️ Jito SELL failed: {}. Falling back to Standard transaction...", e);
-                    self.execute_sell_standard(signal, amount_to_sell, slippage_bps, is_full_exit).await
-                } else {
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    /// Execute sell via Standard Transaction (Confirmed)
-    async fn execute_sell_standard(&self, signal: &SellSignal, amount_token: u64, slippage_bps: u16, close_ata: bool) -> Result<String> {
+        // 3. Build Transaction
         let mut sell_tx = self.tx_manager.build_sell_transaction(
             &signal.position.mint,
-            amount_token,
+            amount_to_sell,
             slippage_bps,
             DexRouter::Jupiter,
-            close_ata,
+            is_full_exit,
         ).await?;
 
+        // 4. Sign Once
         self.presigner.sign_versioned_tx(&mut sell_tx)?;
 
-        let sig = self.presigner.send_versioned_transaction(&sell_tx).await?;
-        info!("🚀 Standard SELL Confirmed! Sig: {}", sig);
-        crate::trade_logger::log_priority_fees(&signal.position.mint, self.config.priority_fee_lamports);
-        Ok(sig)
+        // 5. Parallel Broadcast (Shotgun)
+        let is_jito = self.config.sell_transaction_mode == crate::config::TransactionMode::Jito;
+        self.tx_manager.parallel_broadcast(
+            self.presigner.clone(), 
+            sell_tx, 
+            is_jito, 
+            skip_preflight
+        ).await
     }
 
-    /// Execute sell via Jito Bundle (Wait for confirmation)
-    async fn execute_sell_jito(&self, signal: &SellSignal, amount_token: u64, slippage_bps: u16, close_ata: bool) -> Result<String> {
-        let tip_lamports = self.tx_manager.calculate_tip(false);
-        
-        let mut sell_tx = self.tx_manager.build_sell_transaction(
-            &signal.position.mint,
-            amount_token,
-            slippage_bps,
-            DexRouter::Jupiter,
-            close_ata,
-        ).await?;
-
-        let recent_blockhash = self.presigner.get_blockhash();
-        let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
-
-        sell_tx.message.set_recent_blockhash(recent_blockhash);
-
-        self.presigner.sign_versioned_tx(&mut sell_tx)?;
-        self.presigner.sign_versioned_tx(&mut tip_tx)?;
-
-        let (id, sigs) = self.presigner.send_jito_bundle(vec![sell_tx, tip_tx]).await?;
-        info!("🚀 Sell Bundle Sent! Jito IDs: {} | Main Tx: {}", id, sigs.get(0).map(|s| s.to_string()).unwrap_or_default());
-        log_bundle_sent(&id, 2);
-        
-        let tx_sig = sigs.get(0).ok_or_else(|| anyhow::anyhow!("No signatures in bundle"))?.to_string();
-
-        // Wait for confirmation (Fixed "lying" logs)
-        let status = self.presigner.wait_for_bundle_confirmation(&id, 20, &sigs).await?;
-        if status.is_success() {
-            info!("✅ Jito SELL Confirmed! ID: {}", id);
-            Ok(tx_sig)
-        } else {
-            Err(anyhow::anyhow!("Jito bundle failed to land: {:?}", status))
-        }
-    }
 
     /// Close all open positions (graceful shutdown)
     /// Returns a list of (mint, Result<bundle_id>) for each attempted sell
