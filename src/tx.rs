@@ -540,33 +540,56 @@ impl TransactionManager {
         
         // Race all tasks - return first success or aggregate errors
         let mut errors = Vec::new();
+        let mut signature_received = false;
         
+        // Phase 1: Wait for any path to return a signature (acceptance)
         while !tasks.is_empty() {
             let (result, _index, remaining) = futures::future::select_all(tasks).await;
             tasks = remaining;
             
             match result {
                 Ok(Ok((path, returned_sig))) => {
-                    info!("🎯 First success via {} path: {}", path, &returned_sig[..12]);
-                    // Cancel remaining tasks by dropping them
-                    return Ok(sig);
+                    info!("📡 Signature accepted via {} path: {}", path, &returned_sig[..12]);
+                    signature_received = true;
+                    // We have the signature! Now we must wait for confirmation (on-chain finality)
+                    break;
                 }
-                Ok(Err(e)) => {
-                    errors.push(e);
-                }
-                Err(e) => {
-                    errors.push(anyhow::anyhow!("Task panicked: {}", e));
-                }
+                Ok(Err(e)) => errors.push(e),
+                Err(e) => errors.push(anyhow::anyhow!("Task panicked: {}", e)),
             }
         }
         
-        // All paths failed
-        error!("❌ All broadcast paths failed for {}", &sig[..12]);
-        Err(anyhow::anyhow!(
-            "All {} broadcast paths failed. Errors: {:?}", 
-            errors.len(), 
-            errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
-        ))
+        if !signature_received {
+            error!("❌ All broadcast paths rejected the transaction for {}", &sig[..12]);
+            return Err(anyhow::anyhow!(
+                "All broadcast paths failed. Errors: {:?}", 
+                errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+            ));
+        }
+
+        // Phase 2: Wait for Confirmation (Landing)
+        // This is critical for reliability. If we return Ok too early, the monitoring loop stops.
+        info!("⏳ Waiting for landing confirmation: {}...", &sig[..12]);
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+        let mut confirmed = false;
+
+        while start.elapsed() < timeout {
+            // Check signature status on-chain
+            if let Ok(true) = presigner.check_signature_success(&sig).await {
+                confirmed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+
+        if confirmed {
+            info!("🎯 Transaction CONFIRMED on-chain: {}", &sig[..12]);
+            Ok(sig)
+        } else {
+            warn!("⏰ Broadcast accepted but failed to land on-chain within 30s: {}", &sig[..12]);
+            Err(anyhow::anyhow!("Transaction timed out after broadcast: it might land later, but we will retry for safety."))
+        }
     }
 
     pub fn transaction_mode(&self) -> crate::config::TransactionMode {

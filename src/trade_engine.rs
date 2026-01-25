@@ -85,71 +85,30 @@ impl TradeEngine {
             }
         };
 
-        // STEP 3: Sign & Send (Standard vs Jito)
-        let mode = self.tx_manager.transaction_mode();
-        let identifier = if mode == crate::config::TransactionMode::Standard {
-            // STEP 3a: Sign and Send Standard Transaction
-            let start_step = Instant::now();
-            
-            // REMOVED Simulation Check for latency
-            
-            // Sign the transaction first
-            self.presigner.sign_versioned_tx(&mut buy_tx)?;
-            
-            let sig = match self.presigner.send_versioned_transaction(&buy_tx).await {
-                Ok(s) => {
-                    log_pipeline_step(&token.mint, "Send Standard Tx", start_step.elapsed().as_millis(), true);
-                    crate::trade_logger::log_priority_fees(&token.mint, self.config.priority_fee_lamports);
-                    s
-                },
-                Err(e) => {
-                    log_pipeline_step(&token.mint, "Send Standard Tx", start_step.elapsed().as_millis(), false);
-                    log_error_detailed(&token.mint, "Send Standard Tx", &e.to_string());
-                    return Err(e);
-                }
-            };
-            info!("🚀 Standard BUY Sent! Sig: {}", sig);
-            sig
-        } else {
-            // STEP 3b: Send Jito Bundle
-            let tip_lamports = self.tx_manager.calculate_tip(true);
-            let recent_blockhash = self.presigner.get_blockhash();
-            
-            // Build Tip Transaction (Jito Only)
-            let mut tip_tx = self.tx_manager.build_tip_transaction(tip_lamports, recent_blockhash)?;
-            buy_tx.message.set_recent_blockhash(recent_blockhash);
-            
-            // REMOVED Simulation Check for latency
-
-            self.presigner.sign_versioned_tx(&mut buy_tx)?;
-            self.presigner.sign_versioned_tx(&mut tip_tx)?;
-
-            let start_step = Instant::now();
-            let (bundle_id, bundle_sigs) = match self.presigner.send_jito_bundle(vec![buy_tx, tip_tx]).await {
-                Ok(res) => {
-                    log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), true);
-                    res
-                },
-                Err(e) => {
-                    log_pipeline_step(&token.mint, "Send Bundle", start_step.elapsed().as_millis(), false);
-                    log_error_detailed(&token.mint, "Send Bundle", &e.to_string());
-                    return Err(e);
-                }
-            };
-            
-            info!("🚀 Buy Bundle Sent! Jito IDs: {} | Main Tx: {}", bundle_id, bundle_sigs.get(0).map(|s| s.to_string()).unwrap_or_default());
-            log_bundle_sent(&bundle_id, 2);
-
-            // Wait for confirmation (Jito Only)
-            let start_confirm = Instant::now();
-            let status = self.presigner.wait_for_bundle_confirmation(&bundle_id, 30, &bundle_sigs).await?;
-            if !status.is_success() {
-                 return Err(anyhow::anyhow!("Bundle failed to confirm: {:?}", status));
+        // STEP 3: Sign and Parallel Broadcast
+        let start_step = Instant::now();
+        
+        // Sign once
+        self.presigner.sign_versioned_tx(&mut buy_tx)?;
+        
+        // Use parallel broadcast for maximum reliability
+        let is_jito = self.tx_manager.transaction_mode() == crate::config::TransactionMode::Jito;
+        let identifier = match self.tx_manager.parallel_broadcast(
+            self.presigner.clone(),
+            buy_tx,
+            is_jito,
+            false, // Don't skip preflight for buys (we want simulation to catch issues)
+        ).await {
+            Ok(sig) => {
+                log_pipeline_step(&token.mint, "Parallel Broadcast", start_step.elapsed().as_millis(), true);
+                info!("🚀 BUY Broadcast Complete! Sig: {}", &sig[..12]);
+                sig
+            },
+            Err(e) => {
+                log_pipeline_step(&token.mint, "Parallel Broadcast", start_step.elapsed().as_millis(), false);
+                log_error_detailed(&token.mint, "Parallel Broadcast", &e.to_string());
+                return Err(e);
             }
-            log_pipeline_step(&token.mint, "Confirm Bundle", start_confirm.elapsed().as_millis(), true);
-            
-            // Use the actual swap transaction signature as the identifier (NOT the bundle_id)
-            bundle_sigs.get(0).map(|s| s.to_string()).unwrap_or(bundle_id)
         };
 
         // STEP 7: Start Optimistic Monitoring (ASAP!)
@@ -451,116 +410,110 @@ impl TradeEngine {
 
         // Spawn a task to handle sell signals
         tokio::spawn(async move {
-            while let Some(signal) = rx.recv().await {
+            while let Some(mut signal) = rx.recv().await {
                 info!("🚨 SELL SIGNAL for {}: {} (P/L: {:.2}%)", signal.position.mint, signal.trigger, signal.pnl_percentage);
                 
                 let mut sell_success = false;
-                
-                // Execute Sell
-                match trade_engine.execute_sell(&signal).await {
-                    Ok(bundle_id) => {
-                         sell_success = true;
-                         // Calculate P/L in SOL (Cleaned units)
-                        let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
-                        let pnl_sol = token_amount_whole * signal.current_price_sol_per_token
-                            - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0);
+                let mut last_error = String::new();
 
-                        // Record exit in DB
-                        if let Err(e) = trade_engine.db.update_trade_exit(
-                            &signal.position.mint,
-                            signal.current_price_sol_per_token,
-                            pnl_sol,
-                            &signal.trigger.to_string(),
-                            &bundle_id.clone()
-                        ).await {
-                            error!("Failed to record trade exit: {}", e);
-                        }
-
-                        // NEW: Record Post-Trade Analytics for AI training
-                        let analytics = crate::db::TradeAnalytics {
-                            mint: signal.position.mint.clone(),
-                            entry_price: signal.position.entry_price_sol_per_token,
-                            exit_price: signal.current_price_sol_per_token,
-                            pnl_sol,
-                            pnl_pct: signal.pnl_percentage,
-                            liquidity_usd: signal.position.liquidity_usd,
-                            top_10_pct: signal.position.top_10_pct,
-                            holder_count: signal.position.holder_count,
-                            socials: signal.position.socials,
-                        };
+                // 🔄 Immediate Retry Loop (3 attempts)
+                for attempt in 1..=3 {
+                    if attempt > 1 {
+                        warn!("🔁 RETRYING SELL (Attempt {}/3) for {} after error: {}", attempt, signal.position.mint, last_error);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         
-                        let db_for_analytics = trade_engine.db.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = db_for_analytics.record_trade_analytics(&analytics).await {
-                                error!("Failed to record trade analytics for {}: {}", analytics.mint, e);
+                        // Optional: Refresh signal/price here if tracker allows, 
+                        // but parallel_broadcast will get a fresh quote anyway.
+                    }
+
+                    match trade_engine.execute_sell(&signal).await {
+                        Ok(bundle_id) => {
+                            sell_success = true;
+                            // Calculate P/L in SOL (Cleaned units)
+                            let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
+                            let pnl_sol = token_amount_whole * signal.current_price_sol_per_token
+                                - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0);
+
+                            // Record exit in DB
+                            if let Err(e) = trade_engine.db.update_trade_exit(
+                                &signal.position.mint,
+                                signal.current_price_sol_per_token,
+                                pnl_sol,
+                                &signal.trigger.to_string(),
+                                &bundle_id.clone()
+                            ).await {
+                                error!("Failed to record trade exit: {}", e);
                             }
-                        });
-                        
-                        // Update Circuit Breaker logic
-                        if signal.pnl_percentage < 0.0 {
-                            let val = trade_engine.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
-                            warn!("📉 TRADING-WIDE: Consecutive loss count: {}", val);
-                        } else if signal.pnl_percentage > 5.0 { // Significant win
-                            trade_engine.consecutive_losses.store(0, Ordering::SeqCst);
-                            info!("✅ TRADING-WIDE: Consecutive losses reset to 0");
-                        }
 
-                        // Log successful sell
-                        log_sell(
-                            &signal.position.mint, 
-                            pnl_sol, 
-                            signal.pnl_percentage, 
-                            &signal.trigger.to_string(), 
-                            &bundle_id
-                        );
-
-                        // Send Telegram Notification
-                        if let Some(tele) = &trade_engine.tele {
-                            let tele = tele.clone();
-                            let mint = signal.position.mint.clone();
-                            let trigger = signal.trigger.to_string();
-                            let pnl_pct = signal.pnl_percentage;
-                            let entry = signal.position.entry_price_sol_per_token;
-                            let exit = signal.current_price_sol_per_token;
-                            let pnl = pnl_sol;
-                            let bid = bundle_id.clone();
+                            // Record Post-Trade Analytics
+                            let analytics = crate::db::TradeAnalytics {
+                                mint: signal.position.mint.clone(),
+                                entry_price: signal.position.entry_price_sol_per_token,
+                                exit_price: signal.current_price_sol_per_token,
+                                pnl_sol,
+                                pnl_pct: signal.pnl_percentage,
+                                liquidity_usd: signal.position.liquidity_usd,
+                                top_10_pct: signal.position.top_10_pct,
+                                holder_count: signal.position.holder_count,
+                                socials: signal.position.socials,
+                            };
                             
+                            let db_for_analytics = trade_engine.db.clone();
                             tokio::spawn(async move {
-                                tele.notify_auto_sell(
-                                    &mint,
-                                    &trigger,
-                                    pnl_pct,
-                                    entry,
-                                    exit,
-                                    pnl,
-                                    &bid
-                                ).await;
+                                if let Err(e) = db_for_analytics.record_trade_analytics(&analytics).await {
+                                    error!("Failed to record trade analytics for {}: {}", analytics.mint, e);
+                                }
                             });
+                            
+                            // Update Circuit Breaker logic
+                            if signal.pnl_percentage < 0.0 {
+                                let val = trade_engine.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
+                                warn!("📉 TRADING-WIDE: Consecutive loss count: {}", val);
+                            } else if signal.pnl_percentage > 5.0 {
+                                trade_engine.consecutive_losses.store(0, Ordering::SeqCst);
+                                info!("✅ TRADING-WIDE: Consecutive losses reset to 0");
+                            }
+
+                            log_sell(&signal.position.mint, pnl_sol, signal.pnl_percentage, &signal.trigger.to_string(), &bundle_id);
+
+                            if let Some(tele) = &trade_engine.tele {
+                                let tele = tele.clone();
+                                let mint = signal.position.mint.clone();
+                                let trigger = signal.trigger.to_string();
+                                let pnl_pct = signal.pnl_percentage;
+                                let entry = signal.position.entry_price_sol_per_token;
+                                let exit = signal.current_price_sol_per_token;
+                                let pnl = pnl_sol;
+                                let bid = bundle_id.clone();
+                                tokio::spawn(async move {
+                                    tele.notify_auto_sell(&mint, &trigger, pnl_pct, entry, exit, pnl, &bid).await;
+                                });
+                            }
+                            break; // Success! Exit retry loop
+                        },
+                        Err(e) => {
+                            last_error = e.to_string();
+                            error!("❌ Attempt {}/3 failed for {}: {}", attempt, signal.position.mint, e);
                         }
-                    },
-                    Err(e) => {
-                        error!("❌ Failed to execute SELL for {}: {}", signal.position.mint, e);
-                        log_sell_failed(&signal.position.mint, &signal.trigger.to_string(), &e.to_string());
                     }
                 }
-                
-                
-                        // Update state after success
-                        if sell_success {
-                            if matches!(signal.trigger, SellTrigger::PartialProfit(_)) {
-                                let sold_amount = (signal.position.amount_token_raw as f64 * (trade_engine.config.partial_exit_amount_pct / 100.0)) as u64;
-                                let remaining = signal.position.amount_token_raw.saturating_sub(sold_amount);
-                                info!("💵 PARTIAL EXIT SUCCESS: Updating tracking balance for {} to {} tokens", signal.position.mint, remaining);
-                                trade_engine.position_tracker.update_position_amount(&signal.position.mint, remaining).await;
-                            } else {
-                                // Full Exit
-                                info!("✅ Trade lifecycle complete for {}. Stopping monitoring.", signal.position.mint);
-                                trade_engine.position_tracker.remove_position(&signal.position.mint).await;
-                                break; 
-                            }
-                        } else {
-                            warn!("🔄 Sell failed for {}. Continuing to monitor/retry...", signal.position.mint);
-                        }
+
+                // Update state after loop finishes (either success or exhausted retries)
+                if sell_success {
+                    if matches!(signal.trigger, SellTrigger::PartialProfit(_)) {
+                        let sold_amount = (signal.position.amount_token_raw as f64 * (trade_engine.config.partial_exit_amount_pct / 100.0)) as u64;
+                        let remaining = signal.position.amount_token_raw.saturating_sub(sold_amount);
+                        info!("💵 PARTIAL EXIT SUCCESS: Updating tracking balance for {} to {} tokens", signal.position.mint, remaining);
+                        trade_engine.position_tracker.update_position_amount(&signal.position.mint, remaining).await;
+                    } else {
+                        info!("✅ Trade lifecycle complete for {}. Stopping monitoring.", signal.position.mint);
+                        trade_engine.position_tracker.remove_position(&signal.position.mint).await;
+                        break; 
+                    }
+                } else {
+                    error!("💀 ALL 3 SELL ATTEMPTS FAILED for {}. Waiting for next signal...", signal.position.mint);
+                    log_sell_failed(&signal.position.mint, &signal.trigger.to_string(), &last_error);
+                }
             }
         });
     }
@@ -624,96 +577,102 @@ impl TradeEngine {
 
             // Spawn listener (simplified version of above)
             tokio::spawn(async move {
-                while let Some(signal) = rx.recv().await {
+                while let Some(mut signal) = rx.recv().await {
                     info!("🚨 SELL SIGNAL (Resumed) for {}: {}", signal.position.mint, signal.trigger);
                     
-                    match trade_engine.execute_sell(&signal).await {
-                        Ok(bundle_id) => {
-                             // Calculate P/L in SOL (Cleaned units)
-                             let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
-                             let pnl_sol = token_amount_whole * signal.current_price_sol_per_token
-                                - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0);
+                    let mut sell_success = false;
+                    let mut last_error = String::new();
 
-                             if let Err(e) = trade_engine.db.update_trade_exit(
-                                &signal.position.mint,
-                                signal.current_price_sol_per_token,
-                                pnl_sol, 
-                                &signal.trigger.to_string(),
-                                &bundle_id.clone()
-                            ).await {
-                                error!("Failed to record trade exit: {}", e);
-                            }
-
-                            // Record Post-Trade Analytics (Partial data for resumed)
-                            let analytics = crate::db::TradeAnalytics {
-                                mint: signal.position.mint.clone(),
-                                entry_price: signal.position.entry_price_sol_per_token,
-                                exit_price: signal.current_price_sol_per_token,
-                                pnl_sol,
-                                pnl_pct: signal.pnl_percentage,
-                                liquidity_usd: signal.position.liquidity_usd,
-                                top_10_pct: signal.position.top_10_pct,
-                                holder_count: signal.position.holder_count,
-                                socials: signal.position.socials,
-                            };
-                            
-                            let db_for_analytics = trade_engine.db.clone();
-                            tokio::spawn(async move {
-                                let _ = db_for_analytics.record_trade_analytics(&analytics).await;
-                            });
-
-                            // Update Circuit Breaker logic
-                            if signal.pnl_percentage < 0.0 {
-                                let val = trade_engine.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
-                                warn!("📉 TRADING-WIDE (Resumed): Consecutive loss count: {}", val);
-                            } else if signal.pnl_percentage > 5.0 { // Significant win
-                                trade_engine.consecutive_losses.store(0, Ordering::SeqCst);
-                                info!("✅ TRADING-WIDE (Resumed): Consecutive losses reset to 0");
-                            }
-
-                            // Log successful sell (Resumed)
-                            log_sell(
-                                &signal.position.mint, 
-                                pnl_sol, 
-                                0.0, // P/L pct unknown for resumed positions without entry price tracking
-                                &signal.trigger.to_string(), 
-                                &bundle_id
-                            );
-
-                            // Send Telegram Notification (Resumed)
-                            if let Some(tele) = &trade_engine.tele {
-                                let tele = tele.clone();
-                                let mint = signal.position.mint.clone();
-                                let trigger = signal.trigger.to_string();
-                                let pnl_pct = 0.0; // PnL pct unknown for resumed
-                                let entry = signal.position.entry_price_sol_per_token;
-                                let exit = signal.current_price_sol_per_token;
-                                let pnl = pnl_sol;
-                                let bid = bundle_id.clone();
-                                
-                                tokio::spawn(async move {
-                                    tele.notify_auto_sell(
-                                        &mint,
-                                        &trigger,
-                                        pnl_pct,
-                                        entry,
-                                        exit,
-                                        pnl,
-                                        &bid
-                                    ).await;
-                                });
-                            }
-                            
-                             // 💡 Zombie Fix: Remove position after successful full exit (Resumed trades)
-                             if matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout | SellTrigger::ExtendedTimeout(_)) {
-                                 trade_engine.position_tracker.remove_position(&signal.position.mint).await;
-                                 break;
-                             }
-                        },
-                        Err(e) => {
-                             error!("❌ Failed to execute SELL (Resumed) for {}: {}", signal.position.mint, e);
-                             log_sell_failed(&signal.position.mint, &signal.trigger.to_string(), &e.to_string());
+                    for attempt in 1..=3 {
+                        if attempt > 1 {
+                            warn!("🔁 RETRYING SELL (Resumed) (Attempt {}/3) for {} after error: {}", attempt, signal.position.mint, last_error);
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
+
+                        match trade_engine.execute_sell(&signal).await {
+                            Ok(bundle_id) => {
+                                sell_success = true;
+                                // Calculate P/L in SOL (Cleaned units)
+                                let token_amount_whole = signal.position.amount_token_raw as f64 / 10f64.powf(signal.position.decimals as f64);
+                                let pnl_sol = token_amount_whole * signal.current_price_sol_per_token
+                                    - (signal.position.amount_sol_invested as f64 / 1_000_000_000.0);
+
+                                if let Err(e) = trade_engine.db.update_trade_exit(
+                                    &signal.position.mint,
+                                    signal.current_price_sol_per_token,
+                                    pnl_sol, 
+                                    &signal.trigger.to_string(),
+                                    &bundle_id.clone()
+                                ).await {
+                                    error!("Failed to record trade exit: {}", e);
+                                }
+
+                                // Record Post-Trade Analytics
+                                let analytics = crate::db::TradeAnalytics {
+                                    mint: signal.position.mint.clone(),
+                                    entry_price: signal.position.entry_price_sol_per_token,
+                                    exit_price: signal.current_price_sol_per_token,
+                                    pnl_sol,
+                                    pnl_pct: signal.pnl_percentage,
+                                    liquidity_usd: signal.position.liquidity_usd,
+                                    top_10_pct: signal.position.top_10_pct,
+                                    holder_count: signal.position.holder_count,
+                                    socials: signal.position.socials,
+                                };
+                                
+                                let db_for_analytics = trade_engine.db.clone();
+                                tokio::spawn(async move {
+                                    let _ = db_for_analytics.record_trade_analytics(&analytics).await;
+                                });
+
+                                // Update Circuit Breaker logic
+                                if signal.pnl_percentage < 0.0 {
+                                    let val = trade_engine.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
+                                    warn!("📉 TRADING-WIDE (Resumed): Consecutive loss count: {}", val);
+                                } else if signal.pnl_percentage > 5.0 {
+                                    trade_engine.consecutive_losses.store(0, Ordering::SeqCst);
+                                    info!("✅ TRADING-WIDE (Resumed): Consecutive losses reset to 0");
+                                }
+
+                                log_sell(&signal.position.mint, pnl_sol, 0.0, &signal.trigger.to_string(), &bundle_id);
+                                
+                                if let Some(tele) = &trade_engine.tele {
+                                    let tele = tele.clone();
+                                    let mint = signal.position.mint.clone();
+                                    let trigger = signal.trigger.to_string();
+                                    let pnl_pct = 0.0; // PnL pct unknown for resumed
+                                    let entry = signal.position.entry_price_sol_per_token;
+                                    let exit = signal.current_price_sol_per_token;
+                                    let pnl = pnl_sol;
+                                    let bid = bundle_id.clone();
+                                    tokio::spawn(async move {
+                                        tele.notify_auto_sell(&mint, &trigger, pnl_pct, entry, exit, pnl, &bid).await;
+                                    });
+                                }
+                                break; 
+                            },
+                            Err(e) => {
+                                last_error = e.to_string();
+                                error!("❌ Attempt {}/3 failed for {} (Resumed): {}", attempt, signal.position.mint, e);
+                            }
+                        }
+                    }
+
+                    if sell_success {
+                         // 💡 Zombie Fix: Remove position after successful full exit (Resumed trades)
+                         if matches!(signal.trigger, SellTrigger::StopLoss(_) | SellTrigger::ProfitTarget(_) | SellTrigger::Timeout | SellTrigger::ExtendedTimeout(_)) {
+                             info!("✅ Trade lifecycle complete for {} (Resumed). Stopping monitoring.", signal.position.mint);
+                             trade_engine.position_tracker.remove_position(&signal.position.mint).await;
+                             break;
+                         } else if matches!(signal.trigger, SellTrigger::PartialProfit(_)) {
+                            let sold_amount = (signal.position.amount_token_raw as f64 * (trade_engine.config.partial_exit_amount_pct / 100.0)) as u64;
+                            let remaining = signal.position.amount_token_raw.saturating_sub(sold_amount);
+                            info!("💵 PARTIAL EXIT SUCCESS (Resumed): Updating tracking balance for {} to {} tokens", signal.position.mint, remaining);
+                            trade_engine.position_tracker.update_position_amount(&signal.position.mint, remaining).await;
+                         }
+                    } else {
+                        error!("💀 ALL 3 SELL ATTEMPTS FAILED for {} (Resumed). Waiting for next signal...", signal.position.mint);
+                        log_sell_failed(&signal.position.mint, &signal.trigger.to_string(), &last_error);
                     }
                 }
             });
